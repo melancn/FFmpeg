@@ -495,6 +495,18 @@ public final class FFMpegNative {
      */
     public native int codecparSetExtradata(long fmtCtx, int streamIndex, byte[] in, int off, int len);
 
+    /**
+     * Set (copy in) the codec context's {@code extradata} directly from a Java
+     * {@code byte[]} (e.g. ExoPlayer {@code Format.initializationData}: AAC
+     * AudioSpecificConfig, OpusHead, Vorbis ident/comment/setup headers, ALAC
+     * magic cookie, SPS/PPS for H.264). Call this after
+     * {@link #allocCodecContext} / {@link #codecParametersToContext} but before
+     * {@link #codecOpen2}. Pass null/0 to clear.
+     *
+     * @return bytes copied, or negative AVERROR
+     */
+    public native int codecContextSetExtradata(long codecCtx, byte[] in, int off, int len);
+
 
     /* -------------------------------------------------------------- */
     /* Codec context configuration setters (encoding setup)           */

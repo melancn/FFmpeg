@@ -2541,6 +2541,28 @@ Java_org_ffmpeg_FFMpegNative_codecparSetExtradata(JNIEnv *env, jobject thiz,
     return len;
 }
 
+/* Set codec-context extradata directly (decode-side init, e.g. from
+ * ExoPlayer Format.initializationData). Must be called before codecOpen2. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_codecContextSetExtradata(JNIEnv *env, jobject thiz,
+                                                      jlong codecCtx, jbyteArray in, jint off, jint len)
+{
+    AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
+    if (!cc)
+        return AVERROR(EINVAL);
+    if (cc->extradata)
+        av_freep(&cc->extradata);
+    cc->extradata_size = 0;
+    if (!in || len <= 0)
+        return 0;
+    cc->extradata = (uint8_t *)av_mallocz(len + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!cc->extradata)
+        return AVERROR(ENOMEM);
+    (*env)->GetByteArrayRegion(env, in, off, len, (jbyte *)cc->extradata);
+    cc->extradata_size = len;
+    return len;
+}
+
 /* ------------------------------------------------------------------ */
 /* libswscale: extra scaling + colorspace                              */
 /* ------------------------------------------------------------------ */
