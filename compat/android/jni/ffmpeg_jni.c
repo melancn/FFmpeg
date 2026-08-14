@@ -322,14 +322,14 @@ Java_org_ffmpeg_FFMpegNative_streamGetFormat(JNIEnv *env, jobject thiz, jlong ct
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_findDecoder(JNIEnv *env, jobject thiz, jint codecId)
 {
-    AVCodec *c = avcodec_find_decoder((enum AVCodecID)codecId);
+    const AVCodec *c = avcodec_find_decoder((enum AVCodecID)codecId);
     return (jlong)(intptr_t)c;
 }
 
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_findEncoder(JNIEnv *env, jobject thiz, jint codecId)
 {
-    AVCodec *c = avcodec_find_encoder((enum AVCodecID)codecId);
+    const AVCodec *c = avcodec_find_encoder((enum AVCodecID)codecId);
     return (jlong)(intptr_t)c;
 }
 
@@ -816,7 +816,12 @@ Java_org_ffmpeg_FFMpegNative_swrConvert(JNIEnv *env, jobject thiz, jlong ctx,
     av_opt_get_int(c, "out_channel_layout", 0, &out_layout);
     av_opt_get_int(c, "out_sample_fmt",     0, &out_fmt_i);
     enum AVSampleFormat out_fmt = (enum AVSampleFormat)(int)out_fmt_i;
-    int out_ch = av_get_channel_layout_nb_channels((uint64_t)out_layout);
+    AVChannelLayout out_ch_layout;
+    if (av_channel_layout_from_mask(&out_ch_layout, (uint64_t)out_layout) < 0) {
+        av_channel_layout_default(&out_ch_layout, 0);
+    }
+    int out_ch = out_ch_layout.nb_channels;
+    av_channel_layout_uninit(&out_ch_layout);
     int out_bps = av_get_bytes_per_sample(out_fmt);
     if (out_ch <= 0 || out_bps <= 0 || outCount <= 0)
         return AVERROR(EINVAL);
@@ -827,7 +832,7 @@ Java_org_ffmpeg_FFMpegNative_swrConvert(JNIEnv *env, jobject thiz, jlong ctx,
 
     uint8_t *out_bufs[1] = { (uint8_t *)out_ptr };
     uint8_t *in_bufs[1] = { NULL };
-    const uint8_t *const in_cb[1] = { NULL };
+    const uint8_t *in_cb[1] = { NULL };
     jbyte *in_ptr = NULL;
     int ret;
 
@@ -1555,7 +1560,7 @@ Java_org_ffmpeg_FFMpegNative_channelLayoutToString(JNIEnv *env, jobject thiz, jl
         return (*env)->NewStringUTF(env, empty);
     }
     char buf[128];
-    av_channel_layout_to_string(&layout, buf, sizeof(buf));
+    av_channel_layout_describe(&layout, buf, sizeof(buf));
     av_channel_layout_uninit(&layout);
     return (*env)->NewStringUTF(env, buf);
 }
@@ -2152,7 +2157,7 @@ Java_org_ffmpeg_FFMpegNative_codecGetHwFramesParameters(JNIEnv *env, jobject thi
     if (!cc || !dev)
         return 0;
     AVBufferRef *out = NULL;
-    int ret = avcodec_get_hw_frames_parameters(cc, dev, &out);
+    int ret = avcodec_get_hw_frames_parameters(cc, dev, AV_PIX_FMT_NONE, &out);
     if (ret < 0 || !out)
         return 0;
     return (jlong)(intptr_t)out;
@@ -2188,7 +2193,7 @@ Java_org_ffmpeg_FFMpegNative_dictGetString(JNIEnv *env, jobject thiz, jlong box,
     char *buf = NULL;
     const char *k = keyValSep ? (*env)->GetStringUTFChars(env, keyValSep, NULL) : NULL;
     const char *p = pairsSep ? (*env)->GetStringUTFChars(env, pairsSep, NULL) : NULL;
-    int ret = av_dict_get_string(*src, &buf, k ? k : ':', p ? p : ',');
+    int ret = av_dict_get_string(*src, &buf, k ? k[0] : ':', p ? p[0] : ',');
     if (k) (*env)->ReleaseStringUTFChars(env, keyValSep, k);
     if (p) (*env)->ReleaseStringUTFChars(env, pairsSep, p);
     jstring result = (ret == 0 && buf) ? (*env)->NewStringUTF(env, buf) : NULL;
@@ -2224,7 +2229,12 @@ Java_org_ffmpeg_FFMpegNative_dictEntryGetValue(JNIEnv *env, jobject thiz, jlong 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_getChannelLayoutNbChannels(JNIEnv *env, jobject thiz, jlong layout)
 {
-    return (jint)av_get_channel_layout_nb_channels((uint64_t)layout);
+    AVChannelLayout ch_layout;
+    if (av_channel_layout_from_mask(&ch_layout, (uint64_t)layout) < 0)
+        return 0;
+    int nb = ch_layout.nb_channels;
+    av_channel_layout_uninit(&ch_layout);
+    return (jint)nb;
 }
 
 JNIEXPORT jlong JNICALL
@@ -2395,8 +2405,8 @@ Java_org_ffmpeg_FFMpegNative_frameGetDuration(JNIEnv *env, jobject thiz, jlong f
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_frameGetPktPos(JNIEnv *env, jobject thiz, jlong frame)
 {
-    AVFrame *f = PTR(AVFrame *, frame);
-    return f ? (jlong)f->pkt_pos : -1;
+    (void)env; (void)thiz; (void)frame;
+    return -1;
 }
 
 JNIEXPORT jint JNICALL
