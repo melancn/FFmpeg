@@ -1,0 +1,222 @@
+name: Android JNI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: android-jni-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build libffmpeg_jni.so (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            arch: aarch64
+            # NDK clang target triple stem used for the API-level-specific driver
+            clang_triple: aarch64-linux-android
+          - abi: armeabi-v7a
+            arch: arm
+            clang_triple: armv7a-linux-androideabi
+
+    env:
+      ANDROID_API: 24
+      BUILD_DIR: build-android
+      INSTALL_DIR: install
+      OUT_DIR: android-jni
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK (for javac -h)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Locate Android NDK
+        id: ndk
+        run: |
+          # ubuntu-latest ships the NDK under $ANDROID_HOME/ndk/<version>
+          NDK_ROOT="$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}/ndk"/* 2>/dev/null | tail -1)"
+          if [ -z "$NDK_ROOT" ]; then
+            echo "::error::No Android NDK found on runner"
+            exit 1
+          fi
+          NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "ndk_root=$NDK_ROOT"    >> "$GITHUB_OUTPUT"
+          echo "ndk_bin=$NDK_BIN"      >> "$GITHUB_OUTPUT"
+          echo "Found NDK at $NDK_ROOT"
+          "$NDK_BIN/clang" --version
+
+      - name: Install ccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-android-${{ matrix.abi }}-${{ hashFiles('configure', 'Makefile', 'lib*', 'ffbuild/**') }}
+          restore-keys: |
+            ccache-android-${{ matrix.abi }}-
+
+      - name: Configure NDK toolchain
+        id: toolchain
+        env:
+          NDK_BIN: ${{ steps.ndk.outputs.ndk_bin }}
+        run: |
+          API="${ANDROID_API}"
+          TRIPLE="${{ matrix.clang_triple }}"
+          # API-level-specific clang driver: <triple><api>-clang
+          CC="$NDK_BIN/${TRIPLE}${API}-clang"
+          CXX="$NDK_BIN/${TRIPLE}${API}-clang++"
+          AR="$NDK_BIN/llvm-ar"
+          RANLIB="$NDK_BIN/llvm-ranlib"
+          NM="$NDK_BIN/llvm-nm"
+          STRIP="$NDK_BIN/llvm-strip"
+          for tool in "$CC" "$AR" "$RANLIB" "$NM"; do
+            [ -x "$tool" ] || { echo "::error::Missing tool: $tool"; exit 1; }
+          done
+          echo "cc=$CC"       >> "$GITHUB_OUTPUT"
+          echo "cxx=$CXX"     >> "$GITHUB_OUTPUT"
+          echo "ar=$AR"       >> "$GITHUB_OUTPUT"
+          echo "ranlib=$RANLIB" >> "$GITHUB_OUTPUT"
+          echo "nm=$NM"       >> "$GITHUB_OUTPUT"
+          echo "strip=$STRIP" >> "$GITHUB_OUTPUT"
+
+      - name: Configure FFmpeg
+        env:
+          CC: ${{ steps.toolchain.outputs.cc }}
+          AR: ${{ steps.toolchain.outputs.ar }}
+          RANLIB: ${{ steps.toolchain.outputs.ranlib }}
+          NM: ${{ steps.toolchain.outputs.nm }}
+        run: |
+          ccache -M 5G
+          PREFIX="$PWD/$BUILD_DIR/$INSTALL_DIR"
+          mkdir -p "$PREFIX"
+          ./configure \
+            --target-os=android --enable-cross-compile \
+            --arch=${{ matrix.arch }} \
+            --cc="ccache $CC" --ar="$AR" --ranlib="$RANLIB" --nm="$NM" \
+            --enable-gpl --enable-nonfree \
+            --enable-static --disable-shared \
+            --disable-doc --disable-avdevice --disable-programs --disable-network \
+            --enable-pic \
+            --extra-cflags="-fPIC -O2" \
+            --extra-ldflags="-lm -lz" \
+            --prefix="$PREFIX" \
+            || CFGRES=$?
+          cat ffbuild/config.log || true
+          exit ${CFGRES:-0}
+
+      - name: Build & install FFmpeg
+        run: |
+          make -j"$(nproc)"
+          make install
+          echo "::group::Installed static libraries"
+          ls -l "$BUILD_DIR/$INSTALL_DIR/lib"
+          echo "::endgroup::"
+
+      - name: Generate JNI header (javac -h)
+        run: |
+          JNI_DIR=compat/android/jni
+          mkdir -p "$JNI_DIR/generated"
+          javac -h "$JNI_DIR/generated" -d "$JNI_DIR/generated" "$JNI_DIR/java/org/ffmpeg/FFMpegNative.java"
+          # The header is named after the class: org_ffmpeg_FFMpegNative.h
+          ls -l "$JNI_DIR/generated/"
+
+      - name: Compile libffmpeg_jni.so
+        env:
+          NDK_BIN: ${{ steps.ndk.outputs.ndk_bin }}
+          CC: ${{ steps.toolchain.outputs.cc }}
+          STRIP: ${{ steps.toolchain.outputs.strip }}
+        run: |
+          ABI="${{ matrix.abi }}"
+          API="${ANDROID_API}"
+          TRIPLE="${{ matrix.clang_triple }}"
+          # Use the API-level-specific driver for the .so too (consistent ABI/sysroot)
+          SHARES_CC="$NDK_BIN/${TRIPLE}${API}-clang"
+          PREFIX="$PWD/$BUILD_DIR/$INSTALL_DIR"
+          OUT="$PWD/$OUT_DIR/$ABI/lib"
+          CLS="$PWD/$OUT_DIR/$ABI/classes"
+          mkdir -p "$OUT" "$CLS"
+
+          "$SHARES_CC" -shared -fPIC \
+            -I"$PWD" -I"$PWD/compat/android/jni" -I"$PWD/compat/android/jni/generated" \
+            -I"$PREFIX/include" \
+            "$PWD/compat/android/jni/ffmpeg_jni.c" \
+            -L"$PREFIX/lib" \
+            -Wl,--start-group \
+            -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
+            -Wl,--end-group \
+            -lm -lz \
+            -Wl,-soname,libffmpeg_jni.so \
+            -o "$OUT/libffmpeg_jni.so"
+
+          "$STRIP" --strip-unneeded "$OUT/libffmpeg_jni.so" || true
+          echo "::group::libffmpeg_jni.so details"
+          file "$OUT/libffmpeg_jni.so"
+          "$NDK_BIN/llvm-nm" -D "$OUT/libffmpeg_jni.so" 2>/dev/null | grep -E 'Java_org_ffmpeg' || true
+          echo "::endgroup::"
+
+      - name: Compile Java sample class
+        run: |
+          ABI="${{ matrix.abi }}"
+          CLS="$PWD/$OUT_DIR/$ABI/classes"
+          mkdir -p "$CLS/org/ffmpeg"
+          javac -d "$CLS" compat/android/jni/java/org/ffmpeg/FFMpegNative.java
+          find "$CLS" -name '*.class' -print
+
+      - name: Stage artifact
+        run: |
+          tree "$OUT_DIR/${{ matrix.abi }}" 2>/dev/null || find "$OUT_DIR/${{ matrix.abi }}" -type f | sort
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-jni-${{ matrix.abi }}
+          path: android-jni/${{ matrix.abi }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  bundle:
+    name: Bundle all ABIs
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master'
+    steps:
+      - name: Download all ABI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ffmpeg-jni-all
+          pattern: ffmpeg-jni-*
+          merge-multiple: false
+
+      - name: Reorganize layout
+        run: |
+          mkdir -p ffmpeg-jni-bundle/jniLibs ffmpeg-jni-bundle/classes
+          for d in ffmpeg-jni-all/ffmpeg-jni-*; do
+            abi=$(basename "$d" | sed 's/^ffmpeg-jni-//')
+            mkdir -p "ffmpeg-jni-bundle/jniLibs/$abi"
+            cp "$d/lib/libffmpeg_jni.so" "ffmpeg-jni-bundle/jniLibs/$abi/" 2>/dev/null || true
+            cp -r "$d/classes/org" "ffmpeg-jni-bundle/classes/" 2>/dev/null || true
+          done
+          find ffmpeg-jni-bundle -type f | sort
+
+      - name: Upload bundled artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-jni-all-abis
+          path: ffmpeg-jni-bundle/
+          retention-days: 30
