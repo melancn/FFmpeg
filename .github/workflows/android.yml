@@ -160,13 +160,19 @@ jobs:
             -Wl,--start-group \
             -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
             -Wl,--end-group \
-            -lm -lz \
+            -llog -lm -lz \
             -Wl,-soname,libffmpeg_jni.so \
             -o "$OUT/libffmpeg_jni.so"
 
           "$STRIP" --strip-unneeded "$OUT/libffmpeg_jni.so" || true
           echo "::group::libffmpeg_jni.so details"
           file "$OUT/libffmpeg_jni.so"
+          DYNAMIC_SECTION=$("$NDK_BIN/llvm-readelf" -d "$OUT/libffmpeg_jni.so")
+          printf '%s\n' "$DYNAMIC_SECTION"
+          if ! printf '%s\n' "$DYNAMIC_SECTION" | grep -Fq 'Shared library: [liblog.so]'; then
+            echo "::error::libffmpeg_jni.so does not declare liblog.so in DT_NEEDED"
+            exit 1
+          fi
           "$NDK_BIN/llvm-nm" -D "$OUT/libffmpeg_jni.so" 2>/dev/null | grep -E 'Java_org_ffmpeg' || true
           echo "::endgroup::"
 
