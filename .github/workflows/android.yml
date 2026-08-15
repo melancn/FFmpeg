@@ -95,7 +95,17 @@ jobs:
           echo "nm=$NM"       >> "$GITHUB_OUTPUT"
           echo "strip=$STRIP" >> "$GITHUB_OUTPUT"
 
+      - name: Cache mbedTLS install
+        id: mbedtls-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUILD_DIR }}/mbedtls-install
+          key: mbedtls-${{ matrix.abi }}-v4.1.1
+          restore-keys: |
+            mbedtls-${{ matrix.abi }}-
+
       - name: Build & install mbedTLS
+        if: steps.mbedtls-cache.outputs.cache-hit != 'true'
         env:
           CC: ${{ steps.toolchain.outputs.cc }}
           AR: ${{ steps.toolchain.outputs.ar }}
@@ -160,6 +170,7 @@ jobs:
             --enable-static --disable-shared \
             --disable-doc --disable-avdevice --disable-programs \
             --enable-pic \
+            --enable-version3 \
             --enable-mbedtls --pkg-config-flags="--static" \
             --extra-cflags="-fPIC -O2" \
             --extra-ldflags="-lm -lz" \
