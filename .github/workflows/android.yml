@@ -244,7 +244,6 @@ jobs:
             -Wl,-soname,libffmpeg_jni.so \
             -o "$OUT/libffmpeg_jni.so"
 
-          "$STRIP" --strip-unneeded "$OUT/libffmpeg_jni.so" || true
           echo "::group::libffmpeg_jni.so details"
           file "$OUT/libffmpeg_jni.so"
           DYNAMIC_SECTION=$("$NDK_BIN/llvm-readelf" -d "$OUT/libffmpeg_jni.so")
@@ -255,8 +254,11 @@ jobs:
           fi
           "$NDK_BIN/llvm-nm" -D "$OUT/libffmpeg_jni.so" 2>/dev/null | grep -E 'Java_org_ffmpeg' || true
           # Verify HTTP/HTTPS protocol symbols and the mbedTLS TLS backend are
-          # linked in. These are internal global symbols (not in the dynamic
-          # export table), so use the full symbol table via llvm-nm.
+          # linked in. These are internal global URLProtocol symbols, NOT in the
+          # dynamic export table (.dynsym), so we must read the full static symbol
+          # table (.symtab) via llvm-nm WITHOUT -D.  This MUST run BEFORE strip:
+          # `--strip-unneeded` removes .symtab (keeping only .dynsym), after which
+          # llvm-nm reports "no symbols" and the check would false-negative.
           "$NDK_BIN/llvm-nm" --defined-only "$OUT/libffmpeg_jni.so" > /tmp/jni_syms.txt
           for sym in ff_http_protocol ff_https_protocol ff_tls_protocol ff_tcp_protocol; do
             if ! grep -q " ${sym}$" /tmp/jni_syms.txt; then
@@ -269,6 +271,12 @@ jobs:
           fi
           echo "HTTP/HTTPS protocol symbols present"
           echo "::endgroup::"
+
+          # Strip only AFTER the .symtab-based checks above succeed: it removes
+          # .symtab/.strtab (keeping .dynsym) to shrink the shipped .so.  The
+          # `|| true` keeps the build green if the tool is unavailable; the
+          # functional checks already passed by this point.
+          "$STRIP" --strip-unneeded "$OUT/libffmpeg_jni.so" || true
 
       - name: Compile Java sample class
         run: |
