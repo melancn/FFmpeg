@@ -100,7 +100,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.BUILD_DIR }}/mbedtls-install
-          key: mbedtls-${{ matrix.abi }}-v3.6.7
+          key: mbedtls-${{ matrix.abi }}-v3.6.7-pic
           restore-keys: |
             mbedtls-${{ matrix.abi }}-
 
@@ -134,11 +134,24 @@ jobs:
           # via c_build_helper) that fail with "Exec format error" under a cross
           # Android CC. Static libraries only; USE_SHARED_MBEDTLS_LIBRARY=Off.
           # Default mbedtls_config.h keeps PSA on (psa_crypto_init, x509write_crt_*).
+          #
+          # -DCMAKE_C_FLAGS="-fPIC": mbedTLS/everest/p256m static targets are non-PIC
+          # by default (only the SHARED target adds -fPIC). Non-PIC objects emit
+          # relocations (R_ARM_REL32 on armeabi-v7a; R_AARCH64_ADR_PREL_PG_HI21 /
+          # R_AARCH64_ADD_ABS_LO12_NC / R_AARCH64_LDST64_ABS_LO12_NC on arm64-v8a)
+          # that ld.lld rejects when linked into the shared libffmpeg_jni.so
+          # ("recompile with -fPIC"); Android API>=23 also forbids text relocations.
+          # CMake treats CMAKE_C_FLAGS as the cached initial value; mbedTLS appends
+          # its warning flags via set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall ..."),
+          # so -fPIC is preserved (-fPIC -Wall -Wextra ...), not clobbered. everest
+          # and p256m share this project-level cache var and thus also get PIC.
+          # Both ABIs now require -fPIC uniformly.
           cmake -S "${MBED_SRC}" -B build \
             -DCMAKE_C_COMPILER="$CC" \
             -DCMAKE_AR="$AR" \
             -DCMAKE_RANLIB="$RANLIB" \
             -DCMAKE_INSTALL_PREFIX="$MBED_PREFIX" \
+            -DCMAKE_C_FLAGS="-fPIC" \
             -DUSE_SHARED_MBEDTLS_LIBRARY=Off \
             -DENABLE_TESTING=Off \
             -DENABLE_PROGRAMS=Off
