@@ -181,6 +181,15 @@ jobs:
           # pulls in ff_tls_protocol and thus ff_https_protocol.
           export PKG_CONFIG_PATH="$MBEDTLS_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           export PKG_CONFIG_LIBDIR="$MBEDTLS_PREFIX/lib/pkgconfig"
+          # --enable-jni + --enable-mediacodec enables the Android MediaCodec
+          # hardware decoders (h264_mediacodec, hevc_mediacodec, av1_mediacodec,
+          # mpeg4_mediacodec, vp8/9_mediacodec, mp3_mediacodec, ...). The
+          # decoders run in the MediaCodec framework via the NDK mediandk +
+          # native binder API; configure pulls in compat/android/binder.o and
+          # needs jni.h + media/NdkMediaFormat.h, both present in the NDK
+          # unified sysroot of the API-level-specific clang driver.
+          # --enable-hwaccel* flags are no longer separate configure options:
+          # the mediacodec hwaccel is auto-selected by the decoders above.
           ./configure \
             --target-os=android --enable-cross-compile \
             --arch=${{ matrix.arch }} \
@@ -191,11 +200,18 @@ jobs:
             --enable-pic \
             --enable-version3 \
             --enable-mbedtls --pkg-config-flags="--static" \
+            --enable-jni --enable-mediacodec \
             --extra-cflags="-fPIC -O2" \
             --extra-ldflags="-lm -lz" \
             --prefix="$PREFIX" \
             || CFGRES=$?
           cat ffbuild/config.log || true
+          # Surface the resolved feature flags so a missed mediacodec enablement
+          # is obvious in the log rather than buried in configure's full trace.
+          echo "::group::FFmpeg configure flags"
+          grep -E '^(CONFIG_MEDIACODEC|CONFIG_JNI|CONFIG_(H264|HEVC|AV1|MPEG4|VP8|VP9|MP3)_MEDIACODEC)' \
+            ffbuild/config.mak 2>/dev/null || true
+          echo "::endgroup::"
           exit ${CFGRES:-0}
 
       - name: Build & install FFmpeg
@@ -231,6 +247,15 @@ jobs:
           CLS="$PWD/$OUT_DIR/$ABI/classes"
           mkdir -p "$OUT" "$CLS"
 
+          # The FFmpeg static libs now reference MediaCodec decoder objects
+          # (h264_mediacodec, hevc_mediacodec, ...) which call the NDK mediandk
+          # + native_window + binder APIs. Those live in the Android platform
+          # shared libraries shipped in the NDK unified sysroot:
+          #   -lmediandk    : AMediaCodec/AMediaFormat (MediaCodec bridge)
+          #   -landroid     : ANativeWindow (hwframes mediacodec surfaces)
+          #   -ljnigraphics : AImage / bitmap helpers used by some mediacodec
+          #                   paths; harmless if unreferenced (the linker drops it)
+          # All three are available from API 21+ at the chosen API 24 driver.
           "$SHARES_CC" -shared -fPIC \
             -I"$PWD" -I"$PWD/compat/android/jni" -I"$PWD/compat/android/jni/generated" \
             -I"$PREFIX/include" \
@@ -240,6 +265,7 @@ jobs:
             -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
             -lmbedtls -lmbedx509 -lmbedcrypto \
             -Wl,--end-group \
+            -lmediandk -landroid -ljnigraphics \
             -llog -lm -lz \
             -Wl,-soname,libffmpeg_jni.so \
             -o "$OUT/libffmpeg_jni.so"
@@ -252,6 +278,15 @@ jobs:
             echo "::error::libffmpeg_jni.so does not declare liblog.so in DT_NEEDED"
             exit 1
           fi
+          # mediacodec hardware decoders require the NDK platform libs to be
+          # recorded as DT_NEEDED so they resolve at runtime on the device.
+          for needlib in libmediandk.so libandroid.so; do
+            if ! printf '%s\n' "$DYNAMIC_SECTION" | grep -Fq "Shared library: [${needlib}]"; then
+              echo "::error::libffmpeg_jni.so does not declare ${needlib} in DT_NEEDED (mediacodec HW decode won't load)"
+              exit 1
+            fi
+          done
+          echo "MediaCodec platform libs (libmediandk.so, libandroid.so) in DT_NEEDED"
           "$NDK_BIN/llvm-nm" -D "$OUT/libffmpeg_jni.so" 2>/dev/null | grep -E 'Java_org_ffmpeg' || true
           # Verify HTTP/HTTPS protocol symbols and the mbedTLS TLS backend are
           # linked in. These are internal global URLProtocol symbols, NOT in the
@@ -270,6 +305,27 @@ jobs:
             echo "::warning::mbedtls_ssl_init not found in defined symbols; check tls backend linkage"
           fi
           echo "HTTP/HTTPS protocol symbols present"
+          # Verify at least one MediaCodec hardware decoder is actually linked
+          # in. The ff_<name>_mediacodec_decoder FFCodec objects are static
+          # globals (in .symtab, not .dynsym), so this must use the --start-group
+          # link above to pull them in from libavcodec.a. Any one of the common
+          # HW decoders satisfies this; absent all of them, the configure flags
+          # did not enable mediacodec.
+          mc_found=0
+          for sym in ff_h264_mediacodec_decoder ff_hevc_mediacodec_decoder \
+                      ff_av1_mediacodec_decoder ff_mpeg4_mediacodec_decoder \
+                      ff_vp8_mediacodec_decoder ff_vp9_mediacodec_decoder \
+                      ff_mp3_mediacodec_decoder; do
+            if grep -q " ${sym}$" /tmp/jni_syms.txt; then
+              mc_found=1
+              echo "MediaCodec HW decoder present: ${sym}"
+              break
+            fi
+          done
+          if [ "$mc_found" -ne 1 ]; then
+            echo "::error::No mediacodec decoder linked in (--enable-mediacodec build issue)"
+            exit 1
+          fi
           echo "::endgroup::"
 
           # Strip only AFTER the .symtab-based checks above succeed: it removes
