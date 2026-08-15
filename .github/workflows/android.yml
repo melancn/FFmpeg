@@ -61,7 +61,7 @@ jobs:
       - name: Install ccache
         run: |
           sudo apt-get update
-          sudo apt-get install -y ccache
+          sudo apt-get install -y ccache pkg-config
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -95,6 +95,47 @@ jobs:
           echo "nm=$NM"       >> "$GITHUB_OUTPUT"
           echo "strip=$STRIP" >> "$GITHUB_OUTPUT"
 
+      - name: Build & install mbedTLS
+        env:
+          CC: ${{ steps.toolchain.outputs.cc }}
+          AR: ${{ steps.toolchain.outputs.ar }}
+          RANLIB: ${{ steps.toolchain.outputs.ranlib }}
+        run: |
+          set -euo pipefail
+          MBED_VER="4.1.1"
+          MBED_SRC="mbedtls-${MBED_VER}"
+          MBED_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
+          mkdir -p "$MBED_PREFIX"
+
+          # Official release tarball already includes submodules and
+          # generated files, so no Python/Perl tooling is required to build
+          # from source.
+          curl -fsSL \
+            "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBED_VER}/${MBED_SRC}.tar.bz2" \
+            -o "${MBED_SRC}.tar.bz2"
+          echo "3359a349e23db3d5536fcee032ae7b2ecbfc08972fab643089b5cbf2a375c98c  ${MBED_SRC}.tar.bz2" | sha256sum -c -
+          tar xjf "${MBED_SRC}.tar.bz2"
+
+          cd "${MBED_SRC}"
+          # Static build only (default), skip tests/programs to stay lean.
+          # pkg-config files are installed to $MBED_PREFIX/lib/pkgconfig.
+          cmake -S . -B build \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_AR="$AR" \
+            -DCMAKE_RANLIB="$RANLIB" \
+            -DCMAKE_INSTALL_PREFIX="$MBED_PREFIX" \
+            -DUSE_SHARED_MBEDTLS_LIBRARY=Off \
+            -DENABLE_TESTING=Off \
+            -DENABLE_PROGRAMS=Off
+          cmake --build build --parallel "$(nproc)"
+          cmake --install build
+
+          # Sanity checks: static libs + compat libmbedcrypto + pkg-config.
+          test -f "$MBED_PREFIX/lib/libmbedtls.a"
+          test -f "$MBED_PREFIX/lib/libmbedcrypto.a"
+          test -f "$MBED_PREFIX/lib/pkgconfig/mbedtls.pc"
+          ls -l "$MBED_PREFIX/lib" "$MBED_PREFIX/lib/pkgconfig"
+
       - name: Configure FFmpeg
         env:
           CC: ${{ steps.toolchain.outputs.cc }}
@@ -104,15 +145,22 @@ jobs:
         run: |
           ccache -M 5G
           PREFIX="$PWD/$BUILD_DIR/$INSTALL_DIR"
+          MBEDTLS_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
           mkdir -p "$PREFIX"
+          # Expose the just-built mbedTLS via pkg-config so configure's
+          # check_pkg_config(mbedtls) path picks up the TLS backend, which
+          # pulls in ff_tls_protocol and thus ff_https_protocol.
+          export PKG_CONFIG_PATH="$MBEDTLS_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          export PKG_CONFIG_LIBDIR="$MBEDTLS_PREFIX/lib/pkgconfig"
           ./configure \
             --target-os=android --enable-cross-compile \
             --arch=${{ matrix.arch }} \
             --cc="ccache $CC" --ar="$AR" --ranlib="$RANLIB" --nm="$NM" \
             --enable-gpl --enable-nonfree \
             --enable-static --disable-shared \
-            --disable-doc --disable-avdevice --disable-programs --disable-network \
+            --disable-doc --disable-avdevice --disable-programs \
             --enable-pic \
+            --enable-mbedtls --pkg-config-flags="--static" \
             --extra-cflags="-fPIC -O2" \
             --extra-ldflags="-lm -lz" \
             --prefix="$PREFIX" \
@@ -148,6 +196,7 @@ jobs:
           # Use the API-level-specific driver for the .so too (consistent ABI/sysroot)
           SHARES_CC="$NDK_BIN/${TRIPLE}${API}-clang"
           PREFIX="$PWD/$BUILD_DIR/$INSTALL_DIR"
+          MBEDTLS_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
           OUT="$PWD/$OUT_DIR/$ABI/lib"
           CLS="$PWD/$OUT_DIR/$ABI/classes"
           mkdir -p "$OUT" "$CLS"
@@ -156,9 +205,10 @@ jobs:
             -I"$PWD" -I"$PWD/compat/android/jni" -I"$PWD/compat/android/jni/generated" \
             -I"$PREFIX/include" \
             "$PWD/compat/android/jni/ffmpeg_jni.c" \
-            -L"$PREFIX/lib" \
+            -L"$PREFIX/lib" -L"$MBEDTLS_PREFIX/lib" \
             -Wl,--start-group \
             -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
+            -lmbedtls -lmbedx509 -lmbedcrypto \
             -Wl,--end-group \
             -llog -lm -lz \
             -Wl,-soname,libffmpeg_jni.so \
@@ -174,6 +224,20 @@ jobs:
             exit 1
           fi
           "$NDK_BIN/llvm-nm" -D "$OUT/libffmpeg_jni.so" 2>/dev/null | grep -E 'Java_org_ffmpeg' || true
+          # Verify HTTP/HTTPS protocol symbols and the mbedTLS TLS backend are
+          # linked in. These are internal global symbols (not in the dynamic
+          # export table), so use the full symbol table via llvm-nm.
+          "$NDK_BIN/llvm-nm" --defined-only "$OUT/libffmpeg_jni.so" > /tmp/jni_syms.txt
+          for sym in ff_http_protocol ff_https_protocol ff_tls_protocol ff_tcp_protocol; do
+            if ! grep -q " ${sym}$" /tmp/jni_syms.txt; then
+              echo "::error::libffmpeg_jni.so missing ${sym} (network/protocol not linked)"
+              exit 1
+            fi
+          done
+          if ! grep -q ' mbedtls_ssl_init$' /tmp/jni_syms.txt; then
+            echo "::warning::mbedtls_ssl_init not found in defined symbols; check tls backend linkage"
+          fi
+          echo "HTTP/HTTPS protocol symbols present"
           echo "::endgroup::"
 
       - name: Compile Java sample class

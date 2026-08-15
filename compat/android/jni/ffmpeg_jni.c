@@ -4402,3 +4402,16 @@ Java_org_ffmpeg_FFMpegNative_swsAllocContext(JNIEnv *env, jobject thiz)
     return (jlong)(intptr_t)sws_alloc_context();
 }
 
+/* ------------------------------------------------------------------ */
+/* Library init: initialize the FFmpeg network layer when the .so is   */
+/* loaded, so http:// and https:// (mbedTLS TLS backend) work at       */
+/* runtime on Android without the caller having to invoke               */
+/* formatNetworkInit() explicitly first.                               */
+/* ------------------------------------------------------------------ */
+JNIEXPORT jint JNICALL
+JNI_OnLoad(JavaVM *vm, void *reserved)
+{
+    avformat_network_init();
+    return JNI_VERSION_1_6;
+}
+
