@@ -119,33 +119,34 @@ jobs:
 
           # Official release tarball already includes submodules + generated
           # files, so no Python/Perl tooling is required to build from source.
-          # 3.6.x LTS is used deliberately: FFmpeg's tls_mbedtls.c and
-          # rtmpdh.* target the 3.x API (mbedtls/bignum.h etc.); 4.x reorganised
-          # headers/libraries and breaks rtmpdh.c compilation.
+          # 3.6.x LTS is required: FFmpeg's tls_mbedtls.c and rtmpdh.* target the
+          # 3.x API (mbedtls/bignum.h etc.); 4.x reorganised headers/libraries and
+          # breaks rtmpdh.c compilation.
           curl -fsSL \
             "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBED_VER}/${MBED_SRC}.tar.bz2" \
             -o "${MBED_SRC}.tar.bz2"
           echo "a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6  ${MBED_SRC}.tar.bz2" | sha256sum -c -
           tar xjf "${MBED_SRC}.tar.bz2"
 
-          cd "${MBED_SRC}"
-          # Static build via the legacy GNU Makefile (3.6.x keeps it).
-          # NDK tools are passed via make variables; SHARED=0 => static libs
-          # only. DESTDIR + PREFIX="" install into $MBED_PREFIX (the install
-          # target assembles $(DESTDIR)$(PREFIX)/lib). Use the default
-          # mbedtls_config.h (PSA on) so psa_crypto_init() and the
-          # mbedtls_x509write_crt_* writers are compiled in.
-          make -j"$(nproc)" SHARED=0 \
-            CC="$CC" AR="$AR" RANLIB="$RANLIB" \
-            LDFLAGS="-lm" \
-            DESTDIR="$MBED_PREFIX" PREFIX=""
-          make install SHARED=0 \
-            CC="$CC" AR="$AR" RANLIB="$RANLIB" \
-            DESTDIR="$MBED_PREFIX" PREFIX=""
+          # CMake build: ENABLE_TESTING=Off + ENABLE_PROGRAMS=Off prevents the
+          # tests/ and programs/ subdirectories from being entered, which in turn
+          # avoids the host-incompatible test-data generators (generate_psa_tests.py
+          # via c_build_helper) that fail with "Exec format error" under a cross
+          # Android CC. Static libraries only; USE_SHARED_MBEDTLS_LIBRARY=Off.
+          # Default mbedtls_config.h keeps PSA on (psa_crypto_init, x509write_crt_*).
+          cmake -S "${MBED_SRC}" -B build \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_AR="$AR" \
+            -DCMAKE_RANLIB="$RANLIB" \
+            -DCMAKE_INSTALL_PREFIX="$MBED_PREFIX" \
+            -DUSE_SHARED_MBEDTLS_LIBRARY=Off \
+            -DENABLE_TESTING=Off \
+            -DENABLE_PROGRAMS=Off
+          cmake --build build --parallel "$(nproc)"
+          cmake --install build
 
-          # 3.6.x layout: libs under <prefix>/lib, headers under
-          # <prefix>/include, pkg-config under <prefix>/lib/pkgconfig.
-          # No tf-psa-crypto split: PSA lives inside libmbedcrypto.a.
+          # 3.6.x layout: libs under <prefix>/lib, headers under <prefix>/include,
+          # pkg-config under <prefix>/lib/pkgconfig. No tf-psa-crypto split.
           test -f "$MBED_PREFIX/lib/libmbedtls.a"
           test -f "$MBED_PREFIX/lib/libmbedcrypto.a"
           test -f "$MBED_PREFIX/lib/pkgconfig/mbedtls.pc"
