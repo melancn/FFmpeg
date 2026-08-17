@@ -57,6 +57,8 @@
 #include "libavutil/channel_layout.h"
 
 #include "libavcodec/avcodec.h"
+#include "libavcodec/mediacodec.h"
+#include "libavcodec/jni.h"
 #include "libavcodec/bsf.h"
 #include "libavcodec/codec_par.h"
 #include "libavcodec/codec_desc.h"
@@ -378,6 +380,59 @@ Java_org_ffmpeg_FFMpegNative_codecFreeContext(JNIEnv *env, jobject thiz, jlong c
         avcodec_free_context(&cc);
 }
 
+/* ------------------------------------------------------------------ */
+/* MediaCodec hardware decode: bind an Android Surface to the decoder  */
+/* so h264/hevc/av1_mediacodec output renders directly to the Surface. */
+/*                                                                     */
+/* Lifecycle (order matters):                                          */
+/*   AVMediaCodecContext *mc = av_mediacodec_alloc_context();          */
+/*   av_mediacodec_default_init(cc, mc, surface);  (before open2)      */
+/*   avcodec_open2(cc, codec, NULL);                                   */
+/*   ... decode ...                                                    */
+/*   av_mediacodec_default_free(cc);     (before codecFreeContext)     */
+/*   avcodec_free_context(&cc);                                        */
+/*                                                                     */
+/* av_mediacodec_default_free() frees the AVMediaCodecContext AND the  */
+/* surface global ref, and also av_freep(&avctx->hwaccel_context); it  */
+/* MUST run before avcodec_free_context() (which does not touch        */
+/* hwaccel_context) to avoid a use-after-free.                         */
+/* ------------------------------------------------------------------ */
+
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_mediasurfaceAllocContext(JNIEnv *env, jobject thiz)
+{
+    return (jlong)(intptr_t)av_mediacodec_alloc_context();
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_mediasurfaceDefaultInit(JNIEnv *env, jobject thiz,
+                                                     jlong codecCtx, jlong mcCtx, jobject surface)
+{
+    AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
+    AVMediaCodecContext *mc = PTR(AVMediaCodecContext *, mcCtx);
+    if (!cc || !mc || !surface)
+        return AVERROR(EINVAL);
+    /* av_mediacodec_default_init NewGlobalRefs the surface and installs mc
+     * into avctx->hwaccel_context. Must run before codecOpen2. */
+    return (jint)av_mediacodec_default_init(cc, mc, (void *)surface);
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_mediasurfaceDefaultFree(JNIEnv *env, jobject thiz, jlong codecCtx)
+{
+    AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
+    if (cc)
+        av_mediacodec_default_free(cc);
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_mediasurfaceFree(JNIEnv *env, jobject thiz, jlong mcCtx)
+{
+    AVMediaCodecContext *mc = PTR(AVMediaCodecContext *, mcCtx);
+    if (mc)
+        av_freep(&mc);
+}
+
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_getContextWidth(JNIEnv *env, jobject thiz, jlong codecCtx)
 {
@@ -691,6 +746,56 @@ Java_org_ffmpeg_FFMpegNative_frameCopyAudio(JNIEnv *env, jobject thiz,
     const uint8_t *src = f->data[0];
     (*env)->SetByteArrayRegion(env, out, off, total, (const jbyte *)src);
     return total;
+}
+
+/* ------------------------------------------------------------------ */
+/* MediaCodec output buffer rendering.                                 */
+/*                                                                     */
+/* On the MediaCodec hardware path the decoded AVFrame carries an      */
+/* opaque AVMediaCodecBuffer* in frame->data[3]; frame->buf[0] owns the */
+/* reference count. After the Java layer is done with the buffer it     */
+/* must call one of the render/release entry points below, THEN         */
+/* frameUnref(frame) to recycle the AVFrame and release the underlying  */
+/* MediaCodec buffer memory.                                            */
+/*                                                                     */
+/* Correct per-frame order:                                            */
+/*   codecReceiveFrame -> mediasurfaceGetBuffer (non-0) ->             */
+/*   mediasurfaceRenderBufferAtTime | mediasurfaceReleaseBuffer(1) ->  */
+/*   frameUnref(frame)                                                 */
+/*                                                                     */
+/* On a software decode path frame->data[3] is NULL, so                 */
+/* mediasurfaceGetBuffer returns 0 and the render helpers error out;    */
+/* use the normal frameCopyVideo path there. HW frames must NOT be      */
+/* passed to frameCopyVideo (data[0..2] are NULL).                      */
+/* ------------------------------------------------------------------ */
+
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_mediasurfaceGetBuffer(JNIEnv *env, jobject thiz, jlong frame)
+{
+    AVFrame *f = PTR(AVFrame *, frame);
+    if (!f || f->format != AV_PIX_FMT_MEDIACODEC)
+        return 0;
+    return (jlong)(intptr_t)f->data[3];
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_mediasurfaceReleaseBuffer(JNIEnv *env, jobject thiz,
+                                                       jlong buf, jint render)
+{
+    AVMediaCodecBuffer *b = PTR(AVMediaCodecBuffer *, buf);
+    if (!b)
+        return AVERROR(EINVAL);
+    return (jint)av_mediacodec_release_buffer(b, render);
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_mediasurfaceRenderBufferAtTime(JNIEnv *env, jobject thiz,
+                                                            jlong buf, jlong nanoTime)
+{
+    AVMediaCodecBuffer *b = PTR(AVMediaCodecBuffer *, buf);
+    if (!b)
+        return AVERROR(EINVAL);
+    return (jint)av_mediacodec_render_buffer_at_time(b, (int64_t)nanoTime);
 }
 
 /* ------------------------------------------------------------------ */
@@ -4412,6 +4517,10 @@ JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM *vm, void *reserved)
 {
     avformat_network_init();
+    /* Register the global JavaVM so libavcodec's ff_jni_get_env() can resolve
+     * it later; required by av_mediacodec_default_init/free. Passing NULL as
+     * the log context is accepted by FFmpeg. */
+    av_jni_set_java_vm((void *)vm, NULL);
     return JNI_VERSION_1_6;
 }
 

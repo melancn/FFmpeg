@@ -226,7 +226,10 @@ jobs:
         run: |
           JNI_DIR=compat/android/jni
           mkdir -p "$JNI_DIR/generated"
-          javac -h "$JNI_DIR/generated" -d "$JNI_DIR/generated" "$JNI_DIR/java/org/ffmpeg/FFMpegNative.java"
+          # FFMpegNative.java references android.view.Surface, so javac needs
+          # android.jar on the classpath to resolve it.
+          ANDROID_JAR="$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)"
+          javac -classpath "$ANDROID_JAR" -h "$JNI_DIR/generated" -d "$JNI_DIR/generated" "$JNI_DIR/java/org/ffmpeg/FFMpegNative.java"
           # The header is named after the class: org_ffmpeg_FFMpegNative.h
           ls -l "$JNI_DIR/generated/"
 
@@ -339,7 +342,10 @@ jobs:
           ABI="${{ matrix.abi }}"
           CLS="$PWD/$OUT_DIR/$ABI/classes"
           mkdir -p "$CLS/org/ffmpeg"
-          javac -d "$CLS" compat/android/jni/java/org/ffmpeg/FFMpegNative.java
+          # FFMpegNative.java references android.view.Surface, so javac needs
+          # android.jar on the classpath to resolve it.
+          ANDROID_JAR="$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)"
+          javac -classpath "$ANDROID_JAR" -d "$CLS" compat/android/jni/java/org/ffmpeg/FFMpegNative.java
           find "$CLS" -name '*.class' -print
 
       - name: Stage artifact

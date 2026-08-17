@@ -509,6 +509,66 @@ public final class FFMpegNative {
 
 
     /* -------------------------------------------------------------- */
+    /* MediaCodec hardware decode: bind an Android Surface to the      */
+    /* decoder so h264/hevc/av1_mediacodec output renders directly to  */
+    /* the Surface.                                                    */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Allocate a {@code AVMediaCodecContext} (for binding to a Surface).
+     * Must be paired with {@link #mediasurfaceDefaultInit} before
+     * {@link #codecOpen2}, and {@link #mediasurfaceDefaultFree} before
+     * {@link #codecFreeContext}.
+     *
+     * @return a non-zero handle, or 0 on allocation failure
+     */
+    public native long mediasurfaceAllocContext();
+
+    /**
+     * Bind an Android {@code Surface} to the codec context's
+     * {@code hwaccel_context}. This NewGlobalRefs the Surface internally and
+     * must run before {@link #codecOpen2}; the Surface takes effect during
+     * MediaCodec's configure phase.
+     *
+     * <p>Typical order:
+     * <pre>
+     * long mc = mediasurfaceAllocContext();
+     * if (mediasurfaceDefaultInit(codecCtx, mc, surface) &lt; 0) {
+     *     mediasurfaceFree(mc);      // rollback
+     *     return error;
+     * }
+     * codecOpen2(codecCtx, codec);   // surface effective at configure
+     * ...decode...
+     * mediasurfaceDefaultFree(codecCtx);   // release surface global ref + mc first
+     * codecFreeContext(codecCtx);          // then free the codec context
+     * </pre>
+     *
+     * <p>Changing the Surface at runtime is NOT supported; to change it you
+     * must close and reopen (mediasurfaceDefaultFree + re-allocContext /
+     * setSurface / defaultInit + re-codecOpen2).
+     *
+     * @return 0 or a negative AVERROR (e.g. {@code ENOSYS} when built without
+     *         {@code --enable-mediacodec})
+     */
+    public native int mediasurfaceDefaultInit(long codecCtx, long mcCtx, android.view.Surface surface);
+
+    /**
+     * Free the {@code AVMediaCodecContext} bound by
+     * {@link #mediasurfaceDefaultInit} plus the Surface global ref it holds.
+     * <b>Must be called before {@link #codecFreeContext}</b>. Calling it twice
+     * is safe (the second call is a no-op).
+     */
+    public native void mediasurfaceDefaultFree(long codecCtx);
+
+    /**
+     * Free an {@code AVMediaCodecContext} that was never successfully
+     * initialized (rollback only, after a failed
+     * {@link #mediasurfaceDefaultInit}).
+     */
+    public native void mediasurfaceFree(long mcCtx);
+
+
+    /* -------------------------------------------------------------- */
     /* Codec context configuration setters (encoding setup)           */
     /* -------------------------------------------------------------- */
 
@@ -753,6 +813,44 @@ public final class FFMpegNative {
      * @return bytes copied, or negative AVERROR
      */
     public native int frameCopyAudio(long frame, byte[] out, int off, int len);
+
+    /* -------------------------------------------------------------- */
+    /* MediaCodec output buffer rendering. Only valid for frames whose  */
+    /* {@link #frameGetFormat} == {@link #AV_PIX_FMT_MEDIACODEC}.       */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Returns a non-zero {@code AVMediaCodecBuffer} handle only when
+     * {@code frameGetFormat(frame) == AV_PIX_FMT_MEDIACODEC}; ordinary
+     * (software) frames return 0. After acquiring the handle you must call
+     * exactly one of {@link #mediasurfaceReleaseBuffer} or
+     * {@link #mediasurfaceRenderBufferAtTime}, then {@link #frameUnref} to
+     * recycle the {@code AVFrame} and release the underlying MediaCodec
+     * buffer. The handle is only valid while {@code frame} is alive; it is
+     * invalidated by {@link #frameUnref}.
+     */
+    public native long mediasurfaceGetBuffer(long frame);
+
+    /**
+     * Release an {@code AVMediaCodecBuffer}; {@code render == 1} renders it to
+     * the bound Surface, {@code render == 0} discards it. Repeated calls are
+     * safe (only the first caller truly renders the underlying MediaCodec
+     * output buffer).
+     *
+     * @return 0 or a negative AVERROR ({@code ENOSYS} means the build was
+     *         compiled without {@code --enable-mediacodec})
+     */
+    public native int mediasurfaceReleaseBuffer(long buf, int render);
+
+    /**
+     * Release an {@code AVMediaCodecBuffer} and render it at the given system
+     * time (CLOCK_MONOTONIC ns, aligned with {@code System.nanoTime()}). The
+     * release semantics match {@link #mediasurfaceReleaseBuffer}; only the
+     * timing differs.
+     *
+     * @return 0 or a negative AVERROR
+     */
+    public native int mediasurfaceRenderBufferAtTime(long buf, long nanoTime);
 
     /**
      * Allocate the frame's buffers for its current format/dimensions. Set
@@ -1637,6 +1735,12 @@ public final class FFMpegNative {
     public static final int AV_PIX_FMT_BGR24    = 3;
     public static final int AV_PIX_FMT_RGBA     = 26;
     public static final int AV_PIX_FMT_BGRA     = 28;
+    /**
+     * Android MediaCodec hardware pixel format. Only frames in this format
+     * carry a non-null {@code AVMediaCodecBuffer*} in {@code frame->data[3]},
+     * which is what {@link #mediasurfaceGetBuffer} hands back for rendering.
+     */
+    public static final int AV_PIX_FMT_MEDIACODEC = 164;
 
     /** Sample-format constants mirroring {@code enum AVSampleFormat}. */
     public static final int AV_SAMPLE_FMT_NONE  = -1;
