@@ -58,16 +58,45 @@ jobs:
           echo "Found NDK at $NDK_ROOT"
           "$NDK_BIN/clang" --version
 
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          # Cache the downloaded .deb archives so apt-get install reuses them
+          # across runs instead of re-downloading on every job.  Keyed on the
+          # requested package set + the runner image's apt state file so a distro
+          # upgrade (new /var/lib/dpkg/status) naturally busts the cache.
+          path: |
+            ~/apt-archives
+          key: apt-android-${{ matrix.abi }}-${{ hashFiles('.github/workflows/android.yml') }}-${{ runner.arch }}
+
       - name: Install ccache
         run: |
+          set -euo pipefail
+          ARCHIVE_DIR=~/apt-archives
+          mkdir -p "$ARCHIVE_DIR"
+          # Restore previously cached debs into apt's archive dir so the install
+          # step finds them locally and skips re-downloading on hit.
+          if ls "$ARCHIVE_DIR"/*.deb >/dev/null 2>&1; then
+            sudo cp -v "$ARCHIVE_DIR"/*.deb /var/cache/apt/archives/ 2>/dev/null || true
+          fi
           sudo apt-get update
-          sudo apt-get install -y ccache pkg-config
+          # A plain install: apt reuses any .deb already in /var/cache/apt/archives
+          # and only fetches the missing ones, so the first run downloads while
+          # subsequent runs hit the cache and stay offline for cached packages.
+          sudo apt-get install -y -o dir::cache::archives=/var/cache/apt/archives ccache pkg-config
+          # Persist any newly fetched debs back into the cache path for next run.
+          cp -v /var/cache/apt/archives/*.deb "$ARCHIVE_DIR"/ 2>/dev/null || true
+          ccache --version
 
       - name: Cache ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-android-${{ matrix.abi }}-${{ hashFiles('configure', 'Makefile', 'lib*', 'ffbuild/**') }}
+          # hashFiles globs must be explicit file patterns; bare 'lib*' matches
+          # top-level dirs (libavcodec/, libavutil/, ...) and produces a hash
+          # independent of their contents, so the key never changed with source.
+          # Use recursive '**' patterns so the key actually tracks source edits.
+          key: ccache-android-${{ matrix.abi }}-${{ hashFiles('configure', 'Makefile', 'lib*/**', 'ffbuild/**', 'compat/**') }}
           restore-keys: |
             ccache-android-${{ matrix.abi }}-
 
@@ -173,6 +202,15 @@ jobs:
           NM: ${{ steps.toolchain.outputs.nm }}
         run: |
           ccache -M 5G
+          # ccache's compiler-check defaults to mtime, which changes between
+          # runner instances (fresh NDK extraction) and forces a full miss on
+          # every run even when ~/.ccache is restored.  Use content hashing so
+          # a restored cache is actually reused across runs/runners.
+          export CCACHE_COMPILERCHECK=content
+          # Keep the cached compiler (-fPIC) flags stable; ccache only skips
+          # preprocessing-dependent hashes when the input is identical.
+          export CCACHE_BASEDIR="$PWD"
+          ccache -z
           PREFIX="$PWD/$BUILD_DIR/$INSTALL_DIR"
           MBEDTLS_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
           mkdir -p "$PREFIX"
@@ -220,6 +258,9 @@ jobs:
           make install
           echo "::group::Installed static libraries"
           ls -l "$BUILD_DIR/$INSTALL_DIR/lib"
+          echo "::endgroup::"
+          echo "::group::ccache statistics"
+          ccache -s
           echo "::endgroup::"
 
       - name: Generate JNI header (javac -h)

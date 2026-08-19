@@ -461,9 +461,8 @@ Java_org_ffmpeg_FFMpegNative_mediasurfaceFree(JNIEnv *env, jobject thiz, jlong m
  * safely pull the Surface global ref back out and delete it. The free
  * callback runs detached from any Java frame, so use the JavaVM cached
  * in JNI_OnLoad to obtain a JNIEnv (AttachCurrentThread if needed). */
-static void mediacodec_hwdevice_free(void *opaque, uint8_t *data)
+static void mediacodec_hwdevice_free(AVHWDeviceContext *ctx)
 {
-    AVHWDeviceContext *ctx = (AVHWDeviceContext *)data;
     if (!ctx || !ctx->hwctx || !g_vm)
         return;
     AVMediaCodecDeviceContext *mc = (AVMediaCodecDeviceContext *)ctx->hwctx;
