@@ -290,7 +290,20 @@ jobs:
             fi
           done
           echo "MediaCodec platform libs (libmediandk.so, libandroid.so) in DT_NEEDED"
-          "$NDK_BIN/llvm-nm" -D "$OUT/libffmpeg_jni.so" 2>/dev/null | grep -E 'Java_org_ffmpeg' || true
+          export_syms=$("$NDK_BIN/llvm-nm" -D "$OUT/libffmpeg_jni.so" 2>/dev/null)
+          # Best-effort listing of all exported JNI symbols (informational).
+          printf '%s\n' "$export_syms" | grep -E 'Java_org_ffmpeg' || true
+          # Hard-assert the new Surface zero-copy JNI entry points are actually
+          # exported: a missing dynamic export means javac -h and the C side
+          # diverged on a signature, or the function was compiled out.
+          for sym in Java_org_ffmpeg_FFMpegNative_mediasurfaceHwdeviceCreate \
+                     Java_org_ffmpeg_FFMpegNative_setContextHwDeviceCtx; do
+            if ! printf '%s\n' "$export_syms" | grep -q " ${sym}$"; then
+              echo "::error::libffmpeg_jni.so does not export ${sym} (JNI signature mismatch or compiled out)"
+              exit 1
+            fi
+            echo "Exported JNI symbol present: ${sym}"
+          done
           # Verify HTTP/HTTPS protocol symbols and the mbedTLS TLS backend are
           # linked in. These are internal global URLProtocol symbols, NOT in the
           # dynamic export table (.dynsym), so we must read the full static symbol
@@ -298,6 +311,19 @@ jobs:
           # `--strip-unneeded` removes .symtab (keeping only .dynsym), after which
           # llvm-nm reports "no symbols" and the check would false-negative.
           "$NDK_BIN/llvm-nm" --defined-only "$OUT/libffmpeg_jni.so" > /tmp/jni_syms.txt
+          # The new Surface zero-copy path depends on the mediacodec hwcontext
+          # backend being linked (av_hwdevice_ctx_alloc dispatches to its
+          # AVHWDeviceType::device_create via ff_hwcontext_type_mediacodec).
+          # Both are libavutil internal symbols (.symtab, not .dynsym); their
+          # absence would make mediasurfaceHwdeviceCreate silently fall back /
+          # fail at runtime even though the JNI export checks above pass.
+          for sym in av_hwdevice_ctx_alloc ff_hwcontext_type_mediacodec; do
+            if ! grep -q " ${sym}$" /tmp/jni_syms.txt; then
+              echo "::error::libffmpeg_jni.so missing ${sym} (mediacodec hwcontext backend not linked)"
+              exit 1
+            fi
+            echo "MediaCodec hwcontext backend symbol present: ${sym}"
+          done
           for sym in ff_http_protocol ff_https_protocol ff_tls_protocol ff_tcp_protocol; do
             if ! grep -q " ${sym}$" /tmp/jni_syms.txt; then
               echo "::error::libffmpeg_jni.so missing ${sym} (network/protocol not linked)"

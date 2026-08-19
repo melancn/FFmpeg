@@ -48,6 +48,7 @@
 #include "libavutil/error.h"
 #include "libavutil/fifo.h"
 #include "libavutil/hwcontext.h"
+#include "libavutil/hwcontext_mediacodec.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/log.h"
 #include <android/log.h>
@@ -76,6 +77,10 @@
 #include "libswscale/swscale.h"
 
 #include "libswresample/swresample.h"
+
+/* Cached for the mediacodec hwdevice free callback, which runs detached from
+ * any Java frame and needs AttachCurrentThread to obtain a JNIEnv. */
+static JavaVM *g_vm = NULL;
 
 /* Convenience cast from a jlong handle to a typed pointer. */
 #define PTR(type, h) ((type)(intptr_t)(h))
@@ -431,6 +436,80 @@ Java_org_ffmpeg_FFMpegNative_mediasurfaceFree(JNIEnv *env, jobject thiz, jlong m
     AVMediaCodecContext *mc = PTR(AVMediaCodecContext *, mcCtx);
     if (mc)
         av_freep(&mc);
+}
+
+/* ------------------------------------------------------------------ */
+/* MediaCodec Surface zero-copy via AV_HWDEVICE_TYPE_MEDIACODEC.       */
+/*                                                                     */
+/* The surface-binding path used above (mediasurfaceDefaultInit) stores */
+/* the Surface in an ad-hoc AVMediaCodecContext hung off                */
+/* avctx->hwaccel_context. Under the default get_format that branch is */
+/* unreachable for the mediacodec decoder (its hw_config declares       */
+/* AD_HOC|HW_DEVICE_CTX, not INTERNAL), so the decoder falls back to    */
+/* software output (NV12 = 23). To hit the zero-copy path we instead    */
+/* build an AV_HWDEVICE_TYPE_MEDIACODEC device whose hwctx->surface is  */
+/* the App Surface, and attach it as avctx->hw_device_ctx BEFORE        */
+/* codecOpen2. This satisfies default get_format (returns               */
+/* AV_PIX_FMT_MEDIACODEC) and the decoder's surface lookup (reads       */
+/* device_ctx->hwctx->surface), so frames come back with format 164 and */
+/* frame->data[3] = AVMediaCodecBuffer* ready for                      */
+/* av_mediacodec_render_buffer_at_time.                                 */
+/* ------------------------------------------------------------------ */
+
+/* av_hwdevice_ctx_free calls ctx->free BEFORE av_freep(&ctx->hwctx)
+ * (hwcontext.c), so inside the callback hwctx is still valid and we can
+ * safely pull the Surface global ref back out and delete it. The free
+ * callback runs detached from any Java frame, so use the JavaVM cached
+ * in JNI_OnLoad to obtain a JNIEnv (AttachCurrentThread if needed). */
+static void mediacodec_hwdevice_free(void *opaque, uint8_t *data)
+{
+    AVHWDeviceContext *ctx = (AVHWDeviceContext *)data;
+    if (!ctx || !ctx->hwctx || !g_vm)
+        return;
+    AVMediaCodecDeviceContext *mc = (AVMediaCodecDeviceContext *)ctx->hwctx;
+    if (!mc->surface)
+        return;
+    JNIEnv *env = NULL;
+    int attached = 0;
+    if ((*g_vm)->GetEnv(g_vm, (void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+        if ((*g_vm)->AttachCurrentThread(g_vm, &env, NULL) == JNI_OK)
+            attached = 1;
+        else
+            env = NULL;
+    }
+    if (env)
+        (*env)->DeleteGlobalRef(env, (jobject)mc->surface);
+    if (attached)
+        (*g_vm)->DetachCurrentThread(g_vm);
+    mc->surface = NULL;
+}
+
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_mediasurfaceHwdeviceCreate(JNIEnv *env, jobject thiz, jobject surface)
+{
+    if (!surface)
+        return 0;
+    AVBufferRef *ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_MEDIACODEC);
+    if (!ref)
+        return 0;
+    AVHWDeviceContext *ctx = (AVHWDeviceContext *)ref->data;
+    AVMediaCodecDeviceContext *mc = (AVMediaCodecDeviceContext *)ctx->hwctx;
+    jobject gref = (*env)->NewGlobalRef(env, surface);
+    if (!gref) {
+        av_buffer_unref(&ref);
+        return 0;
+    }
+    mc->surface = (void *)gref;
+    mc->native_window = NULL;
+    mc->create_window = 0;
+    ctx->free = mediacodec_hwdevice_free;
+    if (av_hwdevice_ctx_init(ref) < 0) {
+        (*env)->DeleteGlobalRef(env, gref);
+        mc->surface = NULL;
+        av_buffer_unref(&ref);
+        return 0;
+    }
+    return (jlong)(intptr_t)ref;
 }
 
 JNIEXPORT jint JNICALL
@@ -1572,9 +1651,30 @@ Java_org_ffmpeg_FFMpegNative_setContextHwFramesCtx(JNIEnv *env, jobject thiz, jl
     AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
     AVBufferRef *ref = (AVBufferRef *)(intptr_t)hwFramesCtx;
     if (cc && ref) {
-        av_buffer_ref(ref);
-        cc->hw_frames_ctx = ref;
+        /* Drop any previously-attached ref first to avoid leaking it. */
+        av_buffer_unref(&cc->hw_frames_ctx);
+        AVBufferRef *copy = av_buffer_ref(ref);
+        if (copy)
+            cc->hw_frames_ctx = copy;
     }
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_setContextHwDeviceCtx(JNIEnv *env, jobject thiz,
+                                                    jlong codecCtx, jlong hwDeviceCtx)
+{
+    AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
+    AVBufferRef *ref = (AVBufferRef *)(intptr_t)hwDeviceCtx;
+    if (!cc || !ref)
+        return AVERROR(EINVAL);
+    av_buffer_unref(&cc->hw_device_ctx);
+    AVBufferRef *copy = av_buffer_ref(ref);
+    if (!copy) {
+        cc->hw_device_ctx = NULL;
+        return AVERROR(ENOMEM);
+    }
+    cc->hw_device_ctx = copy;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -4516,6 +4616,7 @@ Java_org_ffmpeg_FFMpegNative_swsAllocContext(JNIEnv *env, jobject thiz)
 JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM *vm, void *reserved)
 {
+    g_vm = vm;
     avformat_network_init();
     /* Register the global JavaVM so libavcodec's ff_jni_get_env() can resolve
      * it later; required by av_mediacodec_default_init/free. Passing NULL as

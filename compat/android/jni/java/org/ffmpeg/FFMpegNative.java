@@ -28,7 +28,13 @@ public final class FFMpegNative {
     /** Register a native log callback that forwards FFmpeg logs to Android Logcat. */
     public native void logSetCallback();
 
-    /** Attach a hardware frames context to a codec context. */
+    /**
+     * Attach a hardware frames context to a codec context, replacing any
+     * previously-set {@code hw_frames_ctx} (the old reference is released).
+     * Note: the mediacodec hardware decoders' {@code hw_config} does not
+     * declare {@code HW_FRAMES_CTX}, so this setter is unrelated to the
+     * Surface zero-copy path; use {@link #setContextHwDeviceCtx} for Surface.
+     */
     public native void setContextHwFramesCtx(long codecCtx, long hwFramesCtx);
 
     /** Map a hardware frame to a destination frame (or vice‑versa). */
@@ -530,10 +536,25 @@ public final class FFMpegNative {
      * must run before {@link #codecOpen2}; the Surface takes effect during
      * MediaCodec's configure phase.
      *
+     * <p><b>Caveat (mediacodec decoder):</b> on the mediacodec hardware
+     * decoders ({@code h264_mediacodec}, {@code hevc_mediacodec}, ...) this
+     * ad-hoc {@code hwaccel_context} path is <b>not</b> what drives Surface
+     * zero-copy. Under the default {@code get_format} the decoder selects
+     * its pixel format by inspecting {@code hw_device_ctx}; since this path
+     * never sets {@code hw_device_ctx}, {@code get_format} returns
+     * {@link #AV_PIX_FMT_MEDIACODEC} never, the decoder's Surface branch is
+     * skipped, and frames come back as {@link #AV_PIX_FMT_NV12} (23) —
+     * decoded in software buffers, not rendered to the Surface. New code that
+     * wants the zero-copy Surface path on mediacodec decoders should use
+     * {@link #mediasurfaceHwdeviceCreate} + {@link #setContextHwDeviceCtx}
+     * instead. This method is retained for compatibility with older callers
+     * and still works for the non-mediacodec Surface-binding it historically
+     * documented.
+     *
      * <p>Typical order:
      * <pre>
      * long mc = mediasurfaceAllocContext();
-     * if (mediasurfaceDefaultInit(codecCtx, mc, surface) &lt; 0) {
+     * if (mediasurfaceDefaultInit(codecCtx, mc, surface) < 0) {
      *     mediasurfaceFree(mc);      // rollback
      *     return error;
      * }
@@ -564,8 +585,76 @@ public final class FFMpegNative {
      * Free an {@code AVMediaCodecContext} that was never successfully
      * initialized (rollback only, after a failed
      * {@link #mediasurfaceDefaultInit}).
+     *
+     * <p><b>Use-after-free / double-free caveat.</b> This releases the
+     * {@code AVMediaCodecContext} handle directly. After a successful
+     * {@link #mediasurfaceDefaultInit} the codec context owns that same
+     * pointer via {@code avctx->hwaccel_context}, and
+     * {@link #mediasurfaceDefaultFree} will later both {@code DeleteGlobalRef}
+     * the Surface and {@code av_freep} the same memory. Therefore once init
+     * has succeeded <b>this method MUST NOT be called</b> on the returned
+     * handle: doing so leaves {@code hwaccel_context} dangling and the
+     * subsequent {@code mediasurfaceDefaultFree} will trigger a
+     * use-after-free / double-free (and a JVM abort on the dangling
+     * {@code DeleteGlobalRef}).
+     *
+     * <p>Use this only as the rollback of a <i>failed</i>
+     * {@code mediasurfaceDefaultInit} (return value {@code < 0}), which has
+     * already unwound the {@code hwaccel_context} install and is safe to
+     * clean up. Once init returns {@code 0} the Surface lifecycle is owned
+     * exclusively by {@link #mediasurfaceDefaultFree}.
      */
     public native void mediasurfaceFree(long mcCtx);
+
+    /**
+     * Allocate an {@code AV_HWDEVICE_TYPE_MEDIACODEC} device whose
+     * {@code hwctx->surface} holds the given Android {@code Surface}, ready
+     * to be attached to a codec context with
+     * {@link #setContextHwDeviceCtx}. This is the path that actually drives
+     * Surface zero-copy on the mediacodec hardware decoders (unlike
+     * {@link #mediasurfaceDefaultInit}, see its caveat): once the device is
+     * set as {@code hw_device_ctx}, the decoder's default {@code get_format}
+     * returns {@link #AV_PIX_FMT_MEDIACODEC} and decoded frames carry an
+     * {@code AVMediaCodecBuffer*} in {@code frame->data[3]} for
+     * {@link #mediasurfaceRenderBufferAtTime}.
+     *
+     * <p>The handle is an opaque {@code AVBufferRef*} (0 on failure). Release
+     * it with {@link #bufferRefFree} after the codec context has been freed;
+     * dropping the last reference invokes a free callback that deletes the
+     * Surface global ref this method created.
+     *
+     * <p>Typical order:
+     * <pre>
+     * long dev = mediasurfaceHwdeviceCreate(surface);   // 0 == failure
+     * // ... codecAllocContext3 + parametersToContext ...
+     * setContextHwDeviceCtx(codecCtx, dev);             // BEFORE codecOpen2
+     * codecOpen2(codecCtx, codec);
+     * // assert getContextPixFmt(codecCtx) == AV_PIX_FMT_MEDIACODEC
+     * ...decode; mediasurfaceGetBuffer / mediasurfaceRenderBufferAtTime...
+     * codecFreeContext(codecCtx);                       // unrefs its copy of dev
+     * bufferRefFree(dev);                               // last ref -> free callback
+     * </pre>
+     *
+     * @return a non-zero {@code AVBufferRef*} handle, or 0 on allocation or
+     *         init failure
+     */
+    public native long mediasurfaceHwdeviceCreate(android.view.Surface surface);
+
+    /**
+     * Attach a hardware device context (e.g. the one returned by
+     * {@link #mediasurfaceHwdeviceCreate}) to a codec context as
+     * {@code avctx->hw_device_ctx}, transferring a new reference to the
+     * codec. Any previously-attached {@code hw_device_ctx} is released first.
+     * Must be called before {@link #codecOpen2} so the decoder consults it
+     * during {@code get_format}. {@link #codecFreeContext} drops the codec's
+     * own reference; the caller still owns the original handle and must
+     * release it with {@link #bufferRefFree}.
+     *
+     * @return 0 on success, {@code AVERROR(EINVAL)} if either handle is null,
+     *         {@code AVERROR(ENOMEM)} if the new reference could not be
+     *         allocated
+     */
+    public native int setContextHwDeviceCtx(long codecCtx, long hwDeviceCtx);
 
 
     /* -------------------------------------------------------------- */
@@ -1736,11 +1825,28 @@ public final class FFMpegNative {
     public static final int AV_PIX_FMT_RGBA     = 26;
     public static final int AV_PIX_FMT_BGRA     = 28;
     /**
+     * Software NV12 (Y + interleaved UV). The mediacodec decoder falls back
+     * to this format (mapped from the platform {@code COLOR_FormatYUV420*}
+     * variants) when no Surface is attached via {@code hw_device_ctx}; decoded
+     * frames live in ordinary host buffers, not in {@code AVMediaCodecBuffer}.
+     * Asserting against this value after open2 helps detect the fallback.
+     */
+    public static final int AV_PIX_FMT_NV12 = 23;
+    /**
      * Android MediaCodec hardware pixel format. Only frames in this format
      * carry a non-null {@code AVMediaCodecBuffer*} in {@code frame->data[3]},
      * which is what {@link #mediasurfaceGetBuffer} hands back for rendering.
+     * Selected by the mediacodec decoder iff {@code avctx->hw_device_ctx} is
+     * a {@link #AV_HWDEVICE_TYPE_MEDIACODEC} device whose {@code hwctx->surface}
+     * is the App Surface (see {@link #mediasurfaceHwdeviceCreate}).
      */
     public static final int AV_PIX_FMT_MEDIACODEC = 164;
+
+    /**
+     * Hardware device type constants mirroring {@code enum AVHWDeviceType}.
+     * MediaCodec Surface zero-copy requires {@link #AV_HWDEVICE_TYPE_MEDIACODEC}.
+     */
+    public static final int AV_HWDEVICE_TYPE_MEDIACODEC = 10;
 
     /** Sample-format constants mirroring {@code enum AVSampleFormat}. */
     public static final int AV_SAMPLE_FMT_NONE  = -1;
@@ -1850,6 +1956,33 @@ public final class FFMpegNative {
 
     /** Codec id constant, mirrors {@code AV_CODEC_ID_NONE}. */
     public static final int AV_CODEC_ID_NONE = 0;
+
+    /** Common video codec id constants mirroring {@code enum AVCodecID}. */
+    public static final int AV_CODEC_ID_MPEG1VIDEO = 2;
+    public static final int AV_CODEC_ID_MPEG2VIDEO = 3;
+    public static final int AV_CODEC_ID_MPEG4     = 13;
+    public static final int AV_CODEC_ID_H264       = 28;
+    public static final int AV_CODEC_ID_VP8        = 140;
+    public static final int AV_CODEC_ID_VP9        = 167;
+    public static final int AV_CODEC_ID_HEVC       = 173;
+    public static final int AV_CODEC_ID_AV1        = 223;
+
+    /** Common audio codec id constants mirroring {@code enum AVCodecID}. */
+    public static final int AV_CODEC_ID_PCM_S16LE = 0x10000;  // = 65536
+    public static final int AV_CODEC_ID_AMR_NB     = 0x12000; // = 73728
+    public static final int AV_CODEC_ID_AMR_WB     = 73729;
+    public static final int AV_CODEC_ID_MP3        = 0x15001; // = 86017
+    public static final int AV_CODEC_ID_AAC        = 0x15002; // = 86018
+    public static final int AV_CODEC_ID_AC3        = 0x15003; // = 86019
+    public static final int AV_CODEC_ID_DTS        = 0x15004; // = 86020
+    public static final int AV_CODEC_ID_VORBIS     = 0x15005; // = 86021
+    public static final int AV_CODEC_ID_FLAC       = 0x1500c; // = 86028
+    public static final int AV_CODEC_ID_ALAC       = 0x15010; // = 86032
+    public static final int AV_CODEC_ID_EAC3       = 0x15038; // = 86056
+    public static final int AV_CODEC_ID_OPUS       = 0x1504c; // = 86076
+
+    /** @deprecated alias kept for parity with {@code AV_CODEC_ID_H265}. */
+    public static final int AV_CODEC_ID_H265 = AV_CODEC_ID_HEVC;
 
     /** Codec-config enum values mirroring {@code enum AVCodecConfig} (use with {@link #codecGetSupportedConfigs}). */
     public static final int AV_CODEC_CONFIG_PIX_FORMAT      = 0;
