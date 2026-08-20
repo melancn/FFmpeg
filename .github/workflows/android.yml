@@ -87,10 +87,14 @@ jobs:
           # Try to satisfy each package from cached .deb via dpkg, bypassing
           # apt's index version check (which would refuse an older-but-still-
           # working .deb after a distro bump and re-download anyway).
+          # Glob (with nullglob) rather than `ls`: a no-match `ls` exits 2 and
+          # pipefail + set -e would abort the whole step on a cache miss.
+          shopt -s nullglob
           for pkg in "${want_pkgs[@]}"; do
             # Pick the highest-versioned cached deb for this package.
-            deb=$(ls "$ARCHIVE_DIR"/${pkg}_*.deb 2>/dev/null | sort -V | tail -1)
-            if [ -n "$deb" ]; then
+            cached=("$ARCHIVE_DIR/${pkg}"_*.deb)
+            if [ "${#cached[@]}" -gt 0 ]; then
+              deb=$(printf '%s\n' "${cached[@]}" | sort -V | tail -1)
               echo "::notice::Reusing cached deb: $deb"
               to_install+=("$deb")
               cache_hit=1
@@ -98,6 +102,7 @@ jobs:
               echo "No cached deb for $pkg; will fetch via apt"
             fi
           done
+          shopt -u nullglob
 
           if [ "${#to_install[@]}" -gt 0 ]; then
             sudo dpkg -i --force-all "${to_install[@]}" || true
