@@ -806,10 +806,15 @@ Java_org_ffmpeg_FFMpegNative_frameCopyVideo(JNIEnv *env, jobject thiz,
     return ret;
 }
 
-/* Copy decoded audio frame bytes. For interleaved (non-planar) formats the
- * whole buffer is copied from data[0]; for planar formats only plane 0 is
- * copied (use frameCopyAudioPlane for individual channels). Returns bytes
- * copied, or AVERROR for planar layouts when called via this entry. */
+/* Copy decoded audio frame bytes. For interleaved (non-planar) formats all
+ * channels are copied from data[0]; for planar formats only plane 0 is copied
+ * (use frameCopyAudioPlane for individual channels). Returns bytes copied, or
+ * a negative AVERROR.
+ *
+ * The copied size is the frame's *actual* sample data size, not linesize[0]:
+ * av_frame_get_buffer pads linesize for SIMD alignment, so a caller sizing its
+ * array as nb_samples*channels*bps (the true payload) would otherwise get
+ * ENOMEM. */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_frameCopyAudio(JNIEnv *env, jobject thiz,
                                             jlong frame, jbyteArray out, jint off, jint len)
@@ -820,13 +825,15 @@ Java_org_ffmpeg_FFMpegNative_frameCopyAudio(JNIEnv *env, jobject thiz,
     enum AVSampleFormat fmt = (enum AVSampleFormat)f->format;
     int ch = f->ch_layout.nb_channels;
     int bps = av_get_bytes_per_sample(fmt);
-    int total;
-    if (!av_sample_fmt_is_planar(fmt)) {
+    if (f->nb_samples <= 0 || ch <= 0 || bps <= 0)
+        return AVERROR(EINVAL);
+    int total = av_sample_fmt_is_planar(fmt)
+        ? f->nb_samples * bps
+        : f->nb_samples * ch * bps;
+    /* Never read past the allocated plane. */
+    if (f->linesize[0] > 0 && total > f->linesize[0])
         total = f->linesize[0];
-    } else {
-        total = f->nb_samples * bps;
-    }
-    if (total <= 0 || ch <= 0 || bps <= 0)
+    if (total <= 0)
         return AVERROR(EINVAL);
     if (len < total)
         return AVERROR(ENOMEM);
