@@ -364,7 +364,13 @@ Java_org_ffmpeg_FFMpegNative_codecParametersToContext(JNIEnv *env, jobject thiz,
     AVCodecParameters *p = stream_par(fc, index);
     if (!cc || !p)
         return AVERROR(EINVAL);
-    return (jint)avcodec_parameters_to_context(cc, p);
+    int ret = avcodec_parameters_to_context(cc, p);
+    /* avcodec_parameters_to_context() does not carry the stream time base
+     * over, and decoders that rescale packet timestamps (mediacodec sends
+     * them to the codec in AV_TIME_BASE units) need it. */
+    if (ret >= 0)
+        cc->pkt_timebase = fc->streams[index]->time_base;
+    return (jint)ret;
 }
 
 JNIEXPORT jint JNICALL
@@ -1453,6 +1459,13 @@ Java_org_ffmpeg_FFMpegNative_setContextTimeBase(JNIEnv *env, jobject thiz, jlong
 }
 
 JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_setContextPktTimebase(JNIEnv *env, jobject thiz, jlong codecCtx, jint num, jint den)
+{
+    AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
+    if (cc) { cc->pkt_timebase.num = num; cc->pkt_timebase.den = den; }
+}
+
+JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_setContextFramerate(JNIEnv *env, jobject thiz, jlong codecCtx, jint num, jint den)
 {
     AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
@@ -1608,6 +1621,17 @@ Java_org_ffmpeg_FFMpegNative_logGetLevel(JNIEnv *env, jobject thiz)
 static void android_log_callback(void *ptr, int level, const char *fmt, va_list vl)
 {
     int android_level;
+
+    /* av_vlog() does not filter by level; that check lives inside
+     * av_log_default_callback, which this callback replaces. Without it
+     * av_log_set_level()/logSetLevel() has no effect and TRACE-level decoder
+     * chatter floods logcat. The high byte may carry a color tint, so mask it
+     * off before comparing (see libavutil/log.c). */
+    if (level >= 0)
+        level &= 0xff;
+    if (level > av_log_get_level())
+        return;
+
     switch (level) {
         case AV_LOG_PANIC:
         case AV_LOG_FATAL:
@@ -1623,6 +1647,8 @@ static void android_log_callback(void *ptr, int level, const char *fmt, va_list 
             android_level = ANDROID_LOG_INFO;
             break;
         case AV_LOG_VERBOSE:
+            android_level = ANDROID_LOG_VERBOSE;
+            break;
         case AV_LOG_DEBUG:
         case AV_LOG_TRACE:
         default:

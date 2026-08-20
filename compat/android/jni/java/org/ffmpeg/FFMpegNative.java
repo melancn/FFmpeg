@@ -25,7 +25,12 @@ package org.ffmpeg;
  */
 public final class FFMpegNative {
 
-    /** Register a native log callback that forwards FFmpeg logs to Android Logcat. */
+    /**
+     * Register a native log callback that forwards FFmpeg logs to Android Logcat.
+     * Forwarding honours the level set by {@link #logSetLevel} (default
+     * {@code AV_LOG_INFO}); raise it to {@link #AV_LOG_TRACE} to see the
+     * per-buffer codec chatter.
+     */
     public native void logSetCallback();
 
     /**
@@ -61,7 +66,7 @@ public final class FFMpegNative {
         System.loadLibrary("ffmpeg_jni");
     }
 
-    private FFMpegNative() {
+    public FFMpegNative() {
     }
 
     /* ================================================================== */
@@ -433,7 +438,10 @@ public final class FFMpegNative {
 
     /**
      * Copy stream parameters (codec id, width/height/format, ...) into a
-     * freshly allocated codec context, before opening it.
+     * freshly allocated codec context, before opening it. Also sets
+     * {@code pkt_timebase} from the stream time base, which decoders need to
+     * rescale packet timestamps correctly (the mediacodec decoders feed the
+     * codec in {@code AV_TIME_BASE} units).
      */
     public native int codecParametersToContext(long codecCtx, long fmtCtx, int index);
 
@@ -683,6 +691,12 @@ public final class FFMpegNative {
     public native void setContextHeight(long codecCtx, int height);
     /** Set the codec time base (num/den). Important for encoding. */
     public native void setContextTimeBase(long codecCtx, int num, int den);
+    /**
+     * Set the time base of incoming packets (decoding). Decoders use it to
+     * rescale packet timestamps; {@link #codecParametersToContext} already
+     * sets it, so this is only needed when building a context by hand.
+     */
+    public native void setContextPktTimebase(long codecCtx, int num, int den);
     /** Set the frame rate (num/den) for video encoding. */
     public native void setContextFramerate(long codecCtx, int num, int den);
     /** Set the audio sample rate (Hz). */
