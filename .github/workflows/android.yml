@@ -61,31 +61,63 @@ jobs:
       - name: Cache apt packages
         uses: actions/cache@v4
         with:
-          # Cache the downloaded .deb archives so apt-get install reuses them
-          # across runs instead of re-downloading on every job.  Keyed on the
-          # requested package set + the runner image's apt state file so a distro
-          # upgrade (new /var/lib/dpkg/status) naturally busts the cache.
-          path: |
-            ~/apt-archives
-          key: apt-android-${{ matrix.abi }}-${{ hashFiles('.github/workflows/android.yml') }}-${{ runner.arch }}
+          # Cache the downloaded .deb archives so apt install reuses them
+          # across runs instead of re-downloading on every job.  The key is NOT
+          # keyed on matrix.abi: ccache/pkg-config are host x86_64 .debs, the
+          # same binary regardless of which Android ABI this job targets.  A
+          # per-ABI key would just store N copies of the identical archive and
+          # make the first run of each ABI miss.  Keyed on (arch, workflow file
+          # hash) -- the latter so a change to the requested package list below
+          # naturally busts the cache.  restore-keys lets a new key still pick
+          # up older archives.
+          path: ~/apt-archives
+          key: apt-android-${{ runner.arch }}-v1
+          restore-keys: |
+            apt-android-${{ runner.arch }}-
 
       - name: Install ccache
         run: |
           set -euo pipefail
           ARCHIVE_DIR=~/apt-archives
           mkdir -p "$ARCHIVE_DIR"
-          # Restore previously cached debs into apt's archive dir so the install
-          # step finds them locally and skips re-downloading on hit.
-          if ls "$ARCHIVE_DIR"/*.deb >/dev/null 2>&1; then
-            sudo cp -v "$ARCHIVE_DIR"/*.deb /var/cache/apt/archives/ 2>/dev/null || true
+
+          want_pkgs=(ccache pkg-config)
+          to_install=()
+          cache_hit=0
+          # Try to satisfy each package from cached .deb via dpkg, bypassing
+          # apt's index version check (which would refuse an older-but-still-
+          # working .deb after a distro bump and re-download anyway).
+          for pkg in "${want_pkgs[@]}"; do
+            # Pick the highest-versioned cached deb for this package.
+            deb=$(ls "$ARCHIVE_DIR"/${pkg}_*.deb 2>/dev/null | sort -V | tail -1)
+            if [ -n "$deb" ]; then
+              echo "::notice::Reusing cached deb: $deb"
+              to_install+=("$deb")
+              cache_hit=1
+            else
+              echo "No cached deb for $pkg; will fetch via apt"
+            fi
+          done
+
+          if [ "${#to_install[@]}" -gt 0 ]; then
+            sudo dpkg -i --force-all "${to_install[@]}" || true
           fi
+
+          # apt-get install repairs any missing/broken deps and fills gaps for
+          # packages not found in the cache (or whose deps aren't cached).
           sudo apt-get update
-          # A plain install: apt reuses any .deb already in /var/cache/apt/archives
-          # and only fetches the missing ones, so the first run downloads while
-          # subsequent runs hit the cache and stay offline for cached packages.
-          sudo apt-get install -y -o dir::cache::archives=/var/cache/apt/archives ccache pkg-config
-          # Persist any newly fetched debs back into the cache path for next run.
+          sudo apt-get install -y -o dir::cache::archives=/var/cache/apt/archives "${want_pkgs[@]}"
+
+          # Persist all fetched debs back into the cache path for next run.
+          shopt -s nullglob
           cp -v /var/cache/apt/archives/*.deb "$ARCHIVE_DIR"/ 2>/dev/null || true
+          shopt -u nullglob
+
+          if [ "$cache_hit" -eq 1 ]; then
+            echo "::notice::apt package cache HIT (at least one deb reused)"
+          else
+            echo "::notice::apt package cache MISS (first run or cache evicted)"
+          fi
           ccache --version
 
       - name: Cache ccache
