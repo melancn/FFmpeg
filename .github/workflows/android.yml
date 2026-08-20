@@ -316,7 +316,13 @@ jobs:
           # diverged on a signature, or the function was compiled out.
           for sym in Java_org_ffmpeg_FFMpegNative_mediasurfaceHwdeviceCreate \
                      Java_org_ffmpeg_FFMpegNative_setContextHwDeviceCtx \
-                     Java_org_ffmpeg_FFMpegNative_setContextPktTimebase; do
+                     Java_org_ffmpeg_FFMpegNative_setContextPktTimebase \
+                     Java_org_ffmpeg_FFMpegNative_streamGetParProfile \
+                     Java_org_ffmpeg_FFMpegNative_streamGetParChannelLayout \
+                     Java_org_ffmpeg_FFMpegNative_windowRendererCreate \
+                     Java_org_ffmpeg_FFMpegNative_windowRendererSetSize \
+                     Java_org_ffmpeg_FFMpegNative_windowRendererRender \
+                     Java_org_ffmpeg_FFMpegNative_windowRendererFree; do
             if ! printf '%s\n' "$export_syms" | grep -q " ${sym}$"; then
               echo "::error::libffmpeg_jni.so does not export ${sym} (JNI signature mismatch or compiled out)"
               exit 1

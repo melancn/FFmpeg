@@ -41,6 +41,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
+
 #include "libavutil/avutil.h"
 #include "libavutil/buffer.h"
 #include "libavutil/audio_fifo.h"
@@ -2710,6 +2713,27 @@ Java_org_ffmpeg_FFMpegNative_streamGetParChannels(JNIEnv *env, jobject thiz, jlo
 }
 
 JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_streamGetParProfile(JNIEnv *env, jobject thiz, jlong ctx, jint index)
+{
+    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    return p ? (jint)p->profile : (jint)AV_PROFILE_UNKNOWN;
+}
+
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_streamGetParChannelLayout(JNIEnv *env, jobject thiz, jlong ctx, jint index)
+{
+    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    if (!p)
+        return 0;
+    /* Only mask-order layouts map onto an Android channel mask; native/custom
+     * orders have no meaningful bitmask, so report 0 and let the caller fall
+     * back to a channel-count-derived layout. */
+    if (p->ch_layout.order != AV_CHANNEL_ORDER_NATIVE)
+        return 0;
+    return (jlong)p->ch_layout.u.mask;
+}
+
+JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetExtradata(JNIEnv *env, jobject thiz,
                                                jlong ctx, jint index, jbyteArray out, jint off, jint len)
 {
@@ -4630,6 +4654,116 @@ JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_swsAllocContext(JNIEnv *env, jobject thiz)
 {
     return (jlong)(intptr_t)sws_alloc_context();
+}
+
+/* ------------------------------------------------------------------ */
+/* Software video render path: sws_scale straight into an              */
+/* ANativeWindow buffer.                                               */
+/*                                                                     */
+/* Used as the fallback when MediaCodec hardware decoding is           */
+/* unavailable. Scaling directly into the window buffer avoids the      */
+/* byte[] -> Bitmap -> Canvas round trip a Java-side renderer would    */
+/* need (two extra full-frame copies per frame).                       */
+/*                                                                     */
+/* The SwsContext is cached across frames and only rebuilt when the     */
+/* source frame geometry/format or the window buffer size changes.      */
+/* ------------------------------------------------------------------ */
+
+typedef struct FFWindowRenderer {
+    ANativeWindow     *win;
+    struct SwsContext *sws;
+    int src_w, src_h, src_fmt;
+    int dst_w, dst_h;
+} FFWindowRenderer;
+
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_windowRendererCreate(JNIEnv *env, jobject thiz, jobject surface)
+{
+    if (!surface)
+        return 0;
+    ANativeWindow *win = ANativeWindow_fromSurface(env, surface);
+    if (!win)
+        return 0;
+    FFWindowRenderer *r = av_mallocz(sizeof(*r));
+    if (!r) {
+        ANativeWindow_release(win);
+        return 0;
+    }
+    r->win = win;
+    r->src_fmt = AV_PIX_FMT_NONE;
+    return (jlong)(intptr_t)r;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_windowRendererSetSize(JNIEnv *env, jobject thiz,
+                                                   jlong handle, jint width, jint height)
+{
+    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+    if (!r || !r->win || width <= 0 || height <= 0)
+        return AVERROR(EINVAL);
+    int ret = ANativeWindow_setBuffersGeometry(r->win, width, height,
+                                              WINDOW_FORMAT_RGBA_8888);
+    return ret == 0 ? 0 : AVERROR_EXTERNAL;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_windowRendererRender(JNIEnv *env, jobject thiz,
+                                                  jlong handle, jlong frame)
+{
+    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+    AVFrame *f = PTR(AVFrame *, frame);
+    if (!r || !r->win || !f || f->width <= 0 || f->height <= 0)
+        return AVERROR(EINVAL);
+
+    ANativeWindow_Buffer buf;
+    if (ANativeWindow_lock(r->win, &buf, NULL) != 0)
+        return AVERROR_EXTERNAL;
+    if (!buf.bits || buf.width <= 0 || buf.height <= 0) {
+        ANativeWindow_unlockAndPost(r->win);
+        return AVERROR_EXTERNAL;
+    }
+
+    if (!r->sws || r->src_w != f->width || r->src_h != f->height ||
+        r->src_fmt != f->format || r->dst_w != buf.width || r->dst_h != buf.height) {
+        r->sws = sws_getCachedContext(r->sws, f->width, f->height,
+                                      (enum AVPixelFormat)f->format,
+                                      buf.width, buf.height, AV_PIX_FMT_RGBA,
+                                      SWS_BILINEAR, NULL, NULL, NULL);
+        if (!r->sws) {
+            ANativeWindow_unlockAndPost(r->win);
+            return AVERROR(ENOMEM);
+        }
+        r->src_w   = f->width;
+        r->src_h   = f->height;
+        r->src_fmt = f->format;
+        r->dst_w   = buf.width;
+        r->dst_h   = buf.height;
+    }
+
+    /* buf.stride counts pixels, not bytes; RGBA_8888 is 4 bytes per pixel. */
+    uint8_t *dst_data[4] = { (uint8_t *)buf.bits, NULL, NULL, NULL };
+    int dst_linesize[4]  = { buf.stride * 4, 0, 0, 0 };
+    const uint8_t *src_data[4];
+    for (int i = 0; i < 4; i++)
+        src_data[i] = f->data[i];
+
+    int scaled = sws_scale(r->sws, src_data, f->linesize, 0, f->height,
+                           dst_data, dst_linesize);
+    ANativeWindow_unlockAndPost(r->win);
+    return scaled > 0 ? 0 : AVERROR_EXTERNAL;
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_windowRendererFree(JNIEnv *env, jobject thiz, jlong handle)
+{
+    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+    if (!r)
+        return;
+    if (r->sws)
+        sws_freeContext(r->sws);
+    if (r->win)
+        ANativeWindow_release(r->win);
+    av_free(r);
 }
 
 /* ------------------------------------------------------------------ */

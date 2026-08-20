@@ -955,6 +955,43 @@ public final class FFMpegNative {
      */
     public native int mediasurfaceRenderBufferAtTime(long buf, long nanoTime);
 
+    /* -------------------------------------------------------------- */
+    /* Software video rendering: sws_scale directly into an            */
+    /* ANativeWindow buffer. Use this on the software-decode fallback  */
+    /* path, where frames come back in an ordinary pixel format        */
+    /* instead of {@link #AV_PIX_FMT_MEDIACODEC}.                       */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Wrap a {@code Surface} in a native renderer that scales decoded frames
+     * straight into the window's buffer. This connects to the Surface as a
+     * buffer producer, so it is mutually exclusive with the MediaCodec
+     * zero-copy path ({@link #mediasurfaceHwdeviceCreate}) on the same
+     * Surface.
+     *
+     * @return an opaque renderer handle, or 0 on failure. Free with
+     *         {@link #windowRendererFree}.
+     */
+    public native long windowRendererCreate(android.view.Surface surface);
+
+    /**
+     * Set the window's buffer geometry (RGBA_8888). Pass the video's native
+     * resolution and let the Android view hierarchy scale the result.
+     * @return 0 on success, negative AVERROR
+     */
+    public native int windowRendererSetSize(long handle, int width, int height);
+
+    /**
+     * Scale and post one decoded frame to the Surface. The internal
+     * {@code SwsContext} is cached and only rebuilt when the frame geometry,
+     * pixel format, or window buffer size changes.
+     * @return 0 on success, negative AVERROR
+     */
+    public native int windowRendererRender(long handle, long frame);
+
+    /** Release the renderer, its scaler, and the underlying window reference. */
+    public native void windowRendererFree(long handle);
+
     /**
      * Allocate the frame's buffers for its current format/dimensions. Set
      * width/height (or sample rate/channels/sample format) first with the
@@ -1617,6 +1654,23 @@ public final class FFMpegNative {
     /** @return {@code initial_padding} of stream {@code index}'s codecpar. */
     public native int streamGetParInitialPadding(long ctx, int index);
 
+    /**
+     * @return {@code profile} of stream {@code index}'s codecpar (an
+     * {@code AV_PROFILE_*} value such as {@link #AV_PROFILE_DTS_HD_MA}), or
+     * {@link #AV_PROFILE_UNKNOWN}. Needed to tell DTS-HD/E-AC3 extension
+     * streams apart from their base formats when deciding whether a
+     * compressed-bitstream passthrough sink can accept the stream as-is.
+     */
+    public native int streamGetParProfile(long ctx, int index);
+
+    /**
+     * @return the channel-mask bits of stream {@code index}'s codecpar
+     * {@code ch_layout}, or 0 when the layout is not mask-ordered (custom or
+     * ambisonic orders have no meaningful bitmask). Use
+     * {@link #getDefaultChannelLayout} with the channel count as a fallback.
+     */
+    public native long streamGetParChannelLayout(long ctx, int index);
+
     /** @return the frame's crop_top field (display cropping). */
     public native int frameGetCropTop(long frame);
     /** @return the frame's crop_bottom field. */
@@ -1997,6 +2051,34 @@ public final class FFMpegNative {
 
     /** @deprecated alias kept for parity with {@code AV_CODEC_ID_H265}. */
     public static final int AV_CODEC_ID_H265 = AV_CODEC_ID_HEVC;
+
+    /**
+     * Codec profile constants mirroring {@code AV_PROFILE_*}, for use with
+     * {@link #streamGetParProfile}. Only the audio profiles that matter for
+     * compressed-bitstream passthrough are listed: a DTS stream whose profile
+     * is an HD extension (HRA/MA/Express) needs the {@code dca_core}
+     * bitstream filter before a plain {@code ENCODING_DTS} sink accepts it,
+     * and the same applies to E-AC3 Atmos over {@code eac3_core}.
+     */
+    public static final int AV_PROFILE_UNKNOWN         = -99;
+    public static final int AV_PROFILE_DTS             = 20;
+    public static final int AV_PROFILE_DTS_ES         = 30;
+    public static final int AV_PROFILE_DTS_96_24       = 40;
+    public static final int AV_PROFILE_DTS_HD_HRA     = 50;
+    public static final int AV_PROFILE_DTS_HD_MA       = 60;
+    public static final int AV_PROFILE_DTS_HD_MA_X    = 61;
+    public static final int AV_PROFILE_DTS_HD_MA_X_IMAX = 62;
+    public static final int AV_PROFILE_DTS_EXPRESS    = 70;
+    public static final int AV_PROFILE_EAC3_DDP_ATMOS = 30;
+    public static final int AV_PROFILE_TRUEHD_ATMOS   = 30;
+
+    /**
+     * {@code ANativeWindow} buffer formats for
+     * {@link #windowRendererSetSize} (mirrors {@code AHardwareBuffer_Format}).
+     */
+    public static final int WINDOW_FORMAT_RGBA_8888 = 1;
+    public static final int WINDOW_FORMAT_RGBX_8888 = 2;
+    public static final int WINDOW_FORMAT_RGB_565    = 4;
 
     /** Codec-config enum values mirroring {@code enum AVCodecConfig} (use with {@link #codecGetSupportedConfigs}). */
     public static final int AV_CODEC_CONFIG_PIX_FORMAT      = 0;
