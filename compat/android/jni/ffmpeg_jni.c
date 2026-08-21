@@ -608,6 +608,15 @@ Java_org_ffmpeg_FFMpegNative_packetFree(JNIEnv *env, jobject thiz, jlong pkt)
         av_packet_free(&p);
 }
 
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_packetClone(JNIEnv *env, jobject thiz, jlong pkt)
+{
+    AVPacket *p = PTR(AVPacket *, pkt);
+    if (!p)
+        return 0;
+    return (jlong)(intptr_t)av_packet_clone(p);
+}
+
 JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_packetUnref(JNIEnv *env, jobject thiz, jlong pkt)
 {

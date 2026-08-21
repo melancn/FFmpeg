@@ -314,7 +314,8 @@ jobs:
           # Hard-assert the new Surface zero-copy JNI entry points are actually
           # exported: a missing dynamic export means javac -h and the C side
           # diverged on a signature, or the function was compiled out.
-          for sym in Java_org_ffmpeg_FFMpegNative_mediasurfaceHwdeviceCreate \
+          for sym in Java_org_ffmpeg_FFMpegNative_packetClone \
+                     Java_org_ffmpeg_FFMpegNative_mediasurfaceHwdeviceCreate \
                      Java_org_ffmpeg_FFMpegNative_setContextHwDeviceCtx \
                      Java_org_ffmpeg_FFMpegNative_setContextPktTimebase \
                      Java_org_ffmpeg_FFMpegNative_streamGetParProfile \

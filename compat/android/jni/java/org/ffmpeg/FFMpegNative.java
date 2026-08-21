@@ -777,6 +777,12 @@ public final class FFMpegNative {
     /** Free the packet (handle becomes invalid). */
     public native void packetFree(long pkt);
 
+    /**
+     * Deep-copy a packet (av_packet_clone) into a new independent handle.
+     * @return new AVPacket handle (caller must {@link #packetFree}), 0 on failure.
+     */
+    public native long packetClone(long pkt);
+
     /** Reset the packet for reuse without freeing). */
     public native void packetUnref(long pkt);
 
