@@ -66,6 +66,8 @@
 #include "libavcodec/bsf.h"
 #include "libavcodec/codec_par.h"
 #include "libavcodec/codec_desc.h"
+#include "libavcodec/mpeg4audio.h"
+#include "libavcodec/put_bits.h"
 
 #include "libavformat/avformat.h"
 #include "libavformat/avio.h"
@@ -4771,6 +4773,161 @@ Java_org_ffmpeg_FFMpegNative_windowRendererFree(JNIEnv *env, jobject thiz, jlong
     if (r->win)
         ANativeWindow_release(r->win);
     av_free(r);
+}
+
+/* ------------------------------------------------------------------ */
+/* AAC raw -> ADTS packer for audio passthrough / offload.             */
+/*                                                                     */
+/* Matroska (and most containers) carry AAC as raw access units with   */
+/* the AudioSpecificConfig in codecpar->extradata, while Android's     */
+/* ENCODING_AAC_LC direct/offload sinks expect ADTS-framed input.      */
+/* FFmpeg has no bsf in the asc->adts direction (aac_adtstoasc is the  */
+/* reverse), so the 7-byte header is written here, using libavcodec's  */
+/* own bit-writer and MPEG-4 audio config parser. The field order is   */
+/* copied from libavformat/adtsenc.c:adts_write_frame_header(); the    */
+/* legality checks mirror adts_decode_extradata() minus the PCE        */
+/* branch (chan_config == 0 is simply rejected, falling back to sw).   */
+/* ------------------------------------------------------------------ */
+
+#define ADTS_HEADER_SIZE 7
+#define ADTS_MAX_FRAME_BYTES ((1 << 14) - 1)
+
+typedef struct FFAacAdtsPacker {
+    int objecttype;         /* m4ac.object_type - 1 */
+    int sample_rate_index;  /* m4ac.sampling_index  */
+    int channel_conf;       /* m4ac.chan_config     */
+    int mpeg_id;            /* 0 = MPEG-4           */
+} FFAacAdtsPacker;
+
+/**
+ * Parse the AudioSpecificConfig from codecpar->extradata of stream
+ * {@code stream_index} and create a packer for it.
+ *
+ * @return an opaque FFAacAdtsPacker handle, or 0 when the stream cannot be
+ *         ADTS-packed (no extradata, AOT > 4, sampling_index == 15,
+ *         chan_config 0/>7). Free with aacAdtsPackerFree.
+ */
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_aacAdtsPackerCreate(JNIEnv *env, jobject thiz,
+                                                 jlong formatCtx, jint streamIndex)
+{
+    AVFormatContext *s = PTR(AVFormatContext *, formatCtx);
+    if (!s || streamIndex < 0 || streamIndex >= (jint)s->nb_streams)
+        return 0;
+    AVCodecParameters *par = s->streams[streamIndex]->codecpar;
+    if (!par || par->codec_id != AV_CODEC_ID_AAC)
+        return 0;
+    if (par->extradata_size <= 0 || !par->extradata) {
+        av_log(NULL, AV_LOG_WARNING, "aac adts: no extradata (AudioSpecificConfig), cannot pack\n");
+        return 0;
+    }
+
+    MPEG4AudioConfig m4ac;
+    memset(&m4ac, 0, sizeof(m4ac));
+    int off = avpriv_mpeg4audio_get_config2(&m4ac, par->extradata,
+                                            par->extradata_size, 1, NULL);
+    if (off < 0) {
+        av_log(NULL, AV_LOG_WARNING, "aac adts: AudioSpecificConfig parse failed (%d)\n", off);
+        return 0;
+    }
+
+    int objecttype        = m4ac.object_type - 1;
+    int sample_rate_index = m4ac.sampling_index;
+    int channel_conf      = m4ac.chan_config;
+
+    /* Legality checks mirror adts_decode_extradata(); each failure is logged
+     * separately so "设备不支持" and "码流装不下 ADTS" can be told apart. */
+    if (objecttype > 3) {
+        av_log(NULL, AV_LOG_WARNING,
+               "aac adts: MPEG-4 AOT %d is not allowed in ADTS\n", objecttype + 1);
+        return 0;
+    }
+    if (sample_rate_index == 15) {
+        av_log(NULL, AV_LOG_WARNING, "aac adts: escape sample rate index illegal in ADTS\n");
+        return 0;
+    }
+    if (channel_conf > 7) {
+        av_log(NULL, AV_LOG_WARNING,
+               "aac adts: channelConfiguration %d > 7 not supported in ADTS\n", channel_conf);
+        return 0;
+    }
+    if (channel_conf == 0) {
+        /* chan_config == 0 requires a PCE in every frame; not implemented --
+         * fall back to software decode instead. */
+        av_log(NULL, AV_LOG_WARNING, "aac adts: channelConfig 0 (PCE-required) not supported\n");
+        return 0;
+    }
+
+    FFAacAdtsPacker *p = av_mallocz(sizeof(*p));
+    if (!p)
+        return 0;
+    p->objecttype        = objecttype;
+    p->sample_rate_index = sample_rate_index;
+    p->channel_conf      = channel_conf;
+    p->mpeg_id           = 0; /* MPEG-4 */
+    av_log(NULL, AV_LOG_INFO, "aac adts: objecttype=%d sample_rate_index=%d channel_conf=%d\n",
+           objecttype, sample_rate_index, channel_conf);
+    return (jlong)(intptr_t)p;
+}
+
+/**
+ * Wrap one raw AAC access unit in an ADTS header and copy it out.
+ * Output layout: [7-byte header][packet payload].
+ *
+ * @return total bytes written (7 + payload), or a negative AVERROR.
+ */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_aacAdtsPackerWrap(JNIEnv *env, jobject thiz,
+                                               jlong handle, jlong pkt,
+                                               jbyteArray out, jint off, jint len)
+{
+    FFAacAdtsPacker *p = PTR(FFAacAdtsPacker *, handle);
+    AVPacket *packet = PTR(AVPacket *, pkt);
+    if (!p || !packet || !out || !packet->data || packet->size < 0)
+        return AVERROR(EINVAL);
+
+    jint frame_size = ADTS_HEADER_SIZE + packet->size;
+    if (frame_size > ADTS_MAX_FRAME_BYTES || frame_size > len)
+        return AVERROR(EINVAL);
+
+    /* Field order copied from adts_write_frame_header(). */
+    uint8_t hdr[ADTS_HEADER_SIZE];
+    PutBitContext pb;
+    init_put_bits(&pb, hdr, ADTS_HEADER_SIZE);
+
+    /* adts_fixed_header */
+    put_bits(&pb, 12, 0xfff);            /* syncword */
+    put_bits(&pb, 1, p->mpeg_id);        /* ID */
+    put_bits(&pb, 2, 0);                 /* layer */
+    put_bits(&pb, 1, 1);                 /* protection_absent */
+    put_bits(&pb, 2, p->objecttype);     /* profile_objecttype */
+    put_bits(&pb, 4, p->sample_rate_index);
+    put_bits(&pb, 1, 0);                 /* private_bit */
+    put_bits(&pb, 3, p->channel_conf);   /* channel_configuration */
+    put_bits(&pb, 1, 0);                 /* original_copy */
+    put_bits(&pb, 1, 0);                 /* home */
+
+    /* adts_variable_header */
+    put_bits(&pb, 1, 0);                 /* copyright_identification_bit */
+    put_bits(&pb, 1, 0);                 /* copyright_identification_start */
+    put_bits(&pb, 13, frame_size);       /* aac_frame_length */
+    put_bits(&pb, 11, 0x7ff);            /* adts_buffer_fullness */
+    put_bits(&pb, 2, 0);                 /* number_of_raw_data_blocks_in_frame */
+    flush_put_bits(&pb);
+
+    (*env)->SetByteArrayRegion(env, out, off, ADTS_HEADER_SIZE, (const jbyte *)hdr);
+    if (packet->size > 0)
+        (*env)->SetByteArrayRegion(env, out, off + ADTS_HEADER_SIZE,
+                                   packet->size, (const jbyte *)packet->data);
+    return frame_size;
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_aacAdtsPackerFree(JNIEnv *env, jobject thiz, jlong handle)
+{
+    FFAacAdtsPacker *p = PTR(FFAacAdtsPacker *, handle);
+    if (p)
+        av_free(p);
 }
 
 /* ------------------------------------------------------------------ */

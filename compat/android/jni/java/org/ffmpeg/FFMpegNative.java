@@ -992,6 +992,42 @@ public final class FFMpegNative {
     /** Release the renderer, its scaler, and the underlying window reference. */
     public native void windowRendererFree(long handle);
 
+    /* -------------------------------------------------------------- */
+    /* AAC raw -> ADTS packer (audio passthrough / offload).           */
+    /*                                                                  */
+    /* Containers such as Matroska carry AAC as raw access units with  */
+    /* the AudioSpecificConfig in codecpar->extradata, while Android's */
+    /* ENCODING_AAC_LC direct/offload sinks expect ADTS-framed input.  */
+    /* Only AAC LC-family configs with chan_config 1..7 can be        */
+    /* ADTS-packed (no PCE support); HE/xHE cannot -- create returns   */
+    /* 0 for those and the caller falls back to software decoding.     */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Create a packer from the AudioSpecificConfig in stream
+     * {@code index}'s codecpar->extradata.
+     *
+     * @return an opaque packer handle, or 0 when the stream cannot be
+     *         ADTS-packed (no extradata, AOT outside Main/LC/SSR/LTP,
+     *         escape sampling index, chan_config 0 / > 7). Free with
+     *         {@link #aacAdtsPackerFree}.
+     */
+    public native long aacAdtsPackerCreate(long formatCtx, int streamIndex);
+
+    /**
+     * Wrap one raw AAC access unit ({@code pkt}) in a 7-byte ADTS header and
+     * copy [header][payload] into {@code out} at {@code off}. {@code out}
+     * must have room for {@code 7 + packetSize} bytes.
+     *
+     * @return total bytes written ({@code 7 + packetSize}), or a negative
+     *         AVERROR ({@code EINVAL} when the buffer is too small or the
+     *         frame exceeds the 16383-byte ADTS limit).
+     */
+    public native int aacAdtsPackerWrap(long handle, long pkt, byte[] out, int off, int len);
+
+    /** Release the packer. */
+    public native void aacAdtsPackerFree(long handle);
+
     /**
      * Allocate the frame's buffers for its current format/dimensions. Set
      * width/height (or sample rate/channels/sample format) first with the
@@ -2071,6 +2107,16 @@ public final class FFMpegNative {
     public static final int AV_PROFILE_DTS_EXPRESS    = 70;
     public static final int AV_PROFILE_EAC3_DDP_ATMOS = 30;
     public static final int AV_PROFILE_TRUEHD_ATMOS   = 30;
+
+    /**
+     * AAC profiles ({@code libavcodec/defs.h}). Only AAC LC can be
+     * ADTS-packed for {@code ENCODING_AAC_LC} passthrough; HE / HEv2 carry
+     * SBR/PS signalling that plain ADTS cannot express and must go through
+     * the software decoder.
+     */
+    public static final int AV_PROFILE_AAC_LOW   = 1;
+    public static final int AV_PROFILE_AAC_HE    = 4;
+    public static final int AV_PROFILE_AAC_HE_V2 = 28;
 
     /**
      * {@code ANativeWindow} buffer formats for
