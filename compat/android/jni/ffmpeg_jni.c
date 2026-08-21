@@ -4931,6 +4931,82 @@ Java_org_ffmpeg_FFMpegNative_aacAdtsPackerFree(JNIEnv *env, jobject thiz, jlong 
 }
 
 /* ------------------------------------------------------------------ */
+/* Interrupt flag: lets Java abort a blocking av_read_frame /           */
+/* avformat_open_input from another thread.                             */
+/*                                                                      */
+/* Without this, a demux thread parked in a socket read can only be     */
+/* unblocked by the protocol's own rw_timeout. A player that tears down  */
+/* its AVFormatContext while that read is still in flight frees the      */
+/* URLContext underneath the blocked thread, and the thread then         */
+/* dereferences a dangling &h->interrupt_callback (SIGBUS / SIGSEGV on   */
+/* a garbage function pointer). Setting the flag makes FFmpeg's I/O      */
+/* layer return AVERROR_EXIT promptly, so the owner can join the thread  */
+/* before closing the context.                                          */
+/*                                                                      */
+/* The callback deliberately stays in C and never enters the JVM: it is  */
+/* polled inside tight I/O loops, and an AttachCurrentThread round trip  */
+/* per poll would be both slow and deadlock-prone during teardown.       */
+/* ------------------------------------------------------------------ */
+
+typedef struct FFInterruptFlag {
+    /* Written by the controlling thread, polled by the I/O thread. */
+    volatile int aborted;
+} FFInterruptFlag;
+
+static int ff_jni_interrupt_cb(void *opaque)
+{
+    const FFInterruptFlag *f = (const FFInterruptFlag *)opaque;
+    return f && f->aborted;
+}
+
+/* Allocate a cleared interrupt flag. Free with interruptFlagFree once no
+ * AVFormatContext references it any more. @return handle, 0 on OOM. */
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_interruptFlagCreate(JNIEnv *env, jobject thiz)
+{
+    return (jlong)(intptr_t)av_mallocz(sizeof(FFInterruptFlag));
+}
+
+/* Install the flag as ctx->interrupt_callback. Must be called before the
+ * context starts doing I/O (i.e. before formatOpenInput for open-time
+ * cancellation, or right after it for read-time cancellation).
+ * @return 0 on success, negative AVERROR */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_formatSetInterruptFlag(JNIEnv *env, jobject thiz,
+                                                    jlong ctx, jlong flag)
+{
+    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FFInterruptFlag *f = PTR(FFInterruptFlag *, flag);
+    if (!c || !f)
+        return AVERROR(EINVAL);
+    c->interrupt_callback.callback = ff_jni_interrupt_cb;
+    c->interrupt_callback.opaque   = f;
+    return 0;
+}
+
+/* Raise the flag: in-flight and subsequent blocking I/O on any context
+ * holding it fails with AVERROR_EXIT. Safe to call from any thread, and
+ * safe to call repeatedly. */
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_interruptFlagAbort(JNIEnv *env, jobject thiz, jlong flag)
+{
+    FFInterruptFlag *f = PTR(FFInterruptFlag *, flag);
+    if (f)
+        f->aborted = 1;
+}
+
+/* Free the flag. The caller must guarantee that no AVFormatContext still
+ * points at it (close the contexts first), otherwise their callback would
+ * read freed memory. */
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_interruptFlagFree(JNIEnv *env, jobject thiz, jlong flag)
+{
+    FFInterruptFlag *f = PTR(FFInterruptFlag *, flag);
+    if (f)
+        av_free(f);
+}
+
+/* ------------------------------------------------------------------ */
 /* Library init: initialize the FFmpeg network layer when the .so is   */
 /* loaded, so http:// and https:// (mbedTLS TLS backend) work at       */
 /* runtime on Android without the caller having to invoke               */

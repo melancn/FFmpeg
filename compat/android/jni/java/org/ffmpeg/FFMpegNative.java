@@ -1028,6 +1028,57 @@ public final class FFMpegNative {
     /** Release the packer. */
     public native void aacAdtsPackerFree(long handle);
 
+    /* -------------------------------------------------------------- */
+    /* Interrupt flag: abort blocking I/O from another thread.         */
+    /*                                                                 */
+    /* A demux thread parked in a network read can otherwise only be   */
+    /* unblocked by the protocol's rw_timeout. Closing the             */
+    /* AVFormatContext while that read is in flight frees the          */
+    /* URLContext under the blocked thread, which then crashes on a    */
+    /* dangling interrupt_callback. Raise the flag first, join the     */
+    /* thread, then close the context.                                 */
+    /*                                                                 */
+    /* Typical order:                                                  */
+    /*   long flag = interruptFlagCreate();                            */
+    /*   ctx = formatOpenInput(url, opts);                             */
+    /*   formatSetInterruptFlag(ctx, flag);                            */
+    /*   ... demux on another thread ...                               */
+    /*   interruptFlagAbort(flag);   // readFrame -> AVERROR_EXIT      */
+    /*   demuxThread.join();                                           */
+    /*   formatCloseInput(ctx);                                        */
+    /*   interruptFlagFree(flag);    // only after every ctx is closed */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Allocate a cleared interrupt flag.
+     *
+     * @return an opaque flag handle, or 0 on allocation failure. Free with
+     *         {@link #interruptFlagFree}.
+     */
+    public native long interruptFlagCreate();
+
+    /**
+     * Install {@code flag} as the context's {@code interrupt_callback}, so
+     * blocking operations on it abort with {@code AVERROR_EXIT} once the flag
+     * is raised.
+     *
+     * @return 0 on success, or a negative AVERROR
+     */
+    public native int formatSetInterruptFlag(long formatCtx, long flag);
+
+    /**
+     * Raise the flag: in-flight and subsequent blocking I/O on any context
+     * holding it fails with {@code AVERROR_EXIT}. Callable from any thread and
+     * idempotent.
+     */
+    public native void interruptFlagAbort(long flag);
+
+    /**
+     * Free the flag. Every {@link #formatSetInterruptFlag} context must be
+     * closed first, otherwise its callback would read freed memory.
+     */
+    public native void interruptFlagFree(long flag);
+
     /**
      * Allocate the frame's buffers for its current format/dimensions. Set
      * width/height (or sample rate/channels/sample format) first with the

@@ -325,7 +325,11 @@ jobs:
                      Java_org_ffmpeg_FFMpegNative_windowRendererFree \
                      Java_org_ffmpeg_FFMpegNative_aacAdtsPackerCreate \
                      Java_org_ffmpeg_FFMpegNative_aacAdtsPackerWrap \
-                     Java_org_ffmpeg_FFMpegNative_aacAdtsPackerFree; do
+                     Java_org_ffmpeg_FFMpegNative_aacAdtsPackerFree \
+                     Java_org_ffmpeg_FFMpegNative_interruptFlagCreate \
+                     Java_org_ffmpeg_FFMpegNative_formatSetInterruptFlag \
+                     Java_org_ffmpeg_FFMpegNative_interruptFlagAbort \
+                     Java_org_ffmpeg_FFMpegNative_interruptFlagFree; do
             if ! printf '%s\n' "$export_syms" | grep -q " ${sym}$"; then
               echo "::error::libffmpeg_jni.so does not export ${sym} (JNI signature mismatch or compiled out)"
               exit 1
