@@ -572,10 +572,24 @@ static int handle_eac3(MOVMuxContext *mov, AVPacket *pkt, MOVTrack *track)
                 ret /= 8;
 
                 /* get the dependent stream channel map, if exists */
-                if (hdr->channel_map_present)
-                    info->substream[parent].chan_loc |= (hdr->channel_map >> 5) & 0x1f;
-                else
+                if (hdr->channel_map_present) {
+                    /* chanmap is a 16-bit field read MSB-first, so flag index
+                     * i sits at bit (15 - i), matching the indexing of
+                     * ff_eac3_custom_channel_map_locations. chan_loc bits 0-7
+                     * carry flag indices 5-12, i.e. chanmap bit (10 - j).
+                     * The mapping is not contiguous at the top: index 13
+                     * (Lts/Rts) has no chan_loc bit and is skipped, and
+                     * chan_loc bit 8 carries LFE2, which is index 14 and so
+                     * chanmap bit 1. */
+                    for (int j = 0; j < 8; j++) {
+                        if ((hdr->channel_map >> (10 - j)) & 1)
+                            info->substream[parent].chan_loc |= 1 << j;
+                    }
+                    if ((hdr->channel_map >> 1) & 1)
+                        info->substream[parent].chan_loc |= 1 << 8;
+                } else {
                     info->substream[parent].chan_loc |= hdr->channel_mode;
+                }
                 cumul_size += hdr->frame_size;
             }
         }
@@ -6946,6 +6960,48 @@ static int check_pkt(AVFormatContext *s, MOVTrack *trk, AVPacket *pkt)
         return AVERROR(EINVAL);
     }
     return 0;
+}
+
+int ff_mov_set_fragment_end_hint(AVFormatContext *s, int stream_index,
+                                 const AVPacket *pkt, AVRational src_time_base)
+{
+    MOVMuxContext *mov = s->priv_data;
+    AVStream *st;
+    MOVTrack *track;
+    int64_t offset, dts, pts, candidate_duration;
+
+    if (!(mov->flags & FF_MOV_FLAG_FRAGMENT) ||
+        stream_index < 0 || stream_index >= s->nb_streams ||
+        pkt->dts == AV_NOPTS_VALUE)
+        return 0;
+
+    st = s->streams[stream_index];
+    track = st->priv_data;
+    if (!track->entry || track->start_dts == AV_NOPTS_VALUE)
+        return 0;
+
+    if (ff_get_muxer_ts_offset(s, stream_index, &offset) < 0)
+        return 0;
+
+    dts = av_rescale_q(pkt->dts, src_time_base, st->time_base) + offset;
+    pts = pkt->pts == AV_NOPTS_VALUE
+        ? AV_NOPTS_VALUE
+        : av_rescale_q(pkt->pts, src_time_base, st->time_base) + offset;
+    if (track->dts_shift != AV_NOPTS_VALUE)
+        dts += track->dts_shift;
+
+    candidate_duration = dts - track->start_dts;
+    if (dts <= track->cluster[track->entry - 1].dts ||
+        candidate_duration < 0 || candidate_duration >= track->track_duration)
+        return 0;
+
+    track->track_duration = candidate_duration;
+    track->end_pts = pts != AV_NOPTS_VALUE ? pts : dts;
+    if (!(pkt->flags & AV_PKT_FLAG_DISCARD))
+        track->elst_end_pts = track->end_pts;
+    track->end_reliable = 1;
+
+    return 1;
 }
 
 int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
