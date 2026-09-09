@@ -384,22 +384,29 @@ jobs:
       - name: Compile libffmpeg_jni.so
         env:
           NDK_BIN: ${{ steps.ndk.outputs.ndk_bin }}
+          CC: ${{ steps.toolchain.outputs.cc }}
           CXX: ${{ steps.toolchain.outputs.cxx }}
           STRIP: ${{ steps.toolchain.outputs.strip }}
         run: |
           ABI="${{ matrix.abi }}"
-          # Use the API-level-specific clang++ driver for the .so (consistent
-          # ABI/sysroot).  libass's static archive is C++ code, so the link
-          # needs a C++ driver for libc++; -static-libstdc++ below keeps that
-          # in-process instead of adding a libc++_shared.so DT_NEEDED.
-          LINK_CXX="$CXX"
           PREFIX="$PWD/$BUILD_DIR/$INSTALL_DIR"
           MBEDTLS_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
           DEPS_PREFIX="$PWD/$BUILD_DIR/deps-install"
           OUT="$PWD/$OUT_DIR/$ABI/lib"
           CLS="$PWD/$OUT_DIR/$ABI/classes"
+          JNI_OBJ="$PWD/$BUILD_DIR/ffmpeg_jni-$ABI.o"
           mkdir -p "$OUT" "$CLS"
 
+          # Compile the JNI translation unit as C. Passing a .c file to clang++
+          # makes NDK 29 treat FFmpeg's C headers and JNIEnv ABI as C++17.
+          "$CC" -c -fPIC -O2 \
+            -I"$PWD" -I"$PWD/compat/android/jni" -I"$PWD/compat/android/jni/generated" \
+            -I"$PREFIX/include" -I"$DEPS_PREFIX/include" \
+            "$PWD/compat/android/jni/ffmpeg_jni.c" \
+            -o "$JNI_OBJ"
+
+          # Link with the API-level-specific clang++ driver because libass is
+          # C++; -static-libstdc++ avoids a libc++_shared.so DT_NEEDED entry.
           # The FFmpeg static libs now reference MediaCodec decoder objects
           # (h264_mediacodec, hevc_mediacodec, ...) which call the NDK mediandk
           # + native_window + binder APIs. Those live in the Android platform
@@ -409,10 +416,8 @@ jobs:
           #   -ljnigraphics : AImage / bitmap helpers used by some mediacodec
           #                   paths; harmless if unreferenced (the linker drops it)
           # All three are available from API 21+ at the chosen API 24 driver.
-          "$LINK_CXX" -shared -fPIC \
-            -I"$PWD" -I"$PWD/compat/android/jni" -I"$PWD/compat/android/jni/generated" \
-            -I"$PREFIX/include" -I"$DEPS_PREFIX/include" \
-            "$PWD/compat/android/jni/ffmpeg_jni.c" \
+          "$CXX" -shared -fPIC \
+            "$JNI_OBJ" \
             -L"$PREFIX/lib" -L"$MBEDTLS_PREFIX/lib" -L"$DEPS_PREFIX/lib" \
             -Wl,--start-group \
             -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
