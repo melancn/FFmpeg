@@ -510,7 +510,7 @@ jobs:
                       Java_org_ffmpeg_FFMpegNative_assImageGetHeight \
                       Java_org_ffmpeg_FFMpegNative_assImageGetStride \
                       Java_org_ffmpeg_FFMpegNative_assImageGetColor \
-                      Java_org_ffmpeg_FFMpegNative_assImageGetDst \
+                      Java_org_ffmpeg_FFMpegNative_assImageGetType \
                       Java_org_ffmpeg_FFMpegNative_assImageGetTop \
                       Java_org_ffmpeg_FFMpegNative_assImageGetLeft \
                       Java_org_ffmpeg_FFMpegNative_assImageGetBitmap; do

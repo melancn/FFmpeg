@@ -1914,7 +1914,7 @@ public final class FFMpegNative {
      *     byte[] bits = new byte[stride * h];
      *     assImageGetBitmap(img, bits, 0, bits.length);            // 8-bit alpha
      *     blendOntoCanvas(assImageGetTop(img), assImageGetLeft(img),
-     *                     w, h, bits, assImageGetColor(img), assImageGetDst(img));
+     *                     w, h, bits, assImageGetColor(img), assImageGetType(img));
      * }
      * // on seek: assTrackFlushEvents(track);
      * // teardown: assTrackFree(track); assRendererFree(rend); assLibFree(lib);
@@ -1947,8 +1947,8 @@ public final class FFMpegNative {
      * @return 0 on success, negative AVERROR on bad args
      */
     public native int assAddFont(long lib, String name, byte[] in, int off, int len);
-    /** Drop every globally cached in-memory font (all libraries). */
-    public native void assClearFonts();
+    /** Clear the in-memory fonts registered with {@code lib}. */
+    public native void assClearFonts(long lib);
     /** Extra directory scanned by the selected font provider. */
     public native void assSetFontsDir(long lib, String dir);
     /**
@@ -2003,8 +2003,8 @@ public final class FFMpegNative {
     public native int assImageGetStride(long img);
     /** @return foreground color as unsigned packed ARGB. */
     public native long assImageGetColor(long img);
-    /** @return blend hint: 0 color+alpha, 1 add, 2 alpha only, 3 opaque. */
-    public native int assImageGetDst(long img);
+    /** @return image layer type: 0 character, 1 outline, 2 shadow. */
+    public native int assImageGetType(long img);
     /** @return image top / left position in the frame, in pixels. */
     public native int assImageGetTop(long img);
     public native int assImageGetLeft(long img);

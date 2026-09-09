@@ -4532,7 +4532,8 @@ Java_org_ffmpeg_FFMpegNative_assTrackGetPlayResY(JNIEnv *env, jobject thiz, jlon
  * streamGetCodecType == AVMEDIA_TYPE_ATTACHMENT + streamGetMetadata +
  * streamGetExtradata). data is copied; name should keep the stored
  * attachment filename (extension included) so the subtitle script's family
- * references resolve. assClearFonts() drops every globally cached font. */
+ * references resolve. assClearFonts(lib) drops the fonts registered with that
+ * library. */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_assAddFont(JNIEnv *env, jobject thiz, jlong lib,
                                         jstring name, jbyteArray in, jint off, jint len)
@@ -4542,22 +4543,26 @@ Java_org_ffmpeg_FFMpegNative_assAddFont(JNIEnv *env, jobject thiz, jlong lib,
         (jsize)off + (jsize)len > (*env)->GetArrayLength(env, in))
         return AVERROR(EINVAL);
     const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    if (!n)
+        return AVERROR(ENOMEM);
     uint8_t *buf = (uint8_t *)av_malloc(len);
     if (!buf) {
         (*env)->ReleaseStringUTFChars(env, name, n);
         return AVERROR(ENOMEM);
     }
     (*env)->GetByteArrayRegion(env, in, off, len, (jbyte *)buf);
-    ass_add_font(l, n, buf, (size_t)len);
+    ass_add_font(l, n, (const char *)buf, len);
     (*env)->ReleaseStringUTFChars(env, name, n);
     av_free(buf);
     return 0;
 }
 
 JNIEXPORT void JNICALL
-Java_org_ffmpeg_FFMpegNative_assClearFonts(JNIEnv *env, jobject thiz)
+Java_org_ffmpeg_FFMpegNative_assClearFonts(JNIEnv *env, jobject thiz, jlong lib)
 {
-    ass_clear_fonts();
+    ASS_Library *l = PTR(ASS_Library *, lib);
+    if (l)
+        ass_clear_fonts(l);
 }
 
 /* Directory scanned for extra fonts by the selected font provider. */
@@ -4586,12 +4591,12 @@ Java_org_ffmpeg_FFMpegNative_assSetFonts(JNIEnv *env, jobject thiz, jlong rend,
         return AVERROR(EINVAL);
     const char *df = defaultFont ? (*env)->GetStringUTFChars(env, defaultFont, NULL) : NULL;
     const char *fam = defaultFamily ? (*env)->GetStringUTFChars(env, defaultFamily, NULL) : NULL;
-    int ret = ass_set_fonts(r, df, fam, (int)provider, NULL, 0);
+    ass_set_fonts(r, df, fam, (int)provider, NULL, 0);
     if (defaultFont)
         (*env)->ReleaseStringUTFChars(env, defaultFont, df);
     if (defaultFamily)
         (*env)->ReleaseStringUTFChars(env, defaultFamily, fam);
-    return ret;
+    return 0;
 }
 
 /* Renderer geometry / style tweaks. */
@@ -4650,9 +4655,9 @@ Java_org_ffmpeg_FFMpegNative_assProcessCodecPrivate(JNIEnv *env, jobject thiz, j
     if (!buf)
         return AVERROR(ENOMEM);
     (*env)->GetByteArrayRegion(env, in, off, len, (jbyte *)buf);
-    int ret = ass_process_codec_private(t, buf, len);
+    ass_process_codec_private(t, buf, len);
     av_free(buf);
-    return ret;
+    return 0;
 }
 
 /* Feed raw script/event text (e.g. one MKV ASS packet = one "Dialogue:"
@@ -4670,9 +4675,9 @@ Java_org_ffmpeg_FFMpegNative_assProcessData(JNIEnv *env, jobject thiz, jlong tra
         return AVERROR(ENOMEM);
     (*env)->GetByteArrayRegion(env, in, off, len, (jbyte *)buf);
     buf[len] = '\0';
-    int ret = ass_process_data(t, buf, len);
+    ass_process_data(t, buf, len);
     av_free(buf);
-    return ret;
+    return 0;
 }
 
 /* Feed ONE already-timed event (decoded SRT/WebVTS text): start/duration in
@@ -4692,9 +4697,9 @@ Java_org_ffmpeg_FFMpegNative_assProcessChunk(JNIEnv *env, jobject thiz, jlong tr
         return AVERROR(ENOMEM);
     (*env)->GetByteArrayRegion(env, in, off, len, (jbyte *)buf);
     buf[len] = '\0';
-    int ret = ass_process_chunk(t, buf, len, (long long)startMs, (long long)durationMs);
+    ass_process_chunk(t, buf, len, (long long)startMs, (long long)durationMs);
     av_free(buf);
-    return ret;
+    return 0;
 }
 
 /* Rasterize track at nowMs (video clock). detectChange (optional 1-element
@@ -4755,12 +4760,12 @@ Java_org_ffmpeg_FFMpegNative_assImageGetColor(JNIEnv *env, jobject thiz, jlong i
     return i ? (jlong)(unsigned int)i->color : 0;
 }
 
-/* Blend mode hint (0 color+alpha, 1 add, 2 alpha-only, 3 opaque). */
+/* Image layer type (0 character, 1 outline, 2 shadow). */
 JNIEXPORT jint JNICALL
-Java_org_ffmpeg_FFMpegNative_assImageGetDst(JNIEnv *env, jobject thiz, jlong img)
+Java_org_ffmpeg_FFMpegNative_assImageGetType(JNIEnv *env, jobject thiz, jlong img)
 {
     ASS_Image *i = PTR(ASS_Image *, img);
-    return i ? (jint)i->dst : 0;
+    return i ? (jint)i->type : 0;
 }
 
 /* Top-left screen position of this glyph run. */
@@ -4768,14 +4773,14 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_assImageGetTop(JNIEnv *env, jobject thiz, jlong img)
 {
     ASS_Image *i = PTR(ASS_Image *, img);
-    return i ? (jint)(int)i->top : 0;
+    return i ? (jint)i->dst_y : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_assImageGetLeft(JNIEnv *env, jobject thiz, jlong img)
 {
     ASS_Image *i = PTR(ASS_Image *, img);
-    return i ? (jint)(int)i->left : 0;
+    return i ? (jint)i->dst_x : 0;
 }
 
 /* Copy the alpha bitmap (stride*h bytes) into out; out must be big enough.
