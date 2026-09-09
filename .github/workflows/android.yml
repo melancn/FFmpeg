@@ -176,38 +176,44 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.BUILD_DIR }}/deps-install
-          key: deps-${{ matrix.abi }}-fribidi1.0.16-ft2.13.3-hb9.0.0-ass0.17.3-pic-v1
+          key: deps-${{ matrix.abi }}-fribidi1.0.16-ft2.13.3-hb9.0.0-ass0.17.3-pic-v2
           restore-keys: |
             deps-${{ matrix.abi }}-
 
       - name: Build libass dependency stack
         if: steps.deps-cache.outputs.cache-hit != 'true'
-        env:
-          CC: ${{ steps.toolchain.outputs.cc }}
-          CXX: ${{ steps.toolchain.outputs.cxx }}
-          AR: ${{ steps.toolchain.outputs.ar }}
-          STRIP: ${{ steps.toolchain.outputs.strip }}
         run: |
           set -euo pipefail
+          NDK_BIN="${{ steps.ndk.outputs.ndk_bin }}"
+          SYSROOT="$(cd "$NDK_BIN/.." && pwd)/sysroot"
+          # Plain toolchain clang (not the API wrappers): the target triple,
+          # API level and --sysroot go into the meson cross file explicitly,
+          # mirroring the layout libass's own Android CI uses.
+          CC="$NDK_BIN/clang"
+          CXX="$NDK_BIN/clang++"
+          AR="$NDK_BIN/llvm-ar"
+          STRIP="$NDK_BIN/llvm-strip"
           DEPS="$PWD/$BUILD_DIR/deps-install"
           mkdir -p "$DEPS"
-          case "${{ matrix.arch }}" in
-            aarch64) MESON_CPU_FAMILY=aarch64; MESON_CPU=armv8-a ;;
-            arm)     MESON_CPU_FAMILY=arm;     MESON_CPU=armv7-a ;;
-            *) echo "::error::No meson cpu map for ${{ matrix.arch }}"; exit 1 ;;
+          TARGET="${{ matrix.clang_triple }}${ANDROID_API}"
+          case "${{ matrix.abi }}" in
+            arm64-v8a)
+              MESON_CPU_FAMILY=aarch64; MESON_CPU=aarch64; ARCH_ARGS="" ;;
+            armeabi-v7a)
+              MESON_CPU_FAMILY=arm; MESON_CPU=armv7
+              ARCH_ARGS=", '-mthumb', '-mfpu=neon', '-mfloat-abi=softfp', '-march=armv7-a'" ;;
+            *) echo "::error::No meson cpu map for ${{ matrix.abi }}"; exit 1 ;;
           esac
           # Restrict pkg-config to our own prefix so host (x86_64) *.pc files
           # can never satisfy a cross dependency; features that are not found
-          # (fontconfig, brotli, cairo, glib, icu, graphite) auto-disable.
+          # (brotli, zstd, cairo via pkg-config, ...) auto-disable.
           export PKG_CONFIG_LIBDIR="$DEPS/lib/pkgconfig"
-          # The API-level clang wrappers bake in --target/--sysroot/API, so a
-          # plain cross file with the wrapper binaries is enough for meson.
           cat > "$BUILD_DIR/meson-cross.txt" <<EOF
           [binaries]
-          c = '${{ steps.toolchain.outputs.cc }}'
-          cpp = '${{ steps.toolchain.outputs.cxx }}'
-          ar = '${{ steps.toolchain.outputs.ar }}'
-          strip = '${{ steps.toolchain.outputs.strip }}'
+          c = '$CC'
+          cpp = '$CXX'
+          ar = '$AR'
+          strip = '$STRIP'
           pkg-config = 'pkg-config'
 
           [host_machine]
@@ -217,11 +223,14 @@ jobs:
           endian = 'little'
 
           [built-in options]
+          c_args = ['--target=$TARGET', '--sysroot=$SYSROOT'$ARCH_ARGS]
+          cpp_args = ['--target=$TARGET', '--sysroot=$SYSROOT'$ARCH_ARGS]
+          c_link_args = ['--target=$TARGET', '--sysroot=$SYSROOT'$ARCH_ARGS]
+          cpp_link_args = ['--target=$TARGET', '--sysroot=$SYSROOT'$ARCH_ARGS]
           # These archives are linked into the shared libffmpeg_jni.so, so
-          # every object must be compiled with -fPIC (API>=23 also forbids
-          # text relocations).
-          c_args = ['-fPIC', '-O2']
-          cpp_args = ['-fPIC', '-O2']
+          # every static object must be PIC (API>=23 also forbids text
+          # relocations).
+          b_staticpic = true
           EOF
 
           build_one() {
@@ -251,15 +260,23 @@ jobs:
           build_one freetype \
             https://github.com/freetype/freetype/archive/refs/tags/VER-2-13-3.tar.gz \
             -Dtests=disabled
+          # icu/glib/cairo/gobject/freetype/introspection/chafa: turn every
+          # optional integration off explicitly (libass needs plain shaping;
+          # hb's own freetype glue is not used). Harfbuzz tests defaults to
+          # ENABLED, so -Dtests=disabled is mandatory.
           build_one harfbuzz \
             https://github.com/harfbuzz/harfbuzz/archive/refs/tags/9.0.0.tar.gz \
-            -Dtests=false -Ddocs=false
-          # libass without fontconfig on Android: embedded fonts registered via
-          # ass_add_font() plus fontsdir/fallback cover the MKV path; system
-          # font scanning would need a fonts.conf anyway.
+            -Dtests=disabled -Dicu=disabled -Dglib=disabled -Dgobject=disabled \
+            -Dcairo=disabled -Dfreetype=disabled -Dintrospection=disabled -Dchafa=disabled
+          # libass without a font provider on Android: MKV embedded fonts go
+          # through ass_add_font() (registered by the JNI ass* entry points)
+          # and fontsdir/fallback cover the rest.  require-system-font-provider
+          # defaults TRUE and aborts 0.17.3 without an explicit false.
+          # libunibreak stays auto-off (nodownload keeps its wrap out of reach;
+          # libass falls back to built-in line-break tables).
           build_one libass \
             https://github.com/libass/libass/archive/refs/tags/0.17.3.tar.gz \
-            -Dtests=false
+            -Dfontconfig=disabled -Drequire-system-font-provider=false
 
           # libass is C++ but meson's pkgconfig generator does not always add
           # the C++ runtime to Libs.private; FFmpeg's configure link test uses
