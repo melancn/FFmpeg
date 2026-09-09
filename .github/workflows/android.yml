@@ -62,7 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ccache pkg-config
+          sudo apt-get install -y ccache pkg-config meson ninja-build
           ccache --version
 
       - name: Cache ccache
@@ -171,6 +171,108 @@ jobs:
           test -f "$MBED_PREFIX/lib/pkgconfig/mbedtls.pc"
           ls -l "$MBED_PREFIX/lib" "$MBED_PREFIX/lib/pkgconfig"
 
+      - name: Cache cross deps (libass stack)
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUILD_DIR }}/deps-install
+          key: deps-${{ matrix.abi }}-fribidi1.0.16-ft2.13.3-hb9.0.0-ass0.17.3-pic-v1
+          restore-keys: |
+            deps-${{ matrix.abi }}-
+
+      - name: Build libass dependency stack
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        env:
+          CC: ${{ steps.toolchain.outputs.cc }}
+          CXX: ${{ steps.toolchain.outputs.cxx }}
+          AR: ${{ steps.toolchain.outputs.ar }}
+          STRIP: ${{ steps.toolchain.outputs.strip }}
+        run: |
+          set -euo pipefail
+          DEPS="$PWD/$BUILD_DIR/deps-install"
+          mkdir -p "$DEPS"
+          case "${{ matrix.arch }}" in
+            aarch64) MESON_CPU_FAMILY=aarch64; MESON_CPU=armv8-a ;;
+            arm)     MESON_CPU_FAMILY=arm;     MESON_CPU=armv7-a ;;
+            *) echo "::error::No meson cpu map for ${{ matrix.arch }}"; exit 1 ;;
+          esac
+          # Restrict pkg-config to our own prefix so host (x86_64) *.pc files
+          # can never satisfy a cross dependency; features that are not found
+          # (fontconfig, brotli, cairo, glib, icu, graphite) auto-disable.
+          export PKG_CONFIG_LIBDIR="$DEPS/lib/pkgconfig"
+          # The API-level clang wrappers bake in --target/--sysroot/API, so a
+          # plain cross file with the wrapper binaries is enough for meson.
+          cat > "$BUILD_DIR/meson-cross.txt" <<EOF
+          [binaries]
+          c = '${{ steps.toolchain.outputs.cc }}'
+          cpp = '${{ steps.toolchain.outputs.cxx }}'
+          ar = '${{ steps.toolchain.outputs.ar }}'
+          strip = '${{ steps.toolchain.outputs.strip }}'
+          pkgconfig = 'pkg-config'
+
+          [host_machine]
+          system = 'android'
+          cpu_family = '$MESON_CPU_FAMILY'
+          cpu = '$MESON_CPU'
+          endian = 'little'
+
+          [built-in options]
+          # These archives are linked into the shared libffmpeg_jni.so, so
+          # every object must be compiled with -fPIC (API>=23 also forbids
+          # text relocations).
+          c_args = ['-fPIC', '-O2']
+          cpp_args = ['-fPIC', '-O2']
+          EOF
+
+          build_one() {
+            # <name> <url> [extra meson options]
+            local name="$1" url="$2"; shift 2
+            echo "::group::$name"
+            mkdir -p "$BUILD_DIR/$name-src"
+            curl -fsSL "$url" | tar xz -C "$BUILD_DIR/$name-src" --strip-components=1
+            meson setup "$BUILD_DIR/$name-src" "$BUILD_DIR/$name-build" \
+              --cross-file "$BUILD_DIR/meson-cross.txt" \
+              --prefix "$DEPS" --libdir lib --bindir bin \
+              --buildtype=release --default-library=static \
+              --wrap-mode=nodownload "$@"
+            meson compile -C "$BUILD_DIR/$name-build" -j"$(nproc)"
+            meson install -C "$BUILD_DIR/$name-build"
+            echo "::endgroup::"
+          }
+
+          # Order matters: later packages find the earlier ones' .pc files
+          # through PKG_CONFIG_LIBDIR.  Versions here also appear in the cache key.
+          build_one fribidi \
+            https://github.com/fribidi/fribidi/archive/refs/tags/v1.0.16.tar.gz \
+            -Dtests=false -Ddocs=false
+          # freetype: keep all compression extras at their auto-detected
+          # defaults (zlib is provided by the NDK sysroot; bzip2/png/brotli
+          # are absent there and drop out).
+          build_one freetype \
+            https://github.com/freetype/freetype/archive/refs/tags/VER2_13_3.tar.gz \
+            -Dtests=false
+          build_one harfbuzz \
+            https://github.com/harfbuzz/harfbuzz/archive/refs/tags/9.0.0.tar.gz \
+            -Dtests=false -Ddocs=false
+          # libass without fontconfig on Android: embedded fonts registered via
+          # ass_add_font() plus fontsdir/fallback cover the MKV path; system
+          # font scanning would need a fonts.conf anyway.
+          build_one libass \
+            https://github.com/libass/libass/archive/refs/tags/0.17.3.tar.gz \
+            -Dtests=false
+
+          # libass is C++ but meson's pkgconfig generator does not always add
+          # the C++ runtime to Libs.private; FFmpeg's configure link test uses
+          # the plain C driver, so guarantee the flag is present.
+          grep -q '^Libs\.private=' "$DEPS/lib/pkgconfig/libass.pc" || \
+            echo 'Libs.private=' >> "$DEPS/lib/pkgconfig/libass.pc"
+          grep -Eq 'stdc\+\+|-lc\+\+' "$DEPS/lib/pkgconfig/libass.pc" || \
+            sed -i 's/^Libs\.private=.*/& -lstdc++/' "$DEPS/lib/pkgconfig/libass.pc"
+          ls -l "$DEPS/lib" "$DEPS/lib/pkgconfig"
+          test -f "$DEPS/lib/libass.a"
+          test -f "$DEPS/lib/pkgconfig/libass.pc"
+          test -f "$DEPS/include/ass/ass.h"
+
       - name: Configure FFmpeg
         env:
           CC: ${{ steps.toolchain.outputs.cc }}
@@ -190,12 +292,14 @@ jobs:
           ccache -z
           PREFIX="$PWD/$BUILD_DIR/$INSTALL_DIR"
           MBEDTLS_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
+          DEPS_PREFIX="$PWD/$BUILD_DIR/deps-install"
           mkdir -p "$PREFIX"
-          # Expose the just-built mbedTLS via pkg-config so configure's
-          # check_pkg_config(mbedtls) path picks up the TLS backend, which
-          # pulls in ff_tls_protocol and thus ff_https_protocol.
-          export PKG_CONFIG_PATH="$MBEDTLS_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-          export PKG_CONFIG_LIBDIR="$MBEDTLS_PREFIX/lib/pkgconfig"
+          # Expose the just-built mbedTLS and the libass dependency stack via
+          # pkg-config so configure's check_pkg_config() paths pick up the TLS
+          # backend (pulls in ff_tls_protocol -> ff_https_protocol) and
+          # libass/freetype for the subtitles filter.
+          export PKG_CONFIG_PATH="$MBEDTLS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          export PKG_CONFIG_LIBDIR="$MBEDTLS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib/pkgconfig"
           # --enable-jni + --enable-mediacodec enables the Android MediaCodec
           # hardware decoders (h264_mediacodec, hevc_mediacodec, av1_mediacodec,
           # mpeg4_mediacodec, vp8/9_mediacodec, mp3_mediacodec, ...). The
@@ -205,6 +309,13 @@ jobs:
           # unified sysroot of the API-level-specific clang driver.
           # --enable-hwaccel* flags are no longer separate configure options:
           # the mediacodec hwaccel is auto-selected by the decoders above.
+          # --enable-libass pulls in the "subtitles"/"ass" filters (see the
+          # libass dependency stack step).  fontconfig is deliberately NOT
+          # enabled: it is only a drawtext/showcqt extra (subtitles_filter_deps
+          # is "avformat avcodec libass"), and there is no usable
+          # system fonts.conf on Android — embedded MKV fonts go through
+          # ass_add_font()/fontsdir instead.  fribidi+harfbuzz are built, so
+          # also enable them for the drawtext font path.
           ./configure \
             --target-os=android --enable-cross-compile \
             --arch=${{ matrix.arch }} \
@@ -215,10 +326,11 @@ jobs:
             --enable-pic \
             --enable-version3 \
             --enable-mbedtls --pkg-config-flags="--static" \
-            --enable-libass --enable-libfreetype --enable-fontconfig \
+            --enable-libass --enable-libfreetype --enable-libfribidi --enable-libharfbuzz \
             --enable-jni --enable-mediacodec \
             --extra-cflags="-fPIC -O2" \
             --extra-ldflags="-lm -lz" \
+            --extra-libs="-lstdc++" \
             --prefix="$PREFIX" \
             || CFGRES=$?
           cat ffbuild/config.log || true
@@ -255,16 +367,18 @@ jobs:
       - name: Compile libffmpeg_jni.so
         env:
           NDK_BIN: ${{ steps.ndk.outputs.ndk_bin }}
-          CC: ${{ steps.toolchain.outputs.cc }}
+          CXX: ${{ steps.toolchain.outputs.cxx }}
           STRIP: ${{ steps.toolchain.outputs.strip }}
         run: |
           ABI="${{ matrix.abi }}"
-          API="${ANDROID_API}"
-          TRIPLE="${{ matrix.clang_triple }}"
-          # Use the API-level-specific driver for the .so too (consistent ABI/sysroot)
-          SHARES_CC="$NDK_BIN/${TRIPLE}${API}-clang"
+          # Use the API-level-specific clang++ driver for the .so (consistent
+          # ABI/sysroot).  libass's static archive is C++ code, so the link
+          # needs a C++ driver for libc++; -static-libstdc++ below keeps that
+          # in-process instead of adding a libc++_shared.so DT_NEEDED.
+          LINK_CXX="$CXX"
           PREFIX="$PWD/$BUILD_DIR/$INSTALL_DIR"
           MBEDTLS_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
+          DEPS_PREFIX="$PWD/$BUILD_DIR/deps-install"
           OUT="$PWD/$OUT_DIR/$ABI/lib"
           CLS="$PWD/$OUT_DIR/$ABI/classes"
           mkdir -p "$OUT" "$CLS"
@@ -278,15 +392,19 @@ jobs:
           #   -ljnigraphics : AImage / bitmap helpers used by some mediacodec
           #                   paths; harmless if unreferenced (the linker drops it)
           # All three are available from API 21+ at the chosen API 24 driver.
-          "$SHARES_CC" -shared -fPIC \
+          "$LINK_CXX" -shared -fPIC \
             -I"$PWD" -I"$PWD/compat/android/jni" -I"$PWD/compat/android/jni/generated" \
-            -I"$PREFIX/include" \
+            -I"$PREFIX/include" -I"$DEPS_PREFIX/include" \
             "$PWD/compat/android/jni/ffmpeg_jni.c" \
-            -L"$PREFIX/lib" -L"$MBEDTLS_PREFIX/lib" \
+            -L"$PREFIX/lib" -L"$MBEDTLS_PREFIX/lib" -L"$DEPS_PREFIX/lib" \
             -Wl,--start-group \
             -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
             -lmbedtls -lmbedx509 -lmbedcrypto \
             -Wl,--end-group \
+            -Wl,--start-group \
+            -lass -lharfbuzz -lfreetype -lfribidi \
+            -Wl,--end-group \
+            -static-libstdc++ \
             -lmediandk -landroid -ljnigraphics \
             -llog -lm -lz \
             -Wl,-soname,libffmpeg_jni.so \
@@ -309,6 +427,14 @@ jobs:
             fi
           done
           echo "MediaCodec platform libs (libmediandk.so, libandroid.so) in DT_NEEDED"
+          # libffmpeg_jni.so embeds C++ libass code; the static libc++ link
+          # must have prevented a libc++_shared.so runtime dependency, which
+          # an APK that does not also ship that library could not satisfy.
+          if printf '%s\n' "$DYNAMIC_SECTION" | grep -Fq 'Shared library: [libc++_shared.so]'; then
+            echo "::error::libffmpeg_jni.so depends on libc++_shared.so (C++ runtime must be linked statically)"
+            exit 1
+          fi
+          echo "C++ runtime linked statically (no libc++_shared.so in DT_NEEDED)"
           export_syms=$("$NDK_BIN/llvm-nm" -D "$OUT/libffmpeg_jni.so" 2>/dev/null)
           # Best-effort listing of all exported JNI symbols (informational).
           printf '%s\n' "$export_syms" | grep -E 'Java_org_ffmpeg' || true
