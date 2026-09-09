@@ -215,6 +215,7 @@ jobs:
             --enable-pic \
             --enable-version3 \
             --enable-mbedtls --pkg-config-flags="--static" \
+            --enable-libass --enable-libfreetype --enable-fontconfig \
             --enable-jni --enable-mediacodec \
             --extra-cflags="-fPIC -O2" \
             --extra-ldflags="-lm -lz" \
@@ -327,10 +328,44 @@ jobs:
                      Java_org_ffmpeg_FFMpegNative_aacAdtsPackerCreate \
                      Java_org_ffmpeg_FFMpegNative_aacAdtsPackerWrap \
                      Java_org_ffmpeg_FFMpegNative_aacAdtsPackerFree \
-                     Java_org_ffmpeg_FFMpegNative_interruptFlagCreate \
-                     Java_org_ffmpeg_FFMpegNative_formatSetInterruptFlag \
-                     Java_org_ffmpeg_FFMpegNative_interruptFlagAbort \
-                     Java_org_ffmpeg_FFMpegNative_interruptFlagFree; do
+                      Java_org_ffmpeg_FFMpegNative_interruptFlagCreate \
+                      Java_org_ffmpeg_FFMpegNative_formatSetInterruptFlag \
+                      Java_org_ffmpeg_FFMpegNative_interruptFlagAbort \
+                      Java_org_ffmpeg_FFMpegNative_interruptFlagFree \
+                      Java_org_ffmpeg_FFMpegNative_streamGetParExtradataSize \
+                      Java_org_ffmpeg_FFMpegNative_codecGetSubtitleHeaderSize \
+                      Java_org_ffmpeg_FFMpegNative_codecGetSubtitleHeader \
+                      Java_org_ffmpeg_FFMpegNative_assLibCreate \
+                      Java_org_ffmpeg_FFMpegNative_assLibFree \
+                      Java_org_ffmpeg_FFMpegNative_assRendererCreate \
+                      Java_org_ffmpeg_FFMpegNative_assRendererFree \
+                      Java_org_ffmpeg_FFMpegNative_assTrackCreate \
+                      Java_org_ffmpeg_FFMpegNative_assTrackFree \
+                      Java_org_ffmpeg_FFMpegNative_assTrackFlushEvents \
+                      Java_org_ffmpeg_FFMpegNative_assTrackGetPlayResX \
+                      Java_org_ffmpeg_FFMpegNative_assTrackGetPlayResY \
+                      Java_org_ffmpeg_FFMpegNative_assAddFont \
+                      Java_org_ffmpeg_FFMpegNative_assClearFonts \
+                      Java_org_ffmpeg_FFMpegNative_assSetFontsDir \
+                      Java_org_ffmpeg_FFMpegNative_assSetFonts \
+                      Java_org_ffmpeg_FFMpegNative_assSetFrameSize \
+                      Java_org_ffmpeg_FFMpegNative_assSetStorageSize \
+                      Java_org_ffmpeg_FFMpegNative_assSetMargins \
+                      Java_org_ffmpeg_FFMpegNative_assSetUseMargins \
+                      Java_org_ffmpeg_FFMpegNative_assSetFontScale \
+                      Java_org_ffmpeg_FFMpegNative_assProcessCodecPrivate \
+                      Java_org_ffmpeg_FFMpegNative_assProcessData \
+                      Java_org_ffmpeg_FFMpegNative_assProcessChunk \
+                      Java_org_ffmpeg_FFMpegNative_assRenderFrame \
+                      Java_org_ffmpeg_FFMpegNative_assImageGetNext \
+                      Java_org_ffmpeg_FFMpegNative_assImageGetWidth \
+                      Java_org_ffmpeg_FFMpegNative_assImageGetHeight \
+                      Java_org_ffmpeg_FFMpegNative_assImageGetStride \
+                      Java_org_ffmpeg_FFMpegNative_assImageGetColor \
+                      Java_org_ffmpeg_FFMpegNative_assImageGetDst \
+                      Java_org_ffmpeg_FFMpegNative_assImageGetTop \
+                      Java_org_ffmpeg_FFMpegNative_assImageGetLeft \
+                      Java_org_ffmpeg_FFMpegNative_assImageGetBitmap; do
             if ! printf '%s\n' "$export_syms" | grep -q " ${sym}$"; then
               echo "::error::libffmpeg_jni.so does not export ${sym} (JNI signature mismatch or compiled out)"
               exit 1
@@ -367,6 +402,17 @@ jobs:
             echo "::warning::mbedtls_ssl_init not found in defined symbols; check tls backend linkage"
           fi
           echo "HTTP/HTTPS protocol symbols present"
+          # libass subtitle rendering (--enable-libass): the ass/subtitles
+          # filter objects and the libass core must end up linked. The ass_*
+          # entries are referenced by ffmpeg_jni.c's libass wrappers, so their
+          # absence means the .so was rebuilt without the libass deps it needs.
+          for sym in ff_ass_filter ff_subtitles_filter ass_library_init ass_add_font ass_render_frame; do
+            if ! grep -q " ${sym}$" /tmp/jni_syms.txt; then
+              echo "::error::libffmpeg_jni.so missing ${sym} (libass subtitle rendering not linked)"
+              exit 1
+            fi
+          done
+          echo "libass subtitle rendering symbols present"
           # Verify at least one MediaCodec hardware decoder is actually linked
           # in. The ff_<name>_mediacodec_decoder FFCodec objects are static
           # globals (in .symtab, not .dynsym), so this must use the --start-group

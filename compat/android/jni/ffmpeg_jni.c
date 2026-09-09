@@ -83,6 +83,13 @@
 
 #include "libswresample/swresample.h"
 
+/* Optional libass subtitle rendering (see the libass section near the end
+ * of this file; compiled only when FFmpeg was configured --enable-libass). */
+#include "config.h"
+#if CONFIG_LIBASS
+#include <ass/ass.h>
+#endif
+
 /* Cached for the mediacodec hwdevice free callback, which runs detached from
  * any Java frame and needs AttachCurrentThread to obtain a JNIEnv. */
 static JavaVM *g_vm = NULL;
@@ -2763,6 +2770,17 @@ Java_org_ffmpeg_FFMpegNative_streamGetExtradata(JNIEnv *env, jobject thiz,
     return n;
 }
 
+/* Byte length of stream index's codecpar->extradata (0 when absent). Use it
+ * to size the buffer for streamGetExtradata(); for a Matroska
+ * AVMEDIA_TYPE_ATTACHMENT stream this is the font-file size. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_streamGetParExtradataSize(JNIEnv *env, jobject thiz,
+                                                       jlong ctx, jint index)
+{
+    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    return (p && p->extradata && p->extradata_size > 0) ? p->extradata_size : 0;
+}
+
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_formatGetStreamDuration(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
@@ -4380,6 +4398,406 @@ Java_org_ffmpeg_FFMpegNative_subtitleRectGetType(JNIEnv *env, jobject thiz, jlon
         return -1;
     return (jint)s->rects[rectIdx]->type;
 }
+
+/* ------------------------------------------------------------------ */
+/* libass: application-driven subtitle rendering                       */
+/*                                                                     */
+/* The built-in "subtitles"/"ass" filters RE-OPEN the media file with  */
+/* their own demuxer at graph-config time (vf_subtitles's               */
+/* init_subtitles reads the whole input once and re-derives every      */
+/* subtitle event). When an app already owns the source via the        */
+/* format* APIs above that is duplicate IO (a full pass over the file, */
+/* a separate http/https connection) and it ignores the opened        */
+/* context's options and interrupt_callback. These thin libass         */
+/* wrappers let such an app feed the subtitle events IT demuxed/       */
+/* decoded to libass directly (track per text subtitle stream),        */
+/* register MKV-embedded fonts (AVMEDIA_TYPE_ATTACHMENT streams;        */
+/* font bytes live in codecpar->extradata, name/mimetype in stream     */
+/* metadata) with assAddFont, and render the ASS Image list itself.    */
+/*                                                                     */
+/* Compiled only when FFmpeg was configured with --enable-libass; the  */
+/* Java class always declares the methods, so on a non-libass build    */
+/* the first CALL raises UnsatisfiedLinkError. Handles follow the      */
+/* usual long convention (0 == NULL). Rendered ASS_Image bitmaps are   */
+/* 8-bit alpha strips, stride bytes wide, valid until the next         */
+/* assRenderFrame call on the same renderer.                          */
+/* ------------------------------------------------------------------ */
+
+/* Size of AVCodecContext::subtitle_header (SSA style/format header). */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_codecGetSubtitleHeaderSize(JNIEnv *env, jobject thiz, jlong codecCtx)
+{
+    AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
+    return (cc && cc->subtitle_header && cc->subtitle_header_size > 0)
+           ? cc->subtitle_header_size : 0;
+}
+
+/* Copy up to len bytes of the decoder's subtitle_header into out. For SSA/ASS
+ * this is the script format header ([Script Info]/[V4 Styles]); pass it to
+ * assProcessCodecPrivate() once after opening the decoder.
+ * @return bytes copied, or -1 when there is no subtitle_header. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_codecGetSubtitleHeader(JNIEnv *env, jobject thiz,
+                                                    jlong codecCtx, jbyteArray out,
+                                                    jint off, jint len)
+{
+    AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
+    if (!cc || !out || off < 0 || len <= 0 ||
+        (jsize)off + (jsize)len > (*env)->GetArrayLength(env, out))
+        return AVERROR(EINVAL);
+    if (!cc->subtitle_header || cc->subtitle_header_size <= 0)
+        return -1;
+    jint n = (cc->subtitle_header_size < len) ? cc->subtitle_header_size : len;
+    (*env)->SetByteArrayRegion(env, out, off, n, (const jbyte *)cc->subtitle_header);
+    return n;
+}
+
+#if CONFIG_LIBASS
+
+/* ASS_Library lifecycle (ass_library_init/done). One library can back many
+ * renderers/tracks; the embedded-font cache used by assAddFont is global to
+ * the process but is managed through a library handle. */
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_assLibCreate(JNIEnv *env, jobject thiz)
+{
+    return (jlong)(intptr_t)ass_library_init();
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_assLibFree(JNIEnv *env, jobject thiz, jlong lib)
+{
+    ASS_Library *l = PTR(ASS_Library *, lib);
+    if (l)
+        ass_library_done(l);
+}
+
+/* ASS_Renderer: owns rasterization state (frame size, margins, font select). */
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_assRendererCreate(JNIEnv *env, jobject thiz, jlong lib)
+{
+    ASS_Library *l = PTR(ASS_Library *, lib);
+    return l ? (jlong)(intptr_t)ass_renderer_init(l) : 0;
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_assRendererFree(JNIEnv *env, jobject thiz, jlong rend)
+{
+    ASS_Renderer *r = PTR(ASS_Renderer *, rend);
+    if (r)
+        ass_renderer_done(r);
+}
+
+/* ASS_Track: parsed script state (styles + events) for ONE subtitle stream. */
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_assTrackCreate(JNIEnv *env, jobject thiz, jlong lib)
+{
+    ASS_Library *l = PTR(ASS_Library *, lib);
+    return l ? (jlong)(intptr_t)ass_new_track(l) : 0;
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_assTrackFree(JNIEnv *env, jobject thiz, jlong track)
+{
+    ASS_Track *t = PTR(ASS_Track *, track);
+    if (t)
+        ass_free_track(t);
+}
+
+/* Drop all currently queued (visible) events; call on seek. */
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_assTrackFlushEvents(JNIEnv *env, jobject thiz, jlong track)
+{
+    ASS_Track *t = PTR(ASS_Track *, track);
+    if (t)
+        ass_flush_events(t);
+}
+
+/* Script's PlayResX/PlayResY (0 when the script omitted them; then libass
+ * uses its default and callers usually scale by the frame size regardless). */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assTrackGetPlayResX(JNIEnv *env, jobject thiz, jlong track)
+{
+    ASS_Track *t = PTR(ASS_Track *, track);
+    return t ? (jint)t->PlayResX : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assTrackGetPlayResY(JNIEnv *env, jobject thiz, jlong track)
+{
+    ASS_Track *t = PTR(ASS_Track *, track);
+    return t ? (jint)t->PlayResY : 0;
+}
+
+/* Register an in-memory font (e.g. an MKV AttachedFile extracted through
+ * streamGetCodecType == AVMEDIA_TYPE_ATTACHMENT + streamGetMetadata +
+ * streamGetExtradata). data is copied; name should keep the stored
+ * attachment filename (extension included) so the subtitle script's family
+ * references resolve. assClearFonts() drops every globally cached font. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assAddFont(JNIEnv *env, jobject thiz, jlong lib,
+                                        jstring name, jbyteArray in, jint off, jint len)
+{
+    ASS_Library *l = PTR(ASS_Library *, lib);
+    if (!l || !name || !in || off < 0 || len <= 0 ||
+        (jsize)off + (jsize)len > (*env)->GetArrayLength(env, in))
+        return AVERROR(EINVAL);
+    const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    uint8_t *buf = (uint8_t *)av_malloc(len);
+    if (!buf) {
+        (*env)->ReleaseStringUTFChars(env, name, n);
+        return AVERROR(ENOMEM);
+    }
+    (*env)->GetByteArrayRegion(env, in, off, len, (jbyte *)buf);
+    ass_add_font(l, n, buf, (size_t)len);
+    (*env)->ReleaseStringUTFChars(env, name, n);
+    av_free(buf);
+    return 0;
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_assClearFonts(JNIEnv *env, jobject thiz)
+{
+    ass_clear_fonts();
+}
+
+/* Directory scanned for extra fonts by the selected font provider. */
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_assSetFontsDir(JNIEnv *env, jobject thiz, jlong lib, jstring dir)
+{
+    ASS_Library *l = PTR(ASS_Library *, lib);
+    if (!l || !dir)
+        return;
+    const char *d = (*env)->GetStringUTFChars(env, dir, NULL);
+    ass_set_fonts_dir(l, d);
+    (*env)->ReleaseStringUTFChars(env, dir, d);
+}
+
+/* ass_set_fonts passthrough: provider = ASS_FONT_SELECT_* (Java constants:
+ * OFF=0, ENABLE=1, INVERT=2). defaultFont is an optional .ttf file (fallback
+ * family last resort); defaultFamily names the built-in default style font.
+ * @return 0 on success, negative AVERROR if the renderer was null. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assSetFonts(JNIEnv *env, jobject thiz, jlong rend,
+                                         jstring defaultFont, jstring defaultFamily,
+                                         jint provider)
+{
+    ASS_Renderer *r = PTR(ASS_Renderer *, rend);
+    if (!r)
+        return AVERROR(EINVAL);
+    const char *df = defaultFont ? (*env)->GetStringUTFChars(env, defaultFont, NULL) : NULL;
+    const char *fam = defaultFamily ? (*env)->GetStringUTFChars(env, defaultFamily, NULL) : NULL;
+    int ret = ass_set_fonts(r, df, fam, (int)provider, NULL, 0);
+    if (defaultFont)
+        (*env)->ReleaseStringUTFChars(env, defaultFont, df);
+    if (defaultFamily)
+        (*env)->ReleaseStringUTFChars(env, defaultFamily, fam);
+    return ret;
+}
+
+/* Renderer geometry / style tweaks. */
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_assSetFrameSize(JNIEnv *env, jobject thiz, jlong rend, jint w, jint h)
+{
+    ASS_Renderer *r = PTR(ASS_Renderer *, rend);
+    if (r)
+        ass_set_frame_size(r, w, h);
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_assSetStorageSize(JNIEnv *env, jobject thiz, jlong rend, jint w, jint h)
+{
+    ASS_Renderer *r = PTR(ASS_Renderer *, rend);
+    if (r)
+        ass_set_storage_size(r, w, h);
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_assSetMargins(JNIEnv *env, jobject thiz, jlong rend,
+                                           jint top, jint bottom, jint left, jint right)
+{
+    ASS_Renderer *r = PTR(ASS_Renderer *, rend);
+    if (r)
+        ass_set_margins(r, top, bottom, left, right);
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_assSetUseMargins(JNIEnv *env, jobject thiz, jlong rend, jint use)
+{
+    ASS_Renderer *r = PTR(ASS_Renderer *, rend);
+    if (r)
+        ass_set_use_margins(r, use);
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_assSetFontScale(JNIEnv *env, jobject thiz, jlong rend, jdouble scale)
+{
+    ASS_Renderer *r = PTR(ASS_Renderer *, rend);
+    if (r)
+        ass_set_font_scale(r, scale);
+}
+
+/* The three "feed the track" entry points. libass may modify the input
+ * buffer while parsing, so all of them pass a private copy. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assProcessCodecPrivate(JNIEnv *env, jobject thiz, jlong track,
+                                                    jbyteArray in, jint off, jint len)
+{
+    ASS_Track *t = PTR(ASS_Track *, track);
+    if (!t || !in || off < 0 || len <= 0 ||
+        (jsize)off + (jsize)len > (*env)->GetArrayLength(env, in))
+        return AVERROR(EINVAL);
+    char *buf = (char *)av_malloc(len);
+    if (!buf)
+        return AVERROR(ENOMEM);
+    (*env)->GetByteArrayRegion(env, in, off, len, (jbyte *)buf);
+    int ret = ass_process_codec_private(t, buf, len);
+    av_free(buf);
+    return ret;
+}
+
+/* Feed raw script/event text (e.g. one MKV ASS packet = one "Dialogue:"
+ * line). Incremental: libass buffers until an event is complete. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assProcessData(JNIEnv *env, jobject thiz, jlong track,
+                                            jbyteArray in, jint off, jint len)
+{
+    ASS_Track *t = PTR(ASS_Track *, track);
+    if (!t || !in || off < 0 || len <= 0 ||
+        (jsize)off + (jsize)len > (*env)->GetArrayLength(env, in))
+        return AVERROR(EINVAL);
+    char *buf = (char *)av_malloc(len + 1);
+    if (!buf)
+        return AVERROR(ENOMEM);
+    (*env)->GetByteArrayRegion(env, in, off, len, (jbyte *)buf);
+    buf[len] = '\0';
+    int ret = ass_process_data(t, buf, len);
+    av_free(buf);
+    return ret;
+}
+
+/* Feed ONE already-timed event (decoded SRT/WebVTS text): start/duration in
+ * milliseconds (use subtitleGetPts * 1000 / AV_TIME_BASE plus
+ * subtitleGetStart/EndDisplayTime). */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assProcessChunk(JNIEnv *env, jobject thiz, jlong track,
+                                             jbyteArray in, jint off, jint len,
+                                             jlong startMs, jlong durationMs)
+{
+    ASS_Track *t = PTR(ASS_Track *, track);
+    if (!t || !in || off < 0 || len <= 0 ||
+        (jsize)off + (jsize)len > (*env)->GetArrayLength(env, in))
+        return AVERROR(EINVAL);
+    char *buf = (char *)av_malloc(len + 1);
+    if (!buf)
+        return AVERROR(ENOMEM);
+    (*env)->GetByteArrayRegion(env, in, off, len, (jbyte *)buf);
+    buf[len] = '\0';
+    int ret = ass_process_chunk(t, buf, len, (long long)startMs, (long long)durationMs);
+    av_free(buf);
+    return ret;
+}
+
+/* Rasterize track at nowMs (video clock). detectChange (optional 1-element
+ * int[]) receives libass's ASS_CHANGE_* bitmask. @return the first ASS_Image
+ * handle (walk with assImageGetNext*), 0 when nothing is visible. The list
+ * is owned by the renderer and re-generated by every call here. */
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_assRenderFrame(JNIEnv *env, jobject thiz, jlong rend,
+                                            jlong track, jlong nowMs, jintArray detectChange)
+{
+    ASS_Renderer *r = PTR(ASS_Renderer *, rend);
+    ASS_Track *t = PTR(ASS_Track *, track);
+    if (!r || !t)
+        return 0;
+    int dc = 0;
+    ASS_Image *img = ass_render_frame(r, t, (long long)nowMs, &dc);
+    if (detectChange) {
+        jint v = dc;
+        (*env)->SetIntArrayRegion(env, detectChange, 0, 1, &v);
+    }
+    return (jlong)(intptr_t)img;
+}
+
+/* ASS_Image list accessors (0 / -1 on a null handle). */
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_assImageGetNext(JNIEnv *env, jobject thiz, jlong img)
+{
+    ASS_Image *i = PTR(ASS_Image *, img);
+    return (i && i->next) ? (jlong)(intptr_t)i->next : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assImageGetWidth(JNIEnv *env, jobject thiz, jlong img)
+{
+    ASS_Image *i = PTR(ASS_Image *, img);
+    return i ? (jint)i->w : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assImageGetHeight(JNIEnv *env, jobject thiz, jlong img)
+{
+    ASS_Image *i = PTR(ASS_Image *, img);
+    return i ? (jint)i->h : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assImageGetStride(JNIEnv *env, jobject thiz, jlong img)
+{
+    ASS_Image *i = PTR(ASS_Image *, img);
+    return i ? (jint)i->stride : 0;
+}
+
+/* Foreground color as a packed unsigned ARGB value. */
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_assImageGetColor(JNIEnv *env, jobject thiz, jlong img)
+{
+    ASS_Image *i = PTR(ASS_Image *, img);
+    return i ? (jlong)(unsigned int)i->color : 0;
+}
+
+/* Blend mode hint (0 color+alpha, 1 add, 2 alpha-only, 3 opaque). */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assImageGetDst(JNIEnv *env, jobject thiz, jlong img)
+{
+    ASS_Image *i = PTR(ASS_Image *, img);
+    return i ? (jint)i->dst : 0;
+}
+
+/* Top-left screen position of this glyph run. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assImageGetTop(JNIEnv *env, jobject thiz, jlong img)
+{
+    ASS_Image *i = PTR(ASS_Image *, img);
+    return i ? (jint)(int)i->top : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assImageGetLeft(JNIEnv *env, jobject thiz, jlong img)
+{
+    ASS_Image *i = PTR(ASS_Image *, img);
+    return i ? (jint)(int)i->left : 0;
+}
+
+/* Copy the alpha bitmap (stride*h bytes) into out; out must be big enough.
+ * @return bytes copied, negative AVERROR on bad args / small buffer. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assImageGetBitmap(JNIEnv *env, jobject thiz, jlong img,
+                                               jbyteArray out, jint off, jint len)
+{
+    ASS_Image *i = PTR(ASS_Image *, img);
+    if (!i || !i->bitmap || !out || off < 0 || len <= 0 ||
+        (jsize)off + (jsize)len > (*env)->GetArrayLength(env, out))
+        return AVERROR(EINVAL);
+    if (i->stride <= 0 || i->h <= 0)
+        return 0;
+    int needed = i->stride * i->h;
+    if (len < needed)
+        return AVERROR(ENOMEM);
+    (*env)->SetByteArrayRegion(env, out, off, needed, (const jbyte *)i->bitmap);
+    return needed;
+}
+
+#endif /* CONFIG_LIBASS */
 
 /* ------------------------------------------------------------------ */
 /* libavcodec: descriptor iteration / hw config / class                */

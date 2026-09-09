@@ -345,6 +345,14 @@ public final class FFMpegNative {
      */
     public native int streamGetExtradata(long ctx, int index, byte[] out, int off, int len);
 
+    /**
+     * @return byte length of stream {@code index}'s codecpar extradata, 0 when
+     *         absent. Size your buffer with this before calling
+     *         {@link #streamGetExtradata}; for MKV
+     *         {@code AVMEDIA_TYPE_ATTACHMENT} streams this is the font size.
+     */
+    public native int streamGetParExtradataSize(long ctx, int index);
+
 
     /* ================================================================== */
     /* libavcodec (decoding / encoding)                                    */
@@ -1849,6 +1857,173 @@ public final class FFMpegNative {
     public native int subtitleRectGetType(long sub, int rectIdx);
 
     /* -------------------------------------------------------------- */
+    /* libass: application-driven subtitle rendering                  */
+    /*                                                                */
+    /* The built-in "subtitles"/"ass" filters re-open the media file   */
+    /* with their OWN demuxer at graph-config time and read the whole  */
+    /* input once. For an app that already owns the source through    */
+    /* formatOpenInput that is duplicate IO (a second full pass, a    */
+    /* second connection) and it ignores your interrupt_callback.     */
+    /* These wrappers drive libass directly with your own demuxer:    */
+    /* feed events, pull fonts out of the container, render.          */
+    /*                                                                */
+    /* Compiled into libffmpeg_jni.so ONLY when FFmpeg was configured */
+    /* with --enable-libass; otherwise the first call throws          */
+    /* {@link UnsatisfiedLinkError}.                                  */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Typical setup (MKV with embedded ASS + attached fonts):
+     * <pre>
+     * long lib = assLibCreate();
+     * long rend = assRendererCreate(lib);
+     * long track = assTrackCreate(lib);
+     * // MKV AttachedFile fonts are AVMEDIA_TYPE_ATTACHMENT streams (4):
+     * for (int i = 0; i &lt; getNbStreams(fmt); i++) {
+     *     if (streamGetCodecType(fmt, i) != AVMEDIA_TYPE_ATTACHMENT)
+     *         continue;
+     *     String mime = streamGetMetadata(fmt, i, "mimetype");
+     *     if (mime == null || !(mime.contains("font") || mime.contains("truetype")))
+     *         continue;   // leaves out cover art / lyrics attachments
+     *     String fname = streamGetMetadata(fmt, i, "filename");
+     *     int size = streamGetParExtradataSize(fmt, i);
+     *     byte[] font = new byte[size];
+     *     streamGetExtradata(fmt, i, font, 0, size);
+     *     assAddFont(lib, fname, font, 0, size);
+     * }
+     * assSetFonts(rend, null, "sans-serif", ASS_FONT_SELECT_ENABLE);
+     * assSetFrameSize(rend, viewWidth, viewHeight);
+     *
+     * // subtitle stream: allocCodecContext + codecParametersToContext +
+     * // codecOpen2, then per decoded event:
+     * byte[] hdr = new byte[codecGetSubtitleHeaderSize(subCtx)];  // SSA/ASS style header
+     * if (hdr.length &gt; 0) {
+     *     codecGetSubtitleHeader(subCtx, hdr, 0, hdr.length);
+     *     assProcessCodecPrivate(track, hdr, 0, hdr.length);
+     * }
+     * // ASS packets: feed the raw line via packetCopyData + assProcessData.
+     * // SRT/VTT: assProcessChunk(rectTextBytes,
+     * //   (subtitleGetPts(s)*1000 + startDisplayTime)/AV_TIME_BASE?, dur...).
+     *
+     * long frameNowMs = ...;                 // video clock
+     * int[] dc = new int[1];
+     * for (long img = assRenderFrame(rend, track, frameNowMs, dc); img != 0;
+     *          img = assImageGetNext(img)) {
+     *     int w = assImageGetWidth(img), h = assImageGetHeight(img),
+     *         stride = assImageGetStride(img);
+     *     byte[] bits = new byte[stride * h];
+     *     assImageGetBitmap(img, bits, 0, bits.length);            // 8-bit alpha
+     *     blendOntoCanvas(assImageGetTop(img), assImageGetLeft(img),
+     *                     w, h, bits, assImageGetColor(img), assImageGetDst(img));
+     * }
+     * // on seek: assTrackFlushEvents(track);
+     * // teardown: assTrackFree(track); assRendererFree(rend); assLibFree(lib);
+     * </pre>
+     */
+    /** @return ASS_Library handle, or 0 on failure. */
+    public native long assLibCreate();
+    /** Free an ASS_Library (renderers/tracks created from it first). */
+    public native void assLibFree(long lib);
+
+    /** @return ASS_Renderer handle bound to {@code lib}, or 0. */
+    public native long assRendererCreate(long lib);
+    public native void assRendererFree(long rend);
+
+    /** @return ASS_Track handle (one per subtitle stream) for {@code lib}, or 0. */
+    public native long assTrackCreate(long lib);
+    public native void assTrackFree(long track);
+    /** Drop queued/visible events (call after a seek). */
+    public native void assTrackFlushEvents(long track);
+    /** @return script PlayResX (0 if unset). */
+    public native int assTrackGetPlayResX(long track);
+    /** @return script PlayResY (0 if unset). */
+    public native int assTrackGetPlayResY(long track);
+
+    /**
+     * Register an in-memory font, e.g. an MKV AttachedFile extracted with
+     * {@link #streamGetExtradata}. {@code name} should be the stored attachment
+     * filename (keep the extension) so the script's style family resolves;
+     * the bytes are copied.
+     * @return 0 on success, negative AVERROR on bad args
+     */
+    public native int assAddFont(long lib, String name, byte[] in, int off, int len);
+    /** Drop every globally cached in-memory font (all libraries). */
+    public native void assClearFonts();
+    /** Extra directory scanned by the selected font provider. */
+    public native void assSetFontsDir(long lib, String dir);
+    /**
+     * Enable font matching after the embedded fonts are registered.
+     * @param provider {@code ASS_FONT_SELECT_*}
+     * @return 0 on success, negative AVERROR
+     */
+    public native int assSetFonts(long rend, String defaultFont, String defaultFamily, int provider);
+
+    /** Set the target frame (view) size in pixels. */
+    public native void assSetFrameSize(long rend, int w, int h);
+    /** Set the "storage" size the script was authored against (zoom base). */
+    public native void assSetStorageSize(long rend, int w, int h);
+    /** Video margins (letterbox) in pixels. */
+    public native void assSetMargins(long rend, int top, int bottom, int left, int right);
+    /** 1 to render subtitles inside {@link #assSetMargins}'s margins. */
+    public native void assSetUseMargins(long rend, int use);
+    /** Uniform font size factor (1.0 = native). */
+    public native void assSetFontScale(long rend, double scale);
+
+    /**
+     * Feed the SSA/ASS script header ({@link #codecGetSubtitleHeader}).
+     * @return 0 or negative AVERROR
+     */
+    public native int assProcessCodecPrivate(long track, byte[] in, int off, int len);
+    /**
+     * Feed raw script text incrementally (MKV ASS packets are complete
+     * {@code Dialogue:} lines). @return 0 or negative AVERROR.
+     */
+    public native int assProcessData(long track, byte[] in, int off, int len);
+    /**
+     * Feed ONE already-timed event (decoded SRT/WebVTT text). Times in ms
+     * (derive from {@link #subtitleGetPts} + start/end display time).
+     * @return 0 or negative AVERROR
+     */
+    public native int assProcessChunk(long track, byte[] in, int off, int len,
+                                      long startMs, long durationMs);
+
+    /**
+     * Rasterize {@code track} at {@code nowMs}.
+     * @param detectChange optional 1-int[] receiving libass ASS_CHANGE_* bits
+     * @return first {@code ASS_Image} handle (0 = nothing visible); the list
+     *         is owned by the renderer and regenerated by every call.
+     */
+    public native long assRenderFrame(long rend, long track, long nowMs, int[] detectChange);
+
+    /** @return next image handle in the list, 0 at end. */
+    public native long assImageGetNext(long img);
+    public native int assImageGetWidth(long img);
+    public native int assImageGetHeight(long img);
+    /** @return row pitch of the alpha bitmap. */
+    public native int assImageGetStride(long img);
+    /** @return foreground color as unsigned packed ARGB. */
+    public native long assImageGetColor(long img);
+    /** @return blend hint: 0 color+alpha, 1 add, 2 alpha only, 3 opaque. */
+    public native int assImageGetDst(long img);
+    /** @return image top / left position in the frame, in pixels. */
+    public native int assImageGetTop(long img);
+    public native int assImageGetLeft(long img);
+    /**
+     * Copy the alpha bitmap ({@code stride*height} bytes) into {@code out}.
+     * @return bytes copied, or negative AVERROR when {@code out} is too small
+     */
+    public native int assImageGetBitmap(long img, byte[] out, int off, int len);
+
+    /** @return size of AVCodecContext::subtitle_header (SSA/ASS script format
+     *  header), 0 when the decoder has none. */
+    public native int codecGetSubtitleHeaderSize(long codecCtx);
+    /**
+     * Copy up to {@code len} bytes of {@code subtitle_header} into {@code out}.
+     * @return bytes copied, or -1 when there is no subtitle_header.
+     */
+    public native int codecGetSubtitleHeader(long codecCtx, byte[] out, int off, int len);
+
+    /* -------------------------------------------------------------- */
     /* libavcodec: descriptor iteration, hw config, class               */
     /* -------------------------------------------------------------- */
 
@@ -2182,6 +2357,14 @@ public final class FFMpegNative {
     public static final int WINDOW_FORMAT_RGBA_8888 = 1;
     public static final int WINDOW_FORMAT_RGBX_8888 = 2;
     public static final int WINDOW_FORMAT_RGB_565    = 4;
+
+    /**
+     * Font-provider flags for {@link #assSetFonts} (libass
+     * {@code ASS_FONT_SELECT_*}).
+     */
+    public static final int ASS_FONT_SELECT_OFF    = 0;
+    public static final int ASS_FONT_SELECT_ENABLE = 1;
+    public static final int ASS_FONT_SELECT_INVERT = 2;
 
     /** Codec-config enum values mirroring {@code enum AVCodecConfig} (use with {@link #codecGetSupportedConfigs}). */
     public static final int AV_CODEC_CONFIG_PIX_FORMAT      = 0;
