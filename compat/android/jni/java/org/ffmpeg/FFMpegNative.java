@@ -2294,14 +2294,14 @@ public final class FFMpegNative {
     public static final int AV_CODEC_ID_NONE = 0;
 
     /** Common video codec id constants mirroring {@code enum AVCodecID}. */
-    public static final int AV_CODEC_ID_MPEG1VIDEO = 2;
-    public static final int AV_CODEC_ID_MPEG2VIDEO = 3;
-    public static final int AV_CODEC_ID_MPEG4     = 13;
-    public static final int AV_CODEC_ID_H264       = 28;
-    public static final int AV_CODEC_ID_VP8        = 140;
-    public static final int AV_CODEC_ID_VP9        = 167;
-    public static final int AV_CODEC_ID_HEVC       = 173;
-    public static final int AV_CODEC_ID_AV1        = 223;
+    public static final int AV_CODEC_ID_MPEG1VIDEO = 1;
+    public static final int AV_CODEC_ID_MPEG2VIDEO = 2;
+    public static final int AV_CODEC_ID_MPEG4     = 12;
+    public static final int AV_CODEC_ID_H264       = 27;
+    public static final int AV_CODEC_ID_VP8        = 139;
+    public static final int AV_CODEC_ID_VP9        = 166;
+    public static final int AV_CODEC_ID_HEVC       = 172;
+    public static final int AV_CODEC_ID_AV1        = 222;
 
     /** Common audio codec id constants mirroring {@code enum AVCodecID}. */
     public static final int AV_CODEC_ID_PCM_S16LE = 0x10000;  // = 65536
