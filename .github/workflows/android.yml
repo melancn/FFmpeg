@@ -32,10 +32,18 @@ jobs:
       BUILD_DIR: build-android
       INSTALL_DIR: install
       OUT_DIR: android-jni
+      CURL_VERSION: 8.22.0
+      CURL_SHA256: f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Test libcurl build guards
+        run: |
+          bash -n compat/android/build-libcurl.sh
+          bash -n compat/android/verify-libcurl.sh
+          bash compat/android/test-libcurl.sh
 
       - name: Set up JDK (for javac -h)
         uses: actions/setup-java@v4
@@ -55,6 +63,7 @@ jobs:
           NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
           echo "ndk_root=$NDK_ROOT"    >> "$GITHUB_OUTPUT"
           echo "ndk_bin=$NDK_BIN"      >> "$GITHUB_OUTPUT"
+          echo "ndk_version=$(basename "$NDK_ROOT")" >> "$GITHUB_OUTPUT"
           echo "Found NDK at $NDK_ROOT"
           "$NDK_BIN/clang" --version
 
@@ -73,7 +82,7 @@ jobs:
           # top-level dirs (libavcodec/, libavutil/, ...) and produces a hash
           # independent of their contents, so the key never changed with source.
           # Use recursive '**' patterns so the key actually tracks source edits.
-          key: ccache-android-${{ matrix.abi }}-${{ hashFiles('configure', 'Makefile', 'lib*/**', 'ffbuild/**', 'compat/**') }}
+          key: ccache-android-${{ matrix.abi }}-${{ hashFiles('.github/workflows/android.yml', 'configure', 'Makefile', 'lib*/**', 'ffbuild/**', 'compat/**') }}
           restore-keys: |
             ccache-android-${{ matrix.abi }}-
 
@@ -170,6 +179,29 @@ jobs:
           test -f "$MBED_PREFIX/lib/libmbedcrypto.a"
           test -f "$MBED_PREFIX/lib/pkgconfig/mbedtls.pc"
           ls -l "$MBED_PREFIX/lib" "$MBED_PREFIX/lib/pkgconfig"
+
+      - name: Cache static libcurl install
+        id: curl-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUILD_DIR }}/curl-install
+          key: curl-${{ matrix.abi }}-api${{ env.ANDROID_API }}-ndk${{ steps.ndk.outputs.ndk_version }}-${{ env.CURL_VERSION }}-${{ env.CURL_SHA256 }}-mbedtls3.6.7-${{ hashFiles('compat/android/*libcurl.sh', '.github/workflows/android.yml') }}
+          # No restore prefix: never mix archives from another NDK/TLS build.
+
+      - name: Build & install static libcurl
+        if: steps.curl-cache.outputs.cache-hit != 'true'
+        env:
+          NDK_ROOT: ${{ steps.ndk.outputs.ndk_root }}
+          ANDROID_ABI: ${{ matrix.abi }}
+        run: bash compat/android/build-libcurl.sh
+
+      - name: Verify static libcurl (including cache hits)
+        env:
+          NM: ${{ steps.toolchain.outputs.nm }}
+        run: |
+          export CURL_PREFIX="$PWD/$BUILD_DIR/curl-install"
+          export MBEDTLS_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
+          bash compat/android/verify-libcurl.sh
 
       - name: Cache cross deps (libass stack)
         id: deps-cache
@@ -310,13 +342,15 @@ jobs:
           PREFIX="$PWD/$BUILD_DIR/$INSTALL_DIR"
           MBEDTLS_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
           DEPS_PREFIX="$PWD/$BUILD_DIR/deps-install"
+          CURL_PREFIX="$PWD/$BUILD_DIR/curl-install"
           mkdir -p "$PREFIX"
-          # Expose the just-built mbedTLS and the libass dependency stack via
+          # Expose target-only libcurl, mbedTLS and the libass stack via
           # pkg-config so configure's check_pkg_config() paths pick up the TLS
           # backend (pulls in ff_tls_protocol -> ff_https_protocol) and
           # libass/freetype for the subtitles filter.
-          export PKG_CONFIG_PATH="$MBEDTLS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-          export PKG_CONFIG_LIBDIR="$MBEDTLS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_PATH="$CURL_PREFIX/lib/pkgconfig:$MBEDTLS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$PKG_CONFIG_PATH"
+          unset PKG_CONFIG_SYSROOT_DIR
           # --enable-jni + --enable-mediacodec enables the Android MediaCodec
           # hardware decoders (h264_mediacodec, hevc_mediacodec, av1_mediacodec,
           # mpeg4_mediacodec, vp8/9_mediacodec, mp3_mediacodec, ...). The
@@ -342,7 +376,8 @@ jobs:
             --disable-doc --disable-avdevice --disable-programs \
             --enable-pic \
             --enable-version3 \
-            --enable-mbedtls --pkg-config-flags="--static" \
+            --enable-mbedtls --enable-libcurl --enable-protocol=libcurl \
+            --pkg-config-flags="--static" \
             --enable-libass --enable-libfreetype --enable-libfribidi --enable-libharfbuzz \
             --enable-jni --enable-mediacodec \
             --extra-cflags="-fPIC -O2" \
@@ -357,7 +392,13 @@ jobs:
           grep -E '^(CONFIG_MEDIACODEC|CONFIG_JNI|CONFIG_(H264|HEVC|AV1|MPEG4|VP8|VP9|MP3)_MEDIACODEC)' \
             ffbuild/config.mak 2>/dev/null || true
           echo "::endgroup::"
-          exit ${CFGRES:-0}
+          if [ "${CFGRES:-0}" -ne 0 ]; then exit "$CFGRES"; fi
+          for flag in CONFIG_LIBCURL CONFIG_LIBCURL_PROTOCOL CONFIG_MBEDTLS; do
+            if ! grep -qx "$flag=yes" ffbuild/config.mak; then
+              echo "::error::$flag is not enabled (proxy backend would be unavailable)"
+              exit 1
+            fi
+          done
 
       - name: Build & install FFmpeg
         run: |
@@ -392,10 +433,17 @@ jobs:
           PREFIX="$PWD/$BUILD_DIR/$INSTALL_DIR"
           MBEDTLS_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
           DEPS_PREFIX="$PWD/$BUILD_DIR/deps-install"
+          CURL_PREFIX="$PWD/$BUILD_DIR/curl-install"
           OUT="$PWD/$OUT_DIR/$ABI/lib"
           CLS="$PWD/$OUT_DIR/$ABI/classes"
           JNI_OBJ="$PWD/$BUILD_DIR/ffmpeg_jni-$ABI.o"
           mkdir -p "$OUT" "$CLS"
+
+          export PKG_CONFIG_PATH="$CURL_PREFIX/lib/pkgconfig:$MBEDTLS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$PKG_CONFIG_PATH"
+          unset PKG_CONFIG_SYSROOT_DIR
+          CURL_LINK_FLAGS=$(pkg-config --static --libs libcurl)
+          read -r -a CURL_LIBS <<< "$CURL_LINK_FLAGS"
 
           # Compile the JNI translation unit as C. Passing a .c file to clang++
           # makes NDK 29 treat FFmpeg's C headers and JNIEnv ABI as C++17.
@@ -421,6 +469,7 @@ jobs:
             -L"$PREFIX/lib" -L"$MBEDTLS_PREFIX/lib" -L"$DEPS_PREFIX/lib" \
             -Wl,--start-group \
             -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
+            "${CURL_LIBS[@]}" \
             -lmbedtls -lmbedx509 -lmbedcrypto \
             -Wl,--end-group \
             -Wl,--start-group \
@@ -428,8 +477,8 @@ jobs:
             -Wl,--end-group \
             -static-libstdc++ \
             -lmediandk -landroid -ljnigraphics \
-            -llog -lm -lz \
-            -Wl,-soname,libffmpeg_jni.so \
+            -llog -ldl -lm -lz \
+            -Wl,--no-undefined -Wl,-soname,libffmpeg_jni.so \
             -o "$OUT/libffmpeg_jni.so"
 
           echo "::group::libffmpeg_jni.so details"
@@ -457,6 +506,10 @@ jobs:
             exit 1
           fi
           echo "C++ runtime linked statically (no libc++_shared.so in DT_NEEDED)"
+          if grep -Eq 'Shared library: \[(libcurl|libmbedtls|libmbedx509|libmbedcrypto)\.so([.][^]]*)?\]' <<< "$DYNAMIC_SECTION"; then
+            echo "::error::libcurl/mbedTLS must be embedded, not additional APK shared libraries"
+            exit 1
+          fi
           export_syms=$("$NDK_BIN/llvm-nm" -D "$OUT/libffmpeg_jni.so" 2>/dev/null)
           # Best-effort listing of all exported JNI symbols (informational).
           printf '%s\n' "$export_syms" | grep -E 'Java_org_ffmpeg' || true
@@ -550,6 +603,16 @@ jobs:
             echo "::warning::mbedtls_ssl_init not found in defined symbols; check tls backend linkage"
           fi
           echo "HTTP/HTTPS protocol symbols present"
+          # prefer_libcurl exists even when its backend is compiled out.
+          # Verify the implementation and SOCKS code survived static linking.
+          for sym in ff_libcurl_protocol curl_easy_init curl_easy_setopt curl_multi_init \
+                     Curl_cf_socks_proxy_insert_after; do
+            if ! grep -q " ${sym}$" /tmp/jni_syms.txt; then
+              echo "::error::libffmpeg_jni.so missing ${sym} (libcurl/SOCKS backend not linked)"
+              exit 1
+            fi
+          done
+          echo "libcurl HTTP/HTTPS and SOCKS proxy implementation linked"
           # The JNI bridge calls libass directly, so verify the core symbols
           # it needs are present. The optional ass/subtitles AVFilter objects
           # may be omitted by static archive extraction when no caller refers
@@ -603,6 +666,9 @@ jobs:
 
       - name: Stage artifact
         run: |
+          mkdir -p "$OUT_DIR/${{ matrix.abi }}/licenses/curl"
+          cp "$BUILD_DIR/curl-install/share/licenses/curl/COPYING" "$OUT_DIR/${{ matrix.abi }}/licenses/curl/"
+          cp "$BUILD_DIR/curl-install/share/android-build/libcurl.txt" "$OUT_DIR/${{ matrix.abi }}/"
           tree "$OUT_DIR/${{ matrix.abi }}" 2>/dev/null || find "$OUT_DIR/${{ matrix.abi }}" -type f | sort
 
       - name: Upload artifact
@@ -634,6 +700,9 @@ jobs:
             mkdir -p "ffmpeg-jni-bundle/jniLibs/$abi"
             cp "$d/lib/libffmpeg_jni.so" "ffmpeg-jni-bundle/jniLibs/$abi/" 2>/dev/null || true
             cp -r "$d/classes/org" "ffmpeg-jni-bundle/classes/" 2>/dev/null || true
+            mkdir -p "ffmpeg-jni-bundle/licenses/curl" "ffmpeg-jni-bundle/build-info/$abi"
+            cp "$d/licenses/curl/COPYING" "ffmpeg-jni-bundle/licenses/curl/"
+            cp "$d/libcurl.txt" "ffmpeg-jni-bundle/build-info/$abi/"
           done
           find ffmpeg-jni-bundle -type f | sort
 
