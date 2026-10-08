@@ -18,9 +18,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <math.h>
+
 #include "libavutil/emms.h"
 #include "libavutil/intmath.h"
-#include "libavutil/libm.h"
 #include "libavutil/log.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
@@ -1806,6 +1807,11 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 
     mpv->picture_number = avctx->frame_num;
     if(avctx->flags&AV_CODEC_FLAG_PASS2){
+        if (avctx->frame_num >= enc->m.rc_context.num_entries) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Pass-2 statistics contain fewer frames than the input.\n");
+            return AVERROR_INVALIDDATA;
+        }
         mpv->c.pict_type = pic->pict_type = enc->m.rc_context.entry[avctx->frame_num].new_pict_type;
         s->keyframe = pic->pict_type == AV_PICTURE_TYPE_I;
         if(!(avctx->flags&AV_CODEC_FLAG_QSCALE)) {

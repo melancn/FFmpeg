@@ -351,7 +351,12 @@ SwsFormat ff_fmt_from_frame(const AVFrame *frame, int field)
     enum AVPixelFormat hw_format = AV_PIX_FMT_NONE;
 
 #if CONFIG_UNSTABLE
-    if (frame->hw_frames_ctx) {
+    const AVPixFmtDescriptor *hw_desc = av_pix_fmt_desc_get(frame->format);
+    av_assert0(hw_desc);
+
+    if (hw_desc->flags & AV_PIX_FMT_FLAG_HWACCEL) {
+        av_assert0(frame->hw_frames_ctx);
+
         AVHWFramesContext *hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
         hw_format = frame->format;
         format = hwfc->sw_format;
@@ -551,6 +556,27 @@ bool ff_infer_colors(SwsColor *src, SwsColor *dst)
     return incomplete;
 }
 
+static int infer_loc_ref(SwsFormat *fmt, const SwsFormat *ref)
+{
+    if (fmt->loc != AVCHROMA_LOC_UNSPECIFIED ||
+        ref->loc == AVCHROMA_LOC_UNSPECIFIED ||
+        (!fmt->desc->log2_chroma_w && !fmt->desc->log2_chroma_h))
+        return 0;
+
+    fmt->loc = ref->loc;
+    return 1;
+}
+
+bool ff_infer_chroma_loc(SwsFormat *src, SwsFormat *dst)
+{
+    int incomplete = 0;
+
+    incomplete |= infer_loc_ref(dst, src);
+    incomplete |= infer_loc_ref(src, dst);
+
+    return incomplete;
+}
+
 void ff_sws_chroma_pos(const SwsFormat *fmt, bool *incomplete,
                        int *out_x_pos, int *out_y_pos)
 {
@@ -695,6 +721,7 @@ int sws_is_noop(const AVFrame *dst, const AVFrame *src)
     for (int field = 0; field < 2; field++) {
         SwsFormat dst_fmt = ff_fmt_from_frame(dst, field);
         SwsFormat src_fmt = ff_fmt_from_frame(src, field);
+        ff_infer_chroma_loc(&src_fmt, &dst_fmt);
         if (!ff_fmt_equal(&dst_fmt, &src_fmt))
             return 0;
         if (!dst_fmt.interlaced)
@@ -1279,7 +1306,7 @@ static SwsLinearOp fmt_encode_range(const SwsFormat *fmt, bool *incomplete)
 
     if (fmt->format == AV_PIX_FMT_MONOWHITE) {
         /* This format is inverted, 0 = white, 1 = black */
-        c.m[0][4] = av_add_q64(c.m[0][4], c.m[0][0]);
+        c.m[0][4] = ff_add_q64(c.m[0][4], c.m[0][0]);
         c.m[0][0] = av_neg_q64(c.m[0][0]);
     }
 
@@ -1293,8 +1320,8 @@ static SwsLinearOp fmt_decode_range(const SwsFormat *fmt, bool *incomplete)
     /* Invert main diagonal + offset: x = s * y + k  ==>  y = (x - k) / s */
     for (int i = 0; i < 4; i++) {
         av_assert1(c.m[i][i].num);
-        c.m[i][i] = av_inv_q64(c.m[i][i]);
-        c.m[i][4] = av_mul_q64(c.m[i][4], av_neg_q64(c.m[i][i]));
+        c.m[i][i] = ff_inv_q64(c.m[i][i]);
+        c.m[i][4] = ff_mul_q64(c.m[i][4], av_neg_q64(c.m[i][i]));
     }
 
     /* Explicitly initialize alpha for sanity */
@@ -1322,9 +1349,9 @@ static AVRational64 *generate_bayer_matrix(const int size_log2)
         for (int y = 0; y < sz; y++) {
             for (int x = 0; x < sz; x++) {
                 const AVRational64 cur = m[y * size + x];
-                m[(y + sz) * size + x + sz] = av_add_q64(cur, av_make_q64(1, den));
-                m[(y     ) * size + x + sz] = av_add_q64(cur, av_make_q64(2, den));
-                m[(y + sz) * size + x     ] = av_add_q64(cur, av_make_q64(3, den));
+                m[(y + sz) * size + x + sz] = ff_add_q64(cur, ff_make_q64(1, den));
+                m[(y     ) * size + x + sz] = ff_add_q64(cur, ff_make_q64(2, den));
+                m[(y + sz) * size + x     ] = ff_add_q64(cur, ff_make_q64(3, den));
             }
         }
     }
@@ -1340,7 +1367,7 @@ static AVRational64 *generate_bayer_matrix(const int size_log2)
      * To make the average value equal to 1/2 = N/(2N), add a bias of 1/(2N).
      */
     for (int i = 0; i < num_entries; i++)
-        m[i] = av_add_q64(m[i], av_make_q64(1, 2 * num_entries));
+        m[i] = ff_add_q64(m[i], ff_make_q64(1, 2 * num_entries));
 
     return m;
 }
@@ -1407,9 +1434,9 @@ static int fmt_dither(SwsContext *ctx, SwsOpList *ops,
         const int size = 1 << dither.size_log2;
         dither.min = dither.max = dither.matrix[0];
         for (int i = 1; i < size * size; i++) {
-            if (av_cmp_q64(dither.min, dither.matrix[i]) > 0)
+            if (ff_cmp_q64(dither.min, dither.matrix[i]) > 0)
                 dither.min = dither.matrix[i];
-            if (av_cmp_q64(dither.matrix[i], dither.max) > 0)
+            if (ff_cmp_q64(dither.matrix[i], dither.max) > 0)
                 dither.max = dither.matrix[i];
         }
 
@@ -1455,7 +1482,7 @@ static int fmt_dither(SwsContext *ctx, SwsOpList *ops,
     return AVERROR(EINVAL);
 }
 
-#define Q64(x) av_make_q64((x).num, (x).den)
+#define Q64(x) ff_make_q64((x).num, (x).den)
 
 static inline SwsLinearOp
 linear_mat3(const AVRational m00, const AVRational m01, const AVRational m02,
@@ -1495,8 +1522,10 @@ int ff_sws_decode_colors(SwsContext *ctx, SwsPixelType type,
         .lin  = fmt_decode_range(fmt, incomplete),
     }));
 
-    /* Final step, decode colorspace */
-    switch (fmt->csp) {
+    /* Final step, decode colorspace. XYZ formats carry no colorspace
+     * matrix; their transfer/primaries are handled by the color mapping
+     * layer, so treat them like RGB here. */
+    switch (fmt->desc->flags & AV_PIX_FMT_FLAG_XYZ ? AVCOL_SPC_RGB : fmt->csp) {
     case AVCOL_SPC_RGB:
         return 0;
     case AVCOL_SPC_UNSPECIFIED:
@@ -1568,7 +1597,8 @@ int ff_sws_encode_colors(SwsContext *ctx, SwsPixelType type,
     if (!pixel_type)
          return AVERROR(ENOTSUP);
 
-    switch (dst->csp) {
+    /* See ff_sws_decode_colors(): XYZ formats have no colorspace matrix */
+    switch (dst->desc->flags & AV_PIX_FMT_FLAG_XYZ ? AVCOL_SPC_RGB : dst->csp) {
     case AVCOL_SPC_RGB:
         break;
     case AVCOL_SPC_UNSPECIFIED:
@@ -1783,7 +1813,7 @@ int ff_sws_apply_lut3d(SwsContext *ctx, SwsPixelType type, SwsOpList *ops,
     }));
 
     /* Normalize back to [0, 1] */
-    const AVRational64 inv = av_inv_q64(Q(UINT16_MAX));
+    const AVRational64 inv = ff_inv_q64(Q(UINT16_MAX));
     RET(ff_sws_op_list_append(ops, &(SwsOp) {
         .type   = type,
         .op     = SWS_OP_LINEAR,
