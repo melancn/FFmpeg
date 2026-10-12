@@ -71,6 +71,8 @@
 
 #include "libavformat/avformat.h"
 #include "libavformat/avio.h"
+#include "libavformat/internal.h"
+#include "libavformat/demux.h"
 
 #include "libavfilter/avfilter.h"
 #include "libavfilter/buffersrc.h"
