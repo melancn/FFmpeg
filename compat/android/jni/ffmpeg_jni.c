@@ -2824,10 +2824,11 @@ Java_org_ffmpeg_FFMpegNative_streamDisableParsing(JNIEnv *env, jobject thiz, jlo
     if (!c || index < 0 || index >= (jint)c->nb_streams)
         return;
     AVStream *st = c->streams[index];
-    st->need_parsing = AVSTREAM_PARSE_NONE;
-    if (st->parser) {
-        av_parser_close(st->parser);
-        st->parser = NULL;
+    avpriv_stream_set_need_parsing(st, AVSTREAM_PARSE_NONE);
+    FFStream *ffi = ffstream(st);
+    if (ffi->parser) {
+        av_parser_close(ffi->parser);
+        ffi->parser = NULL;
     }
 }
 
