@@ -2808,6 +2808,29 @@ Java_org_ffmpeg_FFMpegNative_streamSetDisposition(JNIEnv *env, jobject thiz, jlo
     c->streams[index]->disposition = disposition;
 }
 
+/* Disable codec-level parsing for a single stream. Closes any parser that
+ * avformat_find_stream_info may have created (stored in st->parser) and sets
+ * need_parsing to AVSTREAM_PARSE_NONE so that av_read_frame returns the raw
+ * demuxed payload without parser-induced frame splitting.
+ *
+ * Use this for streams whose codec_id was misidentified by the demuxer (e.g.
+ * AV3A audio tagged as MP3 in MPEG-TS, codec_id=86017), so that the raw PES
+ * payload is passed through unmodified to the external decoder. Must be
+ * called after formatFindStreamInfo and before the first readFrame. */
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_streamDisableParsing(JNIEnv *env, jobject thiz, jlong ctx, jint index)
+{
+    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    if (!c || index < 0 || index >= (jint)c->nb_streams)
+        return;
+    AVStream *st = c->streams[index];
+    st->need_parsing = AVSTREAM_PARSE_NONE;
+    if (st->parser) {
+        av_parser_close(st->parser);
+        st->parser = NULL;
+    }
+}
+
 /* Copy codecpar extradata into a packet's side_data via the encoder path is
  * the caller's responsibility; here we expose codecpar extradata setting for
  * muxing setup. */
@@ -5456,3 +5479,22 @@ JNI_OnLoad(JavaVM *vm, void *reserved)
     return JNI_VERSION_1_6;
 }
 
+
+/* MediaHub outbound contract v1. Must ship together with libcurl.c environment
+ * isolation and aviobuf.c child-option propagation. Pure capability probe:
+ * never open a URL to test a capability (that could leak before failing).
+ */
+JNIEXPORT jint JNICALL
+Java_com_inlz_mediahub_core_player_network_FfmpegNetworkCapabilities_nativeContractVersion(
+        JNIEnv *env, jclass clazz)
+{
+    void *opaque = NULL;
+    const char *name;
+    (void)env;
+    (void)clazz;
+    while ((name = avio_enum_protocols(&opaque, 0))) {
+        if (!strcmp(name, "libcurl"))
+            return 1;
+    }
+    return 0;
+}

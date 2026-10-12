@@ -63,4 +63,4 @@
 /android-jni/
 /compat/android/jni/generated/
 *.class
-
+/build-android-local/

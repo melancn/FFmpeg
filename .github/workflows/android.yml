@@ -478,6 +478,7 @@ jobs:
             -static-libstdc++ \
             -lmediandk -landroid -ljnigraphics \
             -llog -ldl -lm -lz \
+            -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 \
             -Wl,--no-undefined -Wl,-soname,libffmpeg_jni.so \
             -o "$OUT/libffmpeg_jni.so"
 
@@ -516,7 +517,8 @@ jobs:
           # Hard-assert the new Surface zero-copy JNI entry points are actually
           # exported: a missing dynamic export means javac -h and the C side
           # diverged on a signature, or the function was compiled out.
-          for sym in Java_org_ffmpeg_FFMpegNative_packetClone \
+          for sym in Java_com_inlz_mediahub_core_player_network_FfmpegNetworkCapabilities_nativeContractVersion \
+                     Java_org_ffmpeg_FFMpegNative_packetClone \
                      Java_org_ffmpeg_FFMpegNative_mediasurfaceHwdeviceCreate \
                      Java_org_ffmpeg_FFMpegNative_setContextHwDeviceCtx \
                      Java_org_ffmpeg_FFMpegNative_setContextPktTimebase \
@@ -533,7 +535,8 @@ jobs:
                       Java_org_ffmpeg_FFMpegNative_formatSetInterruptFlag \
                       Java_org_ffmpeg_FFMpegNative_interruptFlagAbort \
                       Java_org_ffmpeg_FFMpegNative_interruptFlagFree \
-                      Java_org_ffmpeg_FFMpegNative_streamGetParExtradataSize \
+                       Java_org_ffmpeg_FFMpegNative_streamGetParExtradataSize \
+                       Java_org_ffmpeg_FFMpegNative_streamDisableParsing \
                       Java_org_ffmpeg_FFMpegNative_codecGetSubtitleHeaderSize \
                       Java_org_ffmpeg_FFMpegNative_codecGetSubtitleHeader \
                       Java_org_ffmpeg_FFMpegNative_assLibCreate \

@@ -332,6 +332,18 @@ public final class FFMpegNative {
     public native int streamGetDisposition(long ctx, int index);
     /** Set stream {@code index} disposition flags. */
     public native void streamSetDisposition(long ctx, int index, int disposition);
+    /**
+     * Disable codec-level parsing for a single stream: closes any parser
+     * that {@link #formatFindStreamInfo} may have created and prevents
+     * {@link #readFrame} from creating a new one. Use this when the demuxer
+     * misidentified the stream's codec (e.g. AV3A audio tagged as MP3 in
+     * MPEG-TS), so that raw demuxed payload is returned without
+     * parser-induced splitting.
+     *
+     * <p>Must be called after {@link #formatFindStreamInfo} and before the
+     * first {@link #readFrame}.
+     */
+    public native void streamDisableParsing(long ctx, int index);
     /** @return fourcc codec tag of stream {@code index}. */
     public native int streamGetParCodecTag(long ctx, int index);
     /** @return audio sample rate (Hz) of stream {@code index}. */
