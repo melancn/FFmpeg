@@ -228,6 +228,14 @@ Java_org_ffmpeg_FFMpegNative_dictFree(JNIEnv *env, jobject thiz, jlong box)
 /* libavformat                                                         */
 /* ------------------------------------------------------------------ */
 
+/* Interrupt plumbing used by both formatOpenInput variants; defined below. */
+typedef struct FFInterruptFlag {
+    /* Written by the controlling thread, polled by the I/O thread. */
+    volatile int aborted;
+} FFInterruptFlag;
+
+static int ff_jni_interrupt_cb(void *opaque);
+
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_formatOpenInput(JNIEnv *env, jobject thiz,
                                              jstring url, jlong optionsBox)
@@ -241,6 +249,61 @@ Java_org_ffmpeg_FFMpegNative_formatOpenInput(JNIEnv *env, jobject thiz,
     (*env)->ReleaseStringUTFChars(env, url, u);
     if (ret < 0 || !ctx)
         return 0;
+    return (jlong)(intptr_t)ctx;
+}
+
+/* Variant of formatOpenInput whose I/O can be cancelled while it is still
+ * running.
+ *
+ * formatOpenInput() calls avformat_open_input(&ctx=NULL, ...), so the
+ * AVFormatContext -- and therefore interrupt_callback -- only exists after
+ * the function returns. Nothing the caller does meanwhile (including
+ * interruptFlagAbort) can reach the DNS lookup, TLS handshake or HLS
+ * playlist reload happening inside, so an abandoned open keeps burning the
+ * thread until the protocol's own timeout expires.
+ *
+ * Here the context is allocated first, the flag is attached to it, and only
+ * then is it opened. Raising the flag now makes the in-flight open fail with
+ * AVERROR_EXIT promptly.
+ *
+ * @param url          input URL / path
+ * @param optionsBox   AVDictionary** box, 0 for none
+ * @param flag         interrupt flag handle; 0 means "no cancellation"
+ * @return the opened AVFormatContext, or 0 on failure (same contract as
+ *         formatOpenInput). On failure the context is closed here. */
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_formatOpenInputWithInterrupt(JNIEnv *env, jobject thiz,
+                                                          jstring url, jlong optionsBox,
+                                                          jlong flag)
+{
+    if (!url)
+        return 0;
+    AVDictionary **opts = optionsBox ? PTR(AVDictionary **, optionsBox) : NULL;
+    FFInterruptFlag *f = flag ? PTR(FFInterruptFlag *, flag) : NULL;
+    /* An already cancelled generation must not start DNS/TLS/probe work. */
+    if (ff_jni_interrupt_cb(f))
+        return 0;
+    AVFormatContext *ctx = avformat_alloc_context();
+    if (!ctx)
+        return 0;
+    if (f) {
+        ctx->interrupt_callback.callback = ff_jni_interrupt_cb;
+        ctx->interrupt_callback.opaque   = f;
+    }
+    const char *u = (*env)->GetStringUTFChars(env, url, NULL);
+    if (!u) {
+        avformat_free_context(ctx);
+        return 0;
+    }
+    int ret = avformat_open_input(&ctx, u, NULL, opts);
+    (*env)->ReleaseStringUTFChars(env, url, u);
+    if (ret < 0 || !ctx) {
+        /* avformat_open_input frees ctx on failure, but free defensively:
+         * a NULL return with a non-NULL ctx would otherwise leak. */
+        if (ctx)
+            avformat_close_input(&ctx);
+        return 0;
+    }
     return (jlong)(intptr_t)ctx;
 }
 
@@ -5405,11 +5468,6 @@ Java_org_ffmpeg_FFMpegNative_aacAdtsPackerFree(JNIEnv *env, jobject thiz, jlong 
 /* polled inside tight I/O loops, and an AttachCurrentThread round trip  */
 /* per poll would be both slow and deadlock-prone during teardown.       */
 /* ------------------------------------------------------------------ */
-
-typedef struct FFInterruptFlag {
-    /* Written by the controlling thread, polled by the I/O thread. */
-    volatile int aborted;
-} FFInterruptFlag;
 
 static int ff_jni_interrupt_cb(void *opaque)
 {

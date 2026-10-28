@@ -163,6 +163,23 @@ public final class FFMpegNative {
     public native long formatOpenInput(String url, long optionsBox);
 
     /**
+     * Cancellable variant of {@link #formatOpenInput}: the context is
+     * allocated first, {@code flag} is attached as its
+     * {@code interrupt_callback}, and only then is it opened. Raising the
+     * flag with {@link #interruptFlagAbort} therefore aborts the in-flight
+     * open (DNS, TLS handshake, HLS playlist reload) with
+     * {@code AVERROR_EXIT} instead of waiting for the protocol timeout.
+     *
+     * @param url          path or URI
+     * @param optionsBox   dictionary-box handle, or 0
+     * @param flag         interrupt flag from {@link #interruptFlagCreate};
+     *                     0 opens without cancellation
+     * @return AVFormatContext handle, or 0 on failure (same contract as
+     *         {@link #formatOpenInput})
+     */
+    public native long formatOpenInputWithInterrupt(String url, long optionsBox, long flag);
+
+    /**
      * Probe the streams. Call once before accessing stream metadata.
      * @return 0 on success, negative AVERROR on failure
      */
