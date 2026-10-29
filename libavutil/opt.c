@@ -534,8 +534,10 @@ static int set_string_image_size(void *obj, const AVOption *o, const char *val, 
         return 0;
     }
     ret = av_parse_video_size(&tmp[0], &tmp[1], val);
-    if (ret < 0)
+    if (ret < 0) {
         av_log(logctx, AV_LOG_ERROR, "Unable to parse \"%s\" option value \"%s\" as image size\n", o->name, val);
+        return ret;
+    }
     if (dst)
         memcpy(dst, tmp, sizeof(tmp));
     return ret;
@@ -563,8 +565,10 @@ static int set_string_color(void *obj, const AVOption *o, const char *val, uint8
     } else {
         uint8_t tmp[4];
         ret = av_parse_color(tmp, val, -1, obj);
-        if (ret < 0)
+        if (ret < 0) {
             av_log(logctx, AV_LOG_ERROR, "Unable to parse \"%s\" option value \"%s\" as color\n", o->name, val);
+            return ret;
+        }
         if (dst)
             memcpy(dst, tmp, sizeof(tmp));
         return ret;
@@ -2169,8 +2173,15 @@ static int opt_copy_elem(void *logctx, enum AVOptionType type,
         *ddictp = NULL;
         return av_dict_copy(ddictp, sdict, 0);
     } else if (type == AV_OPT_TYPE_CHLAYOUT) {
-        if (dst != src)
+        const AVChannelLayout *slayout = (const AVChannelLayout *)src;
+        AVChannelLayout *dlayout = (AVChannelLayout *)dst;
+        if (dlayout != slayout) {
+            if (dlayout->order == AV_CHANNEL_ORDER_CUSTOM &&
+                slayout->order == AV_CHANNEL_ORDER_CUSTOM &&
+                dlayout->u.map == slayout->u.map)
+                dlayout->u.map = NULL;
             return av_channel_layout_copy(dst, src);
+        }
     } else if (opt_is_pod(type)) {
         size_t size = opt_type_desc[type].size;
         memcpy(dst, src, size);

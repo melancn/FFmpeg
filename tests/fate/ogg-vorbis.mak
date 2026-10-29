@@ -7,6 +7,15 @@ fate-ogg-vorbis-copy-chained-meta: $(APITESTSDIR)/api-dump-stream-meta-test$(EXE
 fate-ogg-vorbis-copy-chained-meta: REF = $(SRC_PATH)/tests/ref/fate/ogg-vorbis-chained-meta.txt
 fate-ogg-vorbis-copy-chained-meta: CMD = run_with_temp "$(FFMPEG) -nostdin -hide_banner -loglevel quiet -i $(TARGET_SAMPLES)/ogg-vorbis/chained-meta.ogg -c copy -f ogg -y" "$(APITESTSDIR)/api-dump-stream-meta-test$(EXESUF)" ogg
 
+# Chain two streams cut from the same sample, the second one with a comment
+# header larger than 64 KiB (as with embedded cover art).
+FATE_OGG_COPY_VORBIS-$(call FRAMECRC, OGG, VORBIS, OGG_MUXER) += fate-ogg-vorbis-chained-large-comment
+fate-ogg-vorbis-chained-large-comment: CMD = \
+    { ffmpeg -i $(TARGET_SAMPLES)/vorbis/moog_small.ogg -c copy -t 0.5 -fflags +bitexact -f ogg - && \
+      printf "comment=%070000d" 0 | ffmpeg -i $(TARGET_SAMPLES)/vorbis/moog_small.ogg -/metadata pipe: \
+        -c copy -t 0.5 -fflags +bitexact -serial_offset 1 -f ogg -; } | \
+    framecrc -i - -c copy
+
 FATE_OGG_VORBIS_PROBE-$(call DEMDEC, OGG, VORBIS) += fate-ogg-vorbis-initial-padding-chained
 fate-ogg-vorbis-initial-padding-chained: CMD = ffprobe_demux -of default -show_entries stream=codec_name,initial_padding $(TARGET_SAMPLES)/ogg-vorbis/chained-meta.ogg
 
@@ -16,6 +25,9 @@ fate-ogg-vorbis-ts-offset: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_frames -o
 
 FATE_OGG_VORBIS_PROBE-$(call DEMDEC, OGG, VORBIS) += fate-ogg-vorbis-ts-seek
 fate-ogg-vorbis-ts-seek: CMD = ffprobe_demux -of default -bitexact -select_streams a -read_intervals 2.5%+\#5 -show_packets -show_entries packet=pts,dts,duration,flags -show_entries stream=codec_name,initial_padding $(TARGET_SAMPLES)/ogg-vorbis/tos.ogg
+
+FATE_OGG_VORBIS_PROBE-$(call DEMDEC, OGG, VORBIS) += fate-ogg-vorbis-ts-seek-1.5s
+fate-ogg-vorbis-ts-seek-1.5s: CMD = ffprobe_demux -of default -bitexact -select_streams a -read_intervals 1.5%+\#5 -show_packets -show_entries packet=pts,dts,duration,flags -show_entries stream=codec_name,initial_padding $(TARGET_SAMPLES)/ogg-vorbis/tos.ogg
 
 # Regression test for files with granule=0 on audio pages
 # See https://trac.ffmpeg.org/ticket/3710
