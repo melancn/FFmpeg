@@ -115,9 +115,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.BUILD_DIR }}/mbedtls-install
-          key: mbedtls-${{ matrix.abi }}-v3.6.7-pic
-          restore-keys: |
-            mbedtls-${{ matrix.abi }}-
+          key: mbedtls-${{ matrix.abi }}-api${{ env.ANDROID_API }}-ndk${{ steps.ndk.outputs.ndk_version }}-v3.6.7-pic-urandom-${{ hashFiles('.github/workflows/android.yml') }}
+          # No restore prefix: entropy configuration, API and NDK must match exactly.
 
       - name: Build & install mbedTLS
         if: steps.mbedtls-cache.outputs.cache-hit != 'true'
@@ -142,6 +141,19 @@ jobs:
             -o "${MBED_SRC}.tar.bz2"
           echo "a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6  ${MBED_SRC}.tar.bz2" | sha256sum -c -
           tar xjf "${MBED_SRC}.tar.bz2"
+
+          # Bionic does not take mbedTLS's glibc getrandom() path. The 3.6.7
+          # fallback defaults to /dev/random, whose entropy read can block on
+          # old Android kernels without observing FFmpeg I/O timeouts/interrupts.
+          # Android applications run after platform entropy initialization;
+          # use the platform CSPRNG /dev/urandom, not a weak/fixed random source.
+          # This changes only the entropy device, never TLS certificate checks.
+          MBED_CONFIG="$MBED_SRC/include/mbedtls/mbedtls_config.h"
+          sed -i \
+            's|^//#define MBEDTLS_PLATFORM_DEV_RANDOM .*|#define MBEDTLS_PLATFORM_DEV_RANDOM "/dev/urandom"|' \
+            "$MBED_CONFIG"
+          # Fail closed if a future source/config layout leaves the default intact.
+          grep -Fx '#define MBEDTLS_PLATFORM_DEV_RANDOM "/dev/urandom"' "$MBED_CONFIG"
 
           # CMake build: ENABLE_TESTING=Off + ENABLE_PROGRAMS=Off prevents the
           # tests/ and programs/ subdirectories from being entered, which in turn
@@ -179,6 +191,22 @@ jobs:
           test -f "$MBED_PREFIX/lib/libmbedcrypto.a"
           test -f "$MBED_PREFIX/lib/pkgconfig/mbedtls.pc"
           ls -l "$MBED_PREFIX/lib" "$MBED_PREFIX/lib/pkgconfig"
+
+      - name: Verify mbedTLS entropy configuration (including cache hits)
+        env:
+          NDK_BIN: ${{ steps.ndk.outputs.ndk_bin }}
+        run: |
+          set -euo pipefail
+          MBED_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
+          grep -Fx '#define MBEDTLS_PLATFORM_DEV_RANDOM "/dev/urandom"' \
+            "$MBED_PREFIX/include/mbedtls/mbedtls_config.h"
+          ENTROPY_STRINGS="$PWD/$BUILD_DIR/mbedtls-entropy-${{ matrix.abi }}.txt"
+          "$NDK_BIN/llvm-strings" "$MBED_PREFIX/lib/libmbedcrypto.a" > "$ENTROPY_STRINGS"
+          grep -Fx '/dev/urandom' "$ENTROPY_STRINGS"
+          if grep -Fx '/dev/random' "$ENTROPY_STRINGS"; then
+            echo "::error::mbedTLS still embeds the blocking /dev/random entropy device"
+            exit 1
+          fi
 
       - name: Cache static libcurl install
         id: curl-cache
@@ -481,6 +509,15 @@ jobs:
             -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 \
             -Wl,--no-undefined -Wl,-soname,libffmpeg_jni.so \
             -o "$OUT/libffmpeg_jni.so"
+
+          # Check the linked artifact too, not just the dependency's config/header.
+          ENTROPY_STRINGS="$PWD/$BUILD_DIR/jni-entropy-$ABI.txt"
+          "$NDK_BIN/llvm-strings" "$OUT/libffmpeg_jni.so" > "$ENTROPY_STRINGS"
+          grep -Fx '/dev/urandom' "$ENTROPY_STRINGS"
+          if grep -Fx '/dev/random' "$ENTROPY_STRINGS"; then
+            echo "::error::libffmpeg_jni.so still embeds the blocking /dev/random entropy device"
+            exit 1
+          fi
 
           echo "::group::libffmpeg_jni.so details"
           file "$OUT/libffmpeg_jni.so"
