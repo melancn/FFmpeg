@@ -38,6 +38,7 @@
  */
 
 #include <jni.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -152,6 +153,77 @@ JNIEXPORT jstring JNICALL
 Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
 {
     return version_to_string(env, swresample_version());
+}
+
+/* ------------------------------------------------------------------ */
+/* JNI bridge contract                                                 */
+/*                                                                     */
+/* getVersion() reports the FFmpeg build. It says nothing about which  */
+/* entry points this .so actually implements, so a JAR and a .so can   */
+/* disagree while both look healthy. These queries make that failure   */
+/* detectable instead of letting callers assume a capability is there. */
+/* ------------------------------------------------------------------ */
+
+#define FF_JNI_BRIDGE_API_MAJOR 1
+#define FF_JNI_BRIDGE_API_MINOR 0
+#define FF_JNI_BRIDGE_API_VERSION \
+    ((FF_JNI_BRIDGE_API_MAJOR << 16) | FF_JNI_BRIDGE_API_MINOR)
+
+#define FF_JNI_CAP_PACKET_BUDGET_INFO    (1LL << 0)
+#define FF_JNI_CAP_SIDE_DATA_EXACT_COPY  (1LL << 1)
+#define FF_JNI_CAP_BRIDGE_BUILD_INFO     (1LL << 2)
+
+/* Bumped whenever the packet budget accounting rules change, so a stored
+ * charge value can be attributed to the policy that produced it. */
+#define FF_JNI_PACKET_BUDGET_POLICY_VERSION 1
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(JNIEnv *env, jobject thiz)
+{
+    return FF_JNI_BRIDGE_API_VERSION;
+}
+
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
+{
+    return (jlong)(FF_JNI_CAP_PACKET_BUDGET_INFO |
+                   FF_JNI_CAP_SIDE_DATA_EXACT_COPY |
+                   FF_JNI_CAP_BRIDGE_BUILD_INFO);
+}
+
+/* ABI string for the compiled object, not the device ABI: it identifies
+ * which of the shipped libraries is actually loaded. */
+#if defined(__aarch64__)
+#define FF_JNI_ABI_NAME "arm64-v8a"
+#elif defined(__arm__)
+#define FF_JNI_ABI_NAME "armeabi-v7a"
+#elif defined(__i686__) || defined(__i386__)
+#define FF_JNI_ABI_NAME "x86"
+#elif defined(__x86_64__)
+#define FF_JNI_ABI_NAME "x86_64"
+#else
+#define FF_JNI_ABI_NAME "unknown"
+#endif
+
+#if defined(NDEBUG)
+#define FF_JNI_BUILD_TYPE "release"
+#else
+#define FF_JNI_BUILD_TYPE "debug"
+#endif
+
+/* Single-line JSON describing the built library. Deliberately excludes
+ * URLs, paths, headers and any other run-time data. */
+JNIEXPORT jstring JNICALL
+Java_org_ffmpeg_FFMpegNative_getBridgeBuildInfo(JNIEnv *env, jobject thiz)
+{
+    const char *ffver = av_version_info();
+    char buf[384];
+    snprintf(buf, sizeof(buf),
+             "{\"bridgeApi\":%d,\"packetBudgetPolicyVersion\":%d,"
+             "\"ffmpegVersion\":\"%s\",\"abi\":\"%s\",\"buildType\":\"%s\"}",
+             FF_JNI_BRIDGE_API_VERSION, FF_JNI_PACKET_BUDGET_POLICY_VERSION,
+             ffver ? ffver : "unknown", FF_JNI_ABI_NAME, FF_JNI_BUILD_TYPE);
+    return (*env)->NewStringUTF(env, buf);
 }
 
 JNIEXPORT jstring JNICALL
@@ -737,11 +809,243 @@ Java_org_ffmpeg_FFMpegNative_packetCopyData(JNIEnv *env, jobject thiz,
                                             jlong pkt, jbyteArray out, jint off, jint len)
 {
     AVPacket *p = PTR(AVPacket *, pkt);
-    if (!p || !out || !p->data || p->size <= 0 || len <= 0)
-        return -1;
-    jint n = (p->size < len) ? p->size : len;
+    if (!p || !out || off < 0 || len < 0)
+        return AVERROR(EINVAL);
+
+    /* Validate the destination range before touching the array: an
+     * unchecked SetByteArrayRegion past the end throws
+     * ArrayIndexOutOfBoundsException, which is not a usable contract. Use
+     * subtraction so off + len cannot overflow. */
+    const jsize out_len = (*env)->GetArrayLength(env, out);
+    if (off > out_len || len > out_len - off)
+        return AVERROR(EINVAL);
+
+    /* No payload is not an error: report zero bytes copied so callers can
+     * distinguish it from a rejected call. */
+    if (p->size <= 0 || !p->data || len == 0)
+        return 0;
+
+    const jint n = (p->size < len) ? (jint)p->size : len;
     (*env)->SetByteArrayRegion(env, out, off, n, (const jbyte *)p->data);
+    /* Keep a pending JVM exception pending; do not report success for a
+     * copy the VM refused to perform. */
+    if ((*env)->ExceptionCheck(env))
+        return AVERROR(ENOMEM);
     return n;
+}
+
+/* ------------------------------------------------------------------ */
+/* Packet memory budget                                                */
+/*                                                                     */
+/* The returned charge is an admission-control estimate, NOT the exact  */
+/* malloc size and NOT process RSS. Shared buffers are charged once per */
+/* holding packet, so totals may over-count but never under-count. It   */
+/* says nothing about demuxer-internal buffering, decoders, swresample  */
+/* or libass.                                                           */
+/* ------------------------------------------------------------------ */
+
+/* Conservative per-object overhead allowance for allocator bookkeeping and
+ * the padding FFmpeg requires around buffers. This is policy, not a measured
+ * size; bump FF_JNI_PACKET_BUDGET_POLICY_VERSION when it changes. */
+#define FF_JNI_BUDGET_METADATA_ALLOWANCE 256
+
+static int ff_jni_budget_add(uint64_t *total, uint64_t value)
+{
+    const uint64_t limit = (uint64_t)INT64_MAX;
+    if (value > limit || *total > limit - value)
+        return AVERROR(EOVERFLOW);
+    *total += value;
+    return 0;
+}
+
+/* Number of values written by ff_jni_packet_budget(); frozen for API major 1
+ * and mirrored by FFMpegNative.PACKET_BUDGET_INFO_SLOTS. */
+#define FF_JNI_PACKET_BUDGET_SLOTS 6
+
+/* Fill out[0..FF_JNI_PACKET_BUDGET_SLOTS-1] for a packet. Split from the JNI
+ * wrapper so it can be exercised without a JVM. Returns 0 or a negative
+ * AVERROR; on failure the caller must not publish the array. */
+static int ff_jni_packet_budget(const AVPacket *packet,
+                                int64_t out[FF_JNI_PACKET_BUDGET_SLOTS])
+{
+    uint64_t charge = sizeof(AVPacket);
+    uint64_t side_bytes = 0;
+    uint64_t payload_capacity = 0;
+    uint64_t opaque_capacity = 0;
+    int ret;
+    int i;
+
+    if (!packet ||
+        packet->size < 0 ||
+        packet->side_data_elems < 0 ||
+        (packet->size > 0 && !packet->data) ||
+        (packet->side_data_elems > 0 && !packet->side_data))
+        return AVERROR(EINVAL);
+
+    if ((ret = ff_jni_budget_add(&charge, FF_JNI_BUDGET_METADATA_ALLOWANCE)) < 0)
+        return ret;
+
+    if (packet->buf) {
+        payload_capacity = (uint64_t)packet->buf->size;
+        /* A payload larger than its own buffer means a corrupt packet. */
+        if (packet->buf->size < 0 ||
+            payload_capacity < (uint64_t)packet->size)
+            return AVERROR(EINVAL);
+    } else if (packet->data || packet->size > 0) {
+        /* Without a reference, a clone must duplicate the payload, so charge
+         * the size it would occupy including FFmpeg's required padding. */
+        payload_capacity = (uint64_t)packet->size + AV_INPUT_BUFFER_PADDING_SIZE;
+    }
+
+    if (payload_capacity) {
+        if ((ret = ff_jni_budget_add(&charge, payload_capacity)) < 0)
+            return ret;
+        if ((ret = ff_jni_budget_add(&charge,
+                                     sizeof(AVBufferRef) +
+                                     FF_JNI_BUDGET_METADATA_ALLOWANCE)) < 0)
+            return ret;
+    }
+
+    /* Every side data entry counts, of any type: a packet carrying only
+     * dynamic/HDR/subtitle metadata is still resident memory. */
+    if ((ret = ff_jni_budget_add(&charge,
+                                 (uint64_t)packet->side_data_elems *
+                                 sizeof(AVPacketSideData))) < 0)
+        return ret;
+
+    for (i = 0; i < packet->side_data_elems; i++) {
+        const AVPacketSideData *sd = &packet->side_data[i];
+        if (sd->size < 0 || (sd->size > 0 && !sd->data))
+            return AVERROR(EINVAL);
+        if ((ret = ff_jni_budget_add(&side_bytes, (uint64_t)sd->size)) < 0)
+            return ret;
+        if ((ret = ff_jni_budget_add(&charge, (uint64_t)sd->size)) < 0)
+            return ret;
+        if ((ret = ff_jni_budget_add(&charge,
+                                     AV_INPUT_BUFFER_PADDING_SIZE)) < 0)
+            return ret;
+    }
+
+    /* opaque_ref is owned and its buffer is real memory. opaque (the plain
+     * pointer) is not owned by the packet, so it is deliberately not
+     * dereferenced or charged. */
+    if (packet->opaque_ref) {
+        if (packet->opaque_ref->size < 0)
+            return AVERROR(EINVAL);
+        opaque_capacity = (uint64_t)packet->opaque_ref->size;
+        if ((ret = ff_jni_budget_add(&charge, opaque_capacity)) < 0)
+            return ret;
+        if ((ret = ff_jni_budget_add(&charge,
+                                     sizeof(AVBufferRef) +
+                                     FF_JNI_BUDGET_METADATA_ALLOWANCE)) < 0)
+            return ret;
+    }
+
+    out[0] = (int64_t)packet->size;
+    out[1] = (int64_t)payload_capacity;
+    out[2] = (int64_t)side_bytes;
+    out[3] = (int64_t)packet->side_data_elems;
+    out[4] = (int64_t)opaque_capacity;
+    out[5] = (int64_t)charge;
+    return 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_packetGetBudgetInfo(JNIEnv *env, jobject thiz,
+                                                 jlong pkt, jlongArray out)
+{
+    AVPacket *p = PTR(AVPacket *, pkt);
+    int64_t values[FF_JNI_PACKET_BUDGET_SLOTS];
+    int ret;
+
+    if (!out || !p)
+        return AVERROR(EINVAL);
+    /* Reject undersized arrays instead of writing only part of the layout:
+     * a partially filled snapshot would look valid to the caller. */
+    if ((*env)->GetArrayLength(env, out) < FF_JNI_PACKET_BUDGET_SLOTS)
+        return AVERROR(EINVAL);
+
+    ret = ff_jni_packet_budget(p, values);
+    if (ret < 0)
+        return ret;
+
+    (*env)->SetLongArrayRegion(env, out, 0, FF_JNI_PACKET_BUDGET_SLOTS,
+                               (const jlong *)values);
+    if ((*env)->ExceptionCheck(env))
+        return AVERROR(ENOMEM);
+    return 0;
+}
+
+/* Shared lookup for the two exact side-data queries. */
+static const AVPacketSideData *ff_jni_find_side_data(const AVPacket *p, int type)
+{
+    int i;
+    if (!p || p->side_data_elems < 0 ||
+        (p->side_data_elems > 0 && !p->side_data))
+        return NULL;
+    for (i = 0; i < p->side_data_elems; i++) {
+        if ((int)p->side_data[i].type == type) {
+            /* An entry that claims content but has no pointer is corrupt;
+             * treat it as absent rather than dereferencing NULL. */
+            if (p->side_data[i].size < 0 ||
+                (p->side_data[i].size > 0 && !p->side_data[i].data))
+                return NULL;
+            return &p->side_data[i];
+        }
+    }
+    return NULL;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize(JNIEnv *env, jobject thiz,
+                                                   jlong pkt, jint type)
+{
+    AVPacket *p = PTR(AVPacket *, pkt);
+    const AVPacketSideData *sd;
+
+    if (!p)
+        return AVERROR(EINVAL);
+    sd = ff_jni_find_side_data(p, type);
+    if (!sd)
+        return AVERROR(ENOENT);
+    return (jint)sd->size;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(JNIEnv *env, jobject thiz,
+                                                     jlong pkt, jint type,
+                                                     jbyteArray out,
+                                                     jint offset, jint capacity)
+{
+    AVPacket *p = PTR(AVPacket *, pkt);
+    const AVPacketSideData *sd;
+    jsize out_len;
+
+    if (!p || !out || offset < 0 || capacity < 0)
+        return AVERROR(EINVAL);
+
+    /* Subtraction form: offset + capacity could overflow. */
+    out_len = (*env)->GetArrayLength(env, out);
+    if (offset > out_len || capacity > out_len - offset)
+        return AVERROR(EINVAL);
+
+    sd = ff_jni_find_side_data(p, type);
+    if (!sd)
+        return AVERROR(ENOENT);
+
+    /* Never truncate: refuse instead of copying a prefix and reporting it
+     * as the whole entry. */
+    if ((uint64_t)sd->size > (uint64_t)capacity)
+        return AVERROR(ENOSPC);
+
+    if (sd->size > 0) {
+        (*env)->SetByteArrayRegion(env, out, offset,
+                                   (jsize)sd->size,
+                                   (const jbyte *)sd->data);
+        if ((*env)->ExceptionCheck(env))
+            return AVERROR(ENOMEM);
+    }
+    return (jint)sd->size;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1785,12 +2089,12 @@ Java_org_ffmpeg_FFMpegNative_setContextHwDeviceCtx(JNIEnv *env, jobject thiz,
     AVBufferRef *ref = (AVBufferRef *)(intptr_t)hwDeviceCtx;
     if (!cc || !ref)
         return AVERROR(EINVAL);
-    av_buffer_unref(&cc->hw_device_ctx);
+    /* Take the new reference first: on allocation failure the context must
+     * keep whatever device it already had instead of ending up detached. */
     AVBufferRef *copy = av_buffer_ref(ref);
-    if (!copy) {
-        cc->hw_device_ctx = NULL;
+    if (!copy)
         return AVERROR(ENOMEM);
-    }
+    av_buffer_unref(&cc->hw_device_ctx);
     cc->hw_device_ctx = copy;
     return 0;
 }

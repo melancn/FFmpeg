@@ -446,9 +446,53 @@ jobs:
           # FFMpegNative.java references android.view.Surface, so javac needs
           # android.jar on the classpath to resolve it.
           ANDROID_JAR="$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)"
-          javac -classpath "$ANDROID_JAR" -h "$JNI_DIR/generated" -d "$JNI_DIR/generated" "$JNI_DIR/java/org/ffmpeg/FFMpegNative.java"
+          javac --release 17 -encoding UTF-8 -classpath "$ANDROID_JAR" \
+            -h "$JNI_DIR/generated" -d "$JNI_DIR/generated" \
+            "$JNI_DIR/java/org/ffmpeg/FFMpegNative.java"
           # The header is named after the class: org_ffmpeg_FFMpegNative.h
           ls -l "$JNI_DIR/generated/"
+
+      - name: Verify every native declaration has a JNI implementation
+        run: |
+          set -euo pipefail
+          HDR=compat/android/jni/generated/org_ffmpeg_FFMpegNative.h
+          IMPL=compat/android/jni/ffmpeg_jni.c
+          test -f "$HDR"
+          # javac -h emits one JNICALL prototype per native method; every one
+          # of them must be defined in ffmpeg_jni.c. This catches a Java
+          # declaration that compiles but has no C side (which would surface
+          # only as UnsatisfiedLinkError on a device), and it keeps the
+          # hand-written symbol list below honest.
+          # Anchor on the definition form so comments and the symbol-name
+          # string literals in docs are not mistaken for implementations.
+          grep -oE 'Java_org_ffmpeg_FFMpegNative_[A-Za-z0-9_]+' "$HDR" \
+            | sort -u > /tmp/declared_jni.txt
+          grep -oE '^Java_org_ffmpeg_FFMpegNative_[A-Za-z0-9_]+' "$IMPL" \
+            | sort -u > /tmp/implemented_jni.txt
+          echo "declared:    $(wc -l < /tmp/declared_jni.txt)"
+          echo "implemented: $(wc -l < /tmp/implemented_jni.txt)"
+          missing=$(comm -23 /tmp/declared_jni.txt /tmp/implemented_jni.txt)
+          if [ -n "$missing" ]; then
+            echo "::error::Java declares native methods with no C implementation:"
+            printf '%s\n' "$missing"
+            exit 1
+          fi
+          orphan=$(comm -13 /tmp/declared_jni.txt /tmp/implemented_jni.txt)
+          if [ -n "$orphan" ]; then
+            echo "::error::ffmpeg_jni.c defines JNI symbols absent from FFMpegNative.java (signature drift):"
+            printf '%s\n' "$orphan"
+            exit 1
+          fi
+          # The bridge contract queries must never be silently dropped: a JAR
+          # rebuilt without them would silently fall back to "capability
+          # unavailable" in every consumer.
+          for sym in getBridgeApiVersion getBridgeCapabilities getBridgeBuildInfo \
+                     packetGetBudgetInfo; do
+            grep -qx "Java_org_ffmpeg_FFMpegNative_$sym" /tmp/implemented_jni.txt || {
+              echo "::error::bridge contract entry point missing: $sym"
+              exit 1
+            }
+          done
 
       - name: Compile libffmpeg_jni.so
         env:
@@ -556,6 +600,19 @@ jobs:
           # diverged on a signature, or the function was compiled out.
           for sym in Java_com_inlz_mediahub_core_player_network_FfmpegNetworkCapabilities_nativeContractVersion \
                      Java_org_ffmpeg_FFMpegNative_packetClone \
+                     Java_org_ffmpeg_FFMpegNative_packetAlloc \
+                     Java_org_ffmpeg_FFMpegNative_packetFree \
+                     Java_org_ffmpeg_FFMpegNative_packetGetSize \
+                     Java_org_ffmpeg_FFMpegNative_packetCopyData \
+                     Java_org_ffmpeg_FFMpegNative_packetGetSideData \
+                     Java_org_ffmpeg_FFMpegNative_swrConvertFrame \
+                     Java_org_ffmpeg_FFMpegNative_formatOpenInputWithInterrupt \
+                     Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion \
+                     Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities \
+                     Java_org_ffmpeg_FFMpegNative_getBridgeBuildInfo \
+                     Java_org_ffmpeg_FFMpegNative_packetGetBudgetInfo \
+                     Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize \
+                     Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact \
                      Java_org_ffmpeg_FFMpegNative_mediasurfaceHwdeviceCreate \
                      Java_org_ffmpeg_FFMpegNative_setContextHwDeviceCtx \
                      Java_org_ffmpeg_FFMpegNative_setContextPktTimebase \
@@ -693,6 +750,66 @@ jobs:
           # functional checks already passed by this point.
           "$STRIP" --strip-unneeded "$OUT/libffmpeg_jni.so" || true
 
+      - name: Build native contract test
+        env:
+          CC: ${{ steps.toolchain.outputs.cc }}
+          CXX: ${{ steps.toolchain.outputs.cxx }}
+        run: |
+          set -euo pipefail
+          ABI="${{ matrix.abi }}"
+          PREFIX="$PWD/$BUILD_DIR/$INSTALL_DIR"
+          MBEDTLS_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
+          DEPS_PREFIX="$PWD/$BUILD_DIR/deps-install"
+          CURL_PREFIX="$PWD/$BUILD_DIR/curl-install"
+          OUT="$PWD/$OUT_DIR/$ABI/test"
+          mkdir -p "$OUT"
+
+          export PKG_CONFIG_PATH="$CURL_PREFIX/lib/pkgconfig:$MBEDTLS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$PKG_CONFIG_PATH"
+          unset PKG_CONFIG_SYSROOT_DIR
+          CURL_LINK_FLAGS=$(pkg-config --static --libs libcurl)
+          read -r -a CURL_LIBS <<< "$CURL_LINK_FLAGS"
+
+          # The test translates ../ffmpeg_jni.c into its own object, so it is
+          # linked as an executable rather than a second copy of the .so.
+          # -Dmain=... is defensive: the production file must never take over
+          # the test's entry point.
+          COMMON_CFLAGS=(-fPIC -O1 -Dmain=ff_jni_production_main
+            -I"$PWD" -I"$PWD/compat/android/jni"
+            -I"$PWD/compat/android/jni/generated"
+            -I"$PREFIX/include" -I"$DEPS_PREFIX/include")
+
+          "$CC" "${COMMON_CFLAGS[@]}" \
+            "$PWD/compat/android/jni/tests/packet_contract_test.c" \
+            -L"$PREFIX/lib" -L"$MBEDTLS_PREFIX/lib" -L"$DEPS_PREFIX/lib" \
+            -Wl,--start-group \
+            -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
+            "${CURL_LIBS[@]}" \
+            -lmbedtls -lmbedx509 -lmbedcrypto \
+            -Wl,--end-group \
+            -Wl,--start-group -lass -lharfbuzz -lfreetype -lfribidi -Wl,--end-group \
+            -static-libstdc++ \
+            -lmediandk -landroid -ljnigraphics \
+            -llog -ldl -lm -lz \
+            -o "$OUT/packet_contract_test"
+
+          file "$OUT/packet_contract_test"
+
+      - name: Stage contract test results
+        run: |
+          set -euo pipefail
+          ABI="${{ matrix.abi }}"
+          OUT="$PWD/$OUT_DIR/$ABI/test"
+          # Record which artifact these results belong to, so a later run can
+          # never be matched against the wrong .so.
+          sha256sum "$PWD/$OUT_DIR/$ABI/lib/libffmpeg_jni.so" \
+            | tee "$OUT/libffmpeg_jni.so.sha256"
+          echo "abi=$ABI" > "$OUT/environment.txt"
+          echo "android_api=$ANDROID_API" >> "$OUT/environment.txt"
+          echo "ndk_version=${{ steps.ndk.outputs.ndk_version }}" >> "$OUT/environment.txt"
+          echo "ffmpeg_rev=$(git -C "$PWD" rev-parse HEAD)" >> "$OUT/environment.txt"
+          cat "$OUT/environment.txt"
+
       - name: Compile Java sample class
         run: |
           ABI="${{ matrix.abi }}"
@@ -719,9 +836,72 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  contract-test:
+    name: Run native contract test (${{ matrix.abi }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            qemu_arch: aarch64
+          - abi: armeabi-v7a
+            qemu_arch: arm
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-jni-${{ matrix.abi }}
+          path: artifact
+
+      - name: Install user-mode qemu
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # qemu-user lets the Android-linked test binary run on the x86_64
+          # runner. binfmt keeps it callable by path, exactly like on device.
+          sudo apt-get install -y qemu-user qemu-user-static binfmt-support
+          sudo update-binfmts --enable qemu-${{ matrix.qemu_arch }} || true
+
+      - name: Verify the test binary targets the expected ABI
+        run: |
+          set -euo pipefail
+          BIN=artifact/test/packet_contract_test
+          test -f "$BIN"
+          file "$BIN"
+          case "${{ matrix.abi }}" in
+            arm64-v8a)  grep -q 'ARM aarch64' <<< "$(file "$BIN")" || { echo "::error::not an arm64 binary"; exit 1; } ;;
+            armeabi-v7a) grep -qE 'ARM, EABI5' <<< "$(file "$BIN")" || { echo "::error::not an armv7 binary"; exit 1; } ;;
+          esac
+          # The test must not silently resolve FFmpeg from the host.
+          if grep -qE 'NEEDED.*libav(codec|format|util)' <<< "$(readelf -d "$BIN")"; then
+            echo "::error::contract test has dynamic FFmpeg dependencies; it must be statically linked"
+            exit 1
+          fi
+
+      - name: Run contract test
+        run: |
+          set -euo pipefail
+          BIN=artifact/test/packet_contract_test
+          chmod +x "$BIN"
+          # A minimal environment: the test must not depend on Android runtime
+          # components that the JNI bridge itself does not require.
+          ./"$BIN" 2>&1 | tee contract-test-${{ matrix.abi }}.log
+          grep -qx 'RESULT: PASS' contract-test-${{ matrix.abi }}.log
+
+      - name: Upload contract test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-test-${{ matrix.abi }}
+          path: contract-test-${{ matrix.abi }}.log
+          if-no-files-found: warn
+          retention-days: 30
+
   bundle:
     name: Bundle all ABIs
-    needs: build
+    needs: [build, contract-test]
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master'
     steps:
@@ -743,8 +923,37 @@ jobs:
             mkdir -p "ffmpeg-jni-bundle/licenses/curl" "ffmpeg-jni-bundle/build-info/$abi"
             cp "$d/licenses/curl/COPYING" "ffmpeg-jni-bundle/licenses/curl/"
             cp "$d/libcurl.txt" "ffmpeg-jni-bundle/build-info/$abi/"
+            cp "$d/test/environment.txt" "ffmpeg-jni-bundle/build-info/$abi/" 2>/dev/null || true
           done
           find ffmpeg-jni-bundle -type f | sort
+
+      - name: Emit artifact manifest
+        run: |
+          set -euo pipefail
+          # The manifest is the delivery record: it binds each shipped .so to
+          # the revision that produced it and to the bridge contract it
+          # implements. Consumers must verify against it rather than trusting
+          # that a library "looks like" the right one.
+          {
+            printf '{\n'
+            printf '  "bridgeApi": %d,\n' 65536
+            printf '  "packetBudgetPolicyVersion": %d,\n' 1
+            printf '  "sourceRevision": "%s",\n' "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null || echo unknown)"
+            printf '  "ffmpegVersion": "%s",\n' "$(grep -m1 '^version=' "$GITHUB_WORKSPACE/RELEASE" 2>/dev/null | cut -d= -f2 || echo unknown)"
+            printf '  "buildType": "release",\n'
+            printf '  "artifacts": {\n'
+            first=1
+            for f in ffmpeg-jni-bundle/jniLibs/*/libffmpeg_jni.so; do
+              abi=$(basename "$(dirname "$f")")
+              sum=$(sha256sum "$f" | cut -d' ' -f1)
+              size=$(stat -c%s "$f")
+              [ $first -eq 1 ] || printf ',\n'
+              first=0
+              printf '    "%s": { "sha256": "%s", "size": %d }' "$abi" "$sum" "$size"
+            done
+            printf '\n  }\n}\n'
+          } > ffmpeg-jni-bundle/artifact-manifest.json
+          cat ffmpeg-jni-bundle/artifact-manifest.json
 
       - name: Upload bundled artifact
         uses: actions/upload-artifact@v4

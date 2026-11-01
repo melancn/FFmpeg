@@ -98,6 +98,124 @@ public final class FFMpegNative {
     public native String strerror(int errnum);
 
     /* ================================================================== */
+    /* JNI bridge contract                                                 */
+    /*                                                                     */
+    /* These describe the *wrapper* ABI, not FFmpeg. {@link #getVersion}   */
+    /* reports the FFmpeg build and says nothing about which native entry  */
+    /* points this .so implements, so a JAR and a .so can disagree while   */
+    /* both look healthy. Callers must gate every bridge-version-          */
+    /* dependent feature on these three queries.                           */
+    /* ================================================================== */
+
+    /** Bridge contract major version implemented by this JAR. */
+    public static final int BRIDGE_API_MAJOR = 1;
+
+    /** Bridge contract minor version implemented by this JAR. */
+    public static final int BRIDGE_API_MINOR = 0;
+
+    /** {@code major << 16 | minor}; first release is {@code 0x00010000}. */
+    public static final int BRIDGE_API_VERSION = (BRIDGE_API_MAJOR << 16) | BRIDGE_API_MINOR;
+
+    /** {@link #packetGetBudgetInfo} is implemented and returns the fixed 6-slot layout. */
+    public static final long CAP_PACKET_BUDGET_INFO = 1L << 0;
+
+    /** {@link #packetGetSideDataSize} and {@link #packetCopySideDataExact} are implemented. */
+    public static final long CAP_SIDE_DATA_EXACT_COPY = 1L << 1;
+
+    /** {@link #getBridgeBuildInfo} returns a non-empty description. */
+    public static final long CAP_BRIDGE_BUILD_INFO = 1L << 2;
+
+    /**
+     * Number of elements {@link #packetGetBudgetInfo} requires in its output
+     * array. Part of the contract: the layout below is frozen for major 1.
+     */
+    public static final int PACKET_BUDGET_INFO_SLOTS = 6;
+
+    /* Fixed indices into the packetGetBudgetInfo() output array. */
+    /** {@code AVPacket.size}. */
+    public static final int PACKET_BUDGET_PAYLOAD_BYTES         = 0;
+    /** Capacity of the referenced payload buffer (conservative estimate if none). */
+    public static final int PACKET_BUDGET_PAYLOAD_CAPACITY     = 1;
+    /** Sum of all side data content lengths, excluding padding. */
+    public static final int PACKET_BUDGET_SIDE_DATA_BYTES      = 2;
+    /** Number of side data entries, of any type. */
+    public static final int PACKET_BUDGET_SIDE_DATA_COUNT      = 3;
+    /** Capacity of the buffer referenced by {@code opaque_ref}. */
+    public static final int PACKET_BUDGET_OPAQUE_REF_CAPACITY  = 4;
+    /** Conservative accounting charge for this packet (see method docs). */
+    public static final int PACKET_BUDGET_CHARGE_BYTES         = 5;
+
+    /**
+     * @return the bridge contract version implemented by the loaded library,
+     *         {@code major << 16 | minor}, or 0 if the library predates this
+     *         query. Compare with {@link #BRIDGE_API_VERSION}.
+     */
+    public native int getBridgeApiVersion();
+
+    /**
+     * @return a bitmask of {@code CAP_*} flags this library actually implements
+     *         and has been validated for. Unknown bits must be ignored.
+     */
+    public native long getBridgeCapabilities();
+
+    /**
+     * @return a single-line JSON object identifying the built library
+     *         ({@code bridgeApi}, {@code packetBudgetPolicyVersion},
+     *         {@code ffmpegVersion}, {@code abi}, {@code buildType}), or an
+     *         empty string if unavailable. Contains no URLs, paths or user data.
+     */
+    public native String getBridgeBuildInfo();
+
+    /**
+     * Take a consistent snapshot of a packet's memory accounting.
+     *
+     * <p>This is a <em>budget charge</em>: a deliberately conservative number
+     * suitable for admission control. It is not the exact {@code malloc} size
+     * and not process RSS. Shared buffers are charged once per holding packet,
+     * so the total may over-count but never under-counts. It also does not
+     * cover demuxer-internal buffering, decoders, swresample or libass.
+     *
+     * <p>Returns all values in one call so the caller never reads fields from
+     * two different states.
+     *
+     * @param pkt   packet handle
+     * @param out   at least {@link #PACKET_BUDGET_INFO_SLOTS} elements; written
+     *              only on success. Indices are the
+     *              {@code PACKET_BUDGET_*} constants.
+     * @return 0 on success, negative {@code AVERROR} otherwise. On failure the
+     *         contents of {@code out} are unspecified and must not be used.
+     */
+    public native int packetGetBudgetInfo(long pkt, long[] out);
+
+    /**
+     * Exact byte length of a side data entry.
+     *
+     * <p>Distinguishes the two cases {@link #packetGetSideData} cannot:
+     * a missing entry returns a negative {@code AVERROR} ({@code ENOENT}),
+     * while an entry that exists but is empty returns 0.
+     *
+     * @return the entry length (>= 0), or negative {@code AVERROR}
+     */
+    public native int packetGetSideDataSize(long pkt, int type);
+
+    /**
+     * Copy a side data entry in full, without silent truncation.
+     *
+     * @param pkt       packet handle
+     * @param type      {@code AV_PKT_DATA_*}
+     * @param out       destination array
+     * @param offset    first index to write
+     * @param capacity  number of bytes available from {@code offset}
+     * @return the full entry length on success ({@code 0} for an empty entry);
+     *         {@code AVERROR(ENOENT)} if the entry does not exist,
+     *         {@code AVERROR(ENOSPC)} if it does not fit, in which case
+     *         {@code out} is left untouched; {@code AVERROR(EINVAL)} for bad
+     *         arguments or out-of-range {@code offset}/{@code capacity}
+     */
+    public native int packetCopySideDataExact(long pkt, int type,
+                                              byte[] out, int offset, int capacity);
+
+    /* ================================================================== */
     /* AVDictionary (key/value options)                                    */
     /* ================================================================== */
 
@@ -840,7 +958,18 @@ public final class FFMpegNative {
 
     /**
      * Copy up to {@code len} bytes of packet payload into {@code out}.
-     * @return bytes copied (negative AVERROR on bad arguments)
+     *
+     * <p>Partial copies are allowed by contract: the return value may be less
+     * than {@code len} when the payload is shorter. A caller that needs the
+     * whole payload must compare the return value against
+     * {@link #packetGetSize} rather than assuming success.
+     *
+     * @param off first index of {@code out} to write
+     * @param len maximum number of bytes to copy
+     * @return bytes copied (>= 0), {@code 0} when the packet has no payload,
+     *         or a negative AVERROR on bad arguments (null handle/array,
+     *         negative {@code off}/{@code len}, or a range that does not fit
+     *         in {@code out})
      */
     public native int packetCopyData(long pkt, byte[] out, int off, int len);
 
@@ -885,9 +1014,17 @@ public final class FFMpegNative {
     /** Set the packet flags ({@code AV_PKT_FLAG_*}). */
     public native void packetSetFlags(long pkt, int flags);
     /**
-     * Copy a side-data element of {@code type} into {@code out}. @return bytes
-     * copied, or -1 if no such side data. Pass type = {@code AV_PKT_DATA_*}
-     * (use the integer constants at the end of this class).
+     * Copy a side-data element of {@code type} into {@code out}. Pass type =
+     * {@code AV_PKT_DATA_*} (use the integer constants at the end of this
+     * class).
+     *
+     * <p>Legacy entry point retained unchanged for existing callers. It
+     * truncates to {@code len} and reports -1 both for "no such side data"
+     * and for a rejected call, so it cannot tell an empty entry from a missing
+     * one. New code should use {@link #packetGetSideDataSize} and
+     * {@link #packetCopySideDataExact} instead.
+     *
+     * @return bytes copied, or -1 if no such side data or on bad arguments
      */
     public native int packetGetSideData(long pkt, int type, byte[] out, int off, int len);
 
@@ -1360,7 +1497,21 @@ public final class FFMpegNative {
     /** Free the resampler. */
     public native void swrFree(long ctx);
 
-    /** Convert a whole AVFrame to another AVFrame (allocates dst as needed). */
+    /**
+     * Convert a whole AVFrame to another AVFrame (allocates dst as needed).
+     *
+     * <p>Passing {@code inFrame == 0} is valid and means "drain": buffered
+     * tail samples are emitted into {@code outFrame}. Keep calling until
+     * {@code outFrame}'s {@code nbSamples} reaches 0; a return of 0 only means
+     * the conversion call succeeded and says nothing about how many samples
+     * were produced.
+     *
+     * <p>{@code ctx} and {@code outFrame} must be non-null. The bridge does not
+     * invent timestamps, does not declare end-of-stream, and does not take
+     * ownership of either frame.
+     *
+     * @return 0 on success, negative AVERROR otherwise
+     */
     public native int swrConvertFrame(long ctx, long outFrame, long inFrame);
 
     /** @return next pts after conversion (used for A/V sync). */
