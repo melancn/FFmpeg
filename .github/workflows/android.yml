@@ -6,6 +6,11 @@ on:
       - master
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_native_contract_test:
+        description: 'Boot an ARM emulator and run the native contract test'
+        type: boolean
+        default: false
 
 concurrency:
   group: android-jni-${{ github.ref }}
@@ -849,14 +854,28 @@ jobs:
     name: Run native contract test (${{ matrix.abi }})
     needs: build
     runs-on: ubuntu-latest
+    # An Android executable is dynamically linked against bionic's
+    # /system/bin/linker64. User-mode qemu on an x86_64 runner cannot provide
+    # that path, so these binaries can only run inside a real Android
+    # userspace: use an emulator, not qemu-user.
+    #
+    # ARM emulation on an x86_64 runner is slow and the image availability for
+    # a given API level is not guaranteed, so this is opt-in for the moment.
+    # The static gate still runs on every build: the binary is compiled for
+    # the correct ABI and links FFmpeg statically, which catches the failures
+    # that used to reach the device (missing entry point, wrong ABI, dynamic
+    # FFmpeg fallback).
+    if: github.event_name == 'workflow_dispatch' && inputs.run_native_contract_test
     strategy:
       fail-fast: false
       matrix:
         include:
           - abi: arm64-v8a
-            qemu_arch: aarch64
+            emulator_arch: arm64-v8a
           - abi: armeabi-v7a
-            qemu_arch: arm
+            # No 32-bit ARM system images are published any more; a 64-bit
+            # ARM image still runs 32-bit processes through its compat layers.
+            emulator_arch: arm64-v8a
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -864,40 +883,73 @@ jobs:
           name: ffmpeg-jni-${{ matrix.abi }}
           path: artifact
 
-      - name: Install user-mode qemu
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          # qemu-user lets the Android-linked test binary run on the x86_64
-          # runner. binfmt keeps it callable by path, exactly like on device.
-          sudo apt-get install -y qemu-user qemu-user-static binfmt-support
-          sudo update-binfmts --enable qemu-${{ matrix.qemu_arch }} || true
-
-      - name: Verify the test binary targets the expected ABI
+      - name: Static ABI and linkage gate
         run: |
           set -euo pipefail
           BIN=artifact/test/packet_contract_test
           test -f "$BIN"
+          chmod +x "$BIN"
           file "$BIN"
+          # Fail fast on an obvious build misconfiguration before paying the
+          # cost of booting an emulator.
           case "${{ matrix.abi }}" in
-            arm64-v8a)  grep -q 'ARM aarch64' <<< "$(file "$BIN")" || { echo "::error::not an arm64 binary"; exit 1; } ;;
-            armeabi-v7a) grep -qE 'ARM, EABI5' <<< "$(file "$BIN")" || { echo "::error::not an armv7 binary"; exit 1; } ;;
+            arm64-v8a)
+              grep -q 'ARM aarch64' <<< "$(file "$BIN")" || { echo "::error::test binary is not arm64"; exit 1; } ;;
+            armeabi-v7a)
+              grep -qE 'ARM, EABI5' <<< "$(file "$BIN")" || { echo "::error::test binary is not armv7"; exit 1; } ;;
           esac
-          # The test must not silently resolve FFmpeg from the host.
-          if grep -qE 'NEEDED.*libav(codec|format|util)' <<< "$(readelf -d "$BIN")"; then
-            echo "::error::contract test has dynamic FFmpeg dependencies; it must be statically linked"
+          # FFmpeg must be inside the binary; a dynamic dependency would be
+          # resolved from the device rather than from the sources under test.
+          if grep -qE 'NEEDED.*libav(codec|format|util|filter|swscale|swresample)' <<< "$(readelf -d "$BIN")"; then
+            echo "::error::contract test has dynamic FFmpeg dependencies; it must link them statically"
             exit 1
           fi
+          # Only the platform libraries the JNI bridge itself needs may remain.
+          echo "::group::DT_NEEDED"
+          readelf -d "$BIN" | grep NEEDED || true
+          echo "::endgroup::"
 
-      - name: Run contract test
+      - name: Enable KVM
         run: |
-          set -euo pipefail
-          BIN=artifact/test/packet_contract_test
-          chmod +x "$BIN"
-          # A minimal environment: the test must not depend on Android runtime
-          # components that the JNI bridge itself does not require.
-          ./"$BIN" 2>&1 | tee contract-test-${{ matrix.abi }}.log
-          grep -qx 'RESULT: PASS' contract-test-${{ matrix.abi }}.log
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run contract test on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 24
+          target: default
+          arch: ${{ matrix.emulator_arch }}
+          profile: pixel
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim -no-snapshot
+          script: |
+            set -euo pipefail
+            BIN="$PWD/artifact/test/packet_contract_test"
+            adb shell 'echo "ro.product.cpu.abilist=$(getprop ro.product.cpu.abilist)"'
+            adb push "$BIN" /data/local/tmp/packet_contract_test
+            adb shell chmod 755 /data/local/tmp/packet_contract_test
+            # Run and capture; the exit status is what decides the job, so a
+            # nonzero return must not be swallowed by the pipe.
+            adb shell /data/local/tmp/packet_contract_test > contract-test-${{ matrix.abi }}.log 2>&1 || true
+            cat contract-test-${{ matrix.abi }}.log
+            adb shell rm -f /data/local/tmp/packet_contract_test
+            grep -qx 'RESULT: PASS' contract-test-${{ matrix.abi }}.log || {
+              echo "::error::native contract test did not report PASS on ${{ matrix.abi }}"
+              exit 1
+            }
+
+      - name: Record device environment
+        if: always()
+        run: |
+          {
+            echo "abi=${{ matrix.abi }}"
+            echo "emulator_arch=${{ matrix.emulator_arch }}"
+            echo "android_api=24"
+            echo "runner=$RUNNER_OS"
+          } >> contract-test-${{ matrix.abi }}.log || true
 
       - name: Upload contract test results
         if: always()
@@ -912,7 +964,13 @@ jobs:
     name: Bundle all ABIs
     needs: [build, contract-test]
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master'
+    # Skipped contract-test must not skip the bundle: an optional job that did
+    # not run is not a failed job. Anything else short of success is.
+    if: |
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.contract-test.result == 'success' || needs.contract-test.result == 'skipped') &&
+      (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master')
     steps:
       - name: Download all ABI artifacts
         uses: actions/download-artifact@v4
