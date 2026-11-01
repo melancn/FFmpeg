@@ -36,9 +36,11 @@
  * They are static precisely so they are not part of the shippable ABI, but
  * that also makes them unreachable from a separate object file. Including the
  * .c here keeps the tests bound to the shipped implementation rather than to
- * a copy that could drift. The production file defines no main(), so there is
- * nothing to rename; the build rules pass -Dmain=ff_jni_production_main
- * defensively in case that ever changes. */
+ * a copy that could drift.
+ *
+ * Do not compile this file with a -Dmain=... rename: it would also rename the
+ * main() below and the link would fail. ffmpeg_jni.c must keep defining no
+ * main() of its own. */
 #include "../ffmpeg_jni.c"
 
 static int failures;

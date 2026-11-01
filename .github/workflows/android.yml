@@ -770,17 +770,26 @@ jobs:
           CURL_LINK_FLAGS=$(pkg-config --static --libs libcurl)
           read -r -a CURL_LIBS <<< "$CURL_LINK_FLAGS"
 
-          # The test translates ../ffmpeg_jni.c into its own object, so it is
-          # linked as an executable rather than a second copy of the .so.
-          # -Dmain=... is defensive: the production file must never take over
-          # the test's entry point.
-          COMMON_CFLAGS=(-fPIC -O1 -Dmain=ff_jni_production_main
+          # The test translates ../ffmpeg_jni.c into its own object (for the
+          # file-static budget helpers), so it is linked as an executable
+          # rather than against a second copy of the .so.
+          #
+          # Note: do NOT pass -Dmain=... here. The macro would also rename the
+          # test's own main() and the link fails with "undefined symbol: main".
+          # ffmpeg_jni.c defines no main(), so there is nothing to rename.
+          COMMON_CFLAGS=(-fPIC -O1
             -I"$PWD" -I"$PWD/compat/android/jni"
             -I"$PWD/compat/android/jni/generated"
-            -I"$PREFIX/include" -I"$DEPS_PREFIX/include")
+            -isystem "$PREFIX/include" -isystem "$DEPS_PREFIX/include")
 
-          "$CC" "${COMMON_CFLAGS[@]}" \
+          # Compile as C (the production translation unit is C, and clang++
+          # would reject parts of it as C++), then link with the C++ driver
+          # because the static libass archive needs libc++.
+          "$CC" "${COMMON_CFLAGS[@]}" -c \
             "$PWD/compat/android/jni/tests/packet_contract_test.c" \
+            -o "$OUT/packet_contract_test.o"
+
+          "$CXX" "$OUT/packet_contract_test.o" \
             -L"$PREFIX/lib" -L"$MBEDTLS_PREFIX/lib" -L"$DEPS_PREFIX/lib" \
             -Wl,--start-group \
             -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
