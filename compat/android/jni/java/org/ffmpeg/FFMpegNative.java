@@ -126,6 +126,14 @@ public final class FFMpegNative {
     public static final long CAP_BRIDGE_BUILD_INFO = 1L << 2;
 
     /**
+     * {@link #frameNormalizeChannelLayout} and {@link #channelLayoutNormalizeMask}
+     * are implemented. Gate every layout-normalisation call on this bit: a
+     * library built before them answers 0 here, and calling the entry point
+     * anyway would throw {@link UnsatisfiedLinkError} instead of degrading.
+     */
+    public static final long CAP_FRAME_LAYOUT_NORMALIZE = 1L << 3;
+
+    /**
      * Number of elements {@link #packetGetBudgetInfo} requires in its output
      * array. Part of the contract: the layout below is frozen for major 1.
      */
@@ -1071,6 +1079,62 @@ public final class FFMpegNative {
 
     /** @return channel count from the frame's channel layout (video returns 0). */
     public native int frameGetChannels(long frame);
+
+    /**
+     * Replace an {@code AV_CHANNEL_ORDER_UNSPEC} frame layout with a definite
+     * one, in place, and leave an already-definite layout untouched (idempotent).
+     *
+     * <p>Call this on a freshly decoded audio frame <em>before</em> the first
+     * {@link #swrConvertFrame}. libswresample compares each frame's layout with
+     * the one it derived at {@code swr_init}; an UNSPEC frame can never match
+     * that derived layout, so every frame after the first fails with
+     * {@code AVERROR_INPUT_CHANGED}. Normalising once keeps the layout stable
+     * for the whole stream without rebuilding the resampler (which would drop
+     * the tail samples it still buffers).
+     *
+     * <p>The frame must be owned exclusively by the caller: the layout is
+     * modified in place and must not be shared with another thread or frame.
+     *
+     * @param frame  the frame handle
+     * @param declaredMask a channel-layout <em>bitmask value</em> from
+     *        {@link #streamGetParChannelLayout} (not a pointer), or 0 when the
+     *        container declares nothing usable. Read only; never freed. It is
+     *        used only when its channel count equals the frame's.
+     * @return {@code 0} when the layout was already definite (nothing changed);
+     *         the channel count ({@code > 0}) when the layout was normalised;
+     *         or a negative AVERROR ({@code EINVAL}) when the frame is null, the
+     *         layout is invalid, or an UNSPEC layout has more than two channels
+     *         that no declaration covers. Multi-channel layouts are never
+     *         guessed: 5.1, 5.1(side) and hexa all have six channels, and a
+     *         wrong pick silently mis-maps every sample.
+     *
+     * <p>The single/double-channel case uses {@code av_channel_layout_default},
+     * which maps 1 to FRONT_CENTER and 2 to FL|FR. That is a convention that
+     * matches real mono/stereo PCM, not something read from the stream; for a
+     * single channel the position carries no information.
+     *
+     * @see #CAP_FRAME_LAYOUT_NORMALIZE
+     */
+    public native int frameNormalizeChannelLayout(long frame, long declaredMask);
+
+    /**
+     * Same policy as {@link #frameNormalizeChannelLayout}, for callers holding a
+     * mask and channel count instead of a frame: use it during stream setup to
+     * find out whether a layout can be normalised before any frame is decoded.
+     *
+     * <p>This answers "is this combination workable?", not "did anything
+     * change?", so a mask that already matches the channel count reports that
+     * count ({@code > 0}) rather than 0.
+     *
+     * @param currentMask the mask value describing the layout, or 0 when there
+     *        is none
+     * @param nbChannels  the channel count
+     * @return the channel count ({@code > 0}) when the combination is usable, or
+     *         a negative AVERROR ({@code EINVAL}) when the mask is invalid, the
+     *         two disagree, or there are more than two channels and no mask to
+     *         take the order from
+     */
+    public native int channelLayoutNormalizeMask(long currentMask, int nbChannels);
 
     /** @return sample rate, 0 if N/A. */
     public native int frameGetSampleRate(long frame);

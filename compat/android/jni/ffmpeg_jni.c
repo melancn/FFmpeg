@@ -172,6 +172,7 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
 #define FF_JNI_CAP_PACKET_BUDGET_INFO    (1LL << 0)
 #define FF_JNI_CAP_SIDE_DATA_EXACT_COPY  (1LL << 1)
 #define FF_JNI_CAP_BRIDGE_BUILD_INFO     (1LL << 2)
+#define FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE (1LL << 3)
 
 /* Bumped whenever the packet budget accounting rules change, so a stored
  * charge value can be attributed to the policy that produced it. */
@@ -188,7 +189,8 @@ Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
 {
     return (jlong)(FF_JNI_CAP_PACKET_BUDGET_INFO |
                    FF_JNI_CAP_SIDE_DATA_EXACT_COPY |
-                   FF_JNI_CAP_BRIDGE_BUILD_INFO);
+                   FF_JNI_CAP_BRIDGE_BUILD_INFO |
+                   FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE);
 }
 
 /* ABI string for the compiled object, not the device ABI: it identifies
@@ -1151,6 +1153,111 @@ Java_org_ffmpeg_FFMpegNative_frameGetSampleRate(JNIEnv *env, jobject thiz, jlong
 {
     AVFrame *f = PTR(AVFrame *, frame);
     return f ? (jint)f->sample_rate : 0;
+}
+
+/* Write a definite channel layout into frame->ch_layout when the decoder left
+ * it as AV_CHANNEL_ORDER_UNSPEC, and change nothing otherwise.
+ *
+ * Why this exists: swr_init() resolves the user input layout against
+ * used_ch_layout and stores a definite order (swresample.c: av_opt_set_chlayout
+ * -> s->in_ch_layout is replaced by s->used_ch_layout when it was UNSPEC).
+ * swr_convert_frame() -> config_changed() then compares that stored layout with
+ * each incoming frame's layout through av_channel_layout_compare(), which
+ * returns "different" whenever exactly one side is UNSPEC. So the first frame
+ * initialises the resampler, and every following UNSPEC frame reports
+ * AVERROR_INPUT_CHANGED. The usual reaction -- rebuild the resampler -- closes
+ * it and drops the tail samples still buffered inside it. Making the order
+ * definite once, before the first convert, keeps the layout stable for the whole
+ * stream and is idempotent: a frame that already carries a definite layout is
+ * not touched, so wiring this in cannot change the behaviour of existing
+ * streams.
+ *
+ * declaredMask is the AVChannelLayout bitmask obtained from the stream's
+ * codecpar (streamGetParChannelLayout: a mask value, NOT a pointer, with 0
+ * meaning "no usable declaration"). It is read, never retained or freed.
+ *
+ * Return value:
+ *    0  layout was already definite (and valid), nothing was modified
+ *   >0  layout was normalised, the value is the channel count now in effect
+ *  <0  AVERROR: NULL frame, invalid/unsupported layout, or an UNSPEC layout
+ *      with more than 2 channels that cannot be inferred without guessing
+ *
+ * More than two channels with no declaration are rejected on purpose: there is
+ * no safe default for, say, 6 channels (5.1, 5.1(side) and hexa all have six)
+ * and a wrong guess silently mis-maps every later sample. Failing lets the
+ * caller decide between an error and continuing without conversion.
+ *
+ * Note on the mono/stereo case: av_channel_layout_default() is a convention
+ * (1 -> FRONT_CENTER, 2 -> FL|FR), not a fact read from the stream. It matches
+ * real mono/stereo PCM, and for a single channel the position is irrelevant.
+ * It is also exactly what swr_init() itself falls back to for input layouts it
+ * has to resolve (used_ch_layout -> av_channel_layout_default), so this choice
+ * makes the frame agree with the resampler rather than overriding it.
+ *
+ * Frames must not be shared at this point: the layout is modified in place.
+ * Call it on a frame the caller owns exclusively (a freshly decoded frame
+ * before it is handed to libswresample). */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_frameNormalizeChannelLayout(JNIEnv *env, jobject thiz,
+                                                         jlong frame, jlong declaredMask)
+{
+    AVFrame *f = PTR(AVFrame *, frame);
+    AVChannelLayout *in;
+    AVChannelLayout decl = { 0 }, next = { 0 };
+    int ret;
+
+    if (!f)
+        return AVERROR(EINVAL);
+
+    in = &f->ch_layout;
+    /* Already definite: report "nothing to do" and leave the frame intact.
+     * Checking the layout instead of trusting it keeps a corrupt order from
+     * reaching swr, but a *valid* definite layout is never rewritten. */
+    if (in->order != AV_CHANNEL_ORDER_UNSPEC) {
+        if (!av_channel_layout_check(in))
+            return AVERROR(EINVAL);
+        return 0;
+    }
+    /* An UNSPEC layout is expected to carry only a channel count. */
+    if (in->nb_channels <= 0 || in->nb_channels > 64)
+        return AVERROR(EINVAL);
+
+    /* Prefer the container's declaration, but only when its channel count
+     * matches the frame's: a declaration describing a different channel count
+     * describes a different stream and would cement a wrong mapping. The mask
+     * is a value, so it is rebuilt here and checked rather than cast. */
+    ret = (declaredMask != 0)
+          ? av_channel_layout_from_mask(&decl, (uint64_t)declaredMask)
+          : AVERROR(EINVAL);
+    if (ret >= 0 && decl.nb_channels == in->nb_channels) {
+        if (av_channel_layout_copy(&next, &decl) < 0) {
+            av_channel_layout_uninit(&decl);
+            return AVERROR(ENOMEM);
+        }
+    } else {
+        if (in->nb_channels > 2) {
+            av_channel_layout_uninit(&decl);
+            return AVERROR(EINVAL);
+        }
+        /* av_channel_layout_default() returns void and, for a channel count
+         * with no standard layout, leaves the order as UNSPEC rather than
+         * failing. For 1 and 2 it always installs a NATIVE layout, but verify
+         * instead of assuming: installing another UNSPEC would look like
+         * success while leaving the resampler with the layout that caused the
+         * problem. */
+        av_channel_layout_default(&next, in->nb_channels);
+        if (next.order != AV_CHANNEL_ORDER_NATIVE ||
+            next.nb_channels != in->nb_channels) {
+            av_channel_layout_uninit(&next);
+            av_channel_layout_uninit(&decl);
+            return AVERROR(EINVAL);
+        }
+    }
+    av_channel_layout_uninit(&decl);
+
+    av_channel_layout_uninit(in);
+    *in = next;              /* ownership of any allocated map moves to frame */
+    return (jint)in->nb_channels;
 }
 
 JNIEXPORT jint JNICALL
@@ -2884,6 +2991,57 @@ Java_org_ffmpeg_FFMpegNative_channelLayoutDefault(JNIEnv *env, jobject thiz, jlo
         return AVERROR(EINVAL);
     av_channel_layout_default(&f->ch_layout, nbChannels);
     return 0;
+}
+
+/* Drive the layout normaliser from a plain mask+count pair, for callers that
+ * hold the two values rather than an AVFrame (e.g. checking up front whether a
+ * stream could be normalised before any frame has been decoded).
+ *
+ * This entry point answers "would this layout be usable?", not "did anything
+ * change?": a mask that already matches the channel count returns that count
+ * (> 0) rather than 0, because the caller only wants to know whether the
+ * combination is workable. A negative AVERROR means it is not: the layout is
+ * invalid, the count is out of range, the two disagree, or there are more than
+ * two channels with no usable mask to take the order from.
+ *
+ * No layout is created or returned: only the decision is reported, so there is
+ * nothing for the caller to free. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_channelLayoutNormalizeMask(JNIEnv *env, jobject thiz,
+                                                        jlong currentMask, jint nbChannels)
+{
+    AVChannelLayout cur = { 0 }, next = { 0 };
+    int ret;
+
+    if (nbChannels <= 0 || nbChannels > 64)
+        return AVERROR(EINVAL);
+
+    /* A definite mask that agrees with the channel count is already usable. */
+    ret = (currentMask != 0)
+          ? av_channel_layout_from_mask(&cur, (uint64_t)currentMask)
+          : AVERROR(EINVAL);
+    if (ret >= 0 && cur.order == AV_CHANNEL_ORDER_NATIVE &&
+        cur.nb_channels == nbChannels) {
+        const int n = cur.nb_channels;
+        av_channel_layout_uninit(&cur);
+        return (jint)n;
+    }
+    av_channel_layout_uninit(&cur);
+
+    if (nbChannels > 2)
+        return AVERROR(EINVAL);
+    /* See the frame entry point above (frameNormalizeChannelLayout): the default is applied only when it
+     * actually produced a definite layout. */
+    av_channel_layout_default(&next, nbChannels);
+    if (next.order != AV_CHANNEL_ORDER_NATIVE || next.nb_channels != nbChannels) {
+        av_channel_layout_uninit(&next);
+        return AVERROR(EINVAL);
+    }
+    {
+        const int n = next.nb_channels;
+        av_channel_layout_uninit(&next);
+        return (jint)n;
+    }
 }
 
 

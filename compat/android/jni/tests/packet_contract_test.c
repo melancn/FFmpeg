@@ -30,7 +30,10 @@
 #include "libavcodec/avcodec.h"
 #include "libavcodec/packet.h"
 #include "libavutil/buffer.h"
+#include "libavutil/channel_layout.h"
 #include "libavutil/error.h"
+#include "libavutil/frame.h"
+#include "libswresample/swresample.h"
 
 /* Re-include the production translation unit for its file-static helpers.
  * They are static precisely so they are not part of the shippable ABI, but
@@ -363,6 +366,268 @@ static void test_clone_independence(void)
     av_packet_free(&clone);
 }
 
+/* ------------------------------------------------------------------ */
+/* Frame channel-layout normalisation                                  */
+/*                                                                     */
+/* These run the same code path the resampler feeds on: an UNSPEC      */
+/* layout made definite once, so libswresample sees a stable layout    */
+/* instead of AVERROR_INPUT_CHANGED on every frame after the first.    */
+/* The individual return codes are only half the point; the frame      */
+/* tests drive a real SwrContext so the INPUT_CHANGED defect itself is */
+/* reproduced (and proven fixed) on the device.                        */
+/* ------------------------------------------------------------------ */
+
+/* Called exactly as the JNI shim calls it, with a NULL JNIEnv: the entry point
+ * touches neither env nor the class, and going through the real symbol keeps
+ * the test bound to the shipped signature rather than a local copy. */
+#define NORMALIZE(frame, mask) \
+    Java_org_ffmpeg_FFMpegNative_frameNormalizeChannelLayout(NULL, (jlong)(intptr_t)(frame), (mask))
+#define NORMALIZE_MASK(mask, ch) \
+    Java_org_ffmpeg_FFMpegNative_channelLayoutNormalizeMask(NULL, (mask), (ch))
+
+static AVFrame *make_audio_frame(enum AVSampleFormat fmt, int nb_channels,
+                                int nb_samples, int rate)
+{
+    AVFrame *f = av_frame_alloc();
+
+    if (!f)
+        return NULL;
+    f->format      = fmt;
+    f->nb_samples  = nb_samples;
+    f->sample_rate = rate;
+    /* What a decoder that does not know the order leaves behind: a count and
+     * nothing else. This is the exact input state the defect starts from. */
+    f->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+    f->ch_layout.nb_channels = nb_channels;
+    return f;
+}
+
+static void test_normalize_already_definite_is_noop(void)
+{
+    AVFrame *f = make_audio_frame(AV_SAMPLE_FMT_FLT, 2, 64, 48000);
+    uint64_t before;
+
+    CHECK(f != NULL);
+    if (!f)
+        return;
+    CHECK_OK(av_channel_layout_from_mask(&f->ch_layout, AV_CH_LAYOUT_STEREO));
+    before = f->ch_layout.u.mask;
+
+    /* A definite layout must be left exactly as it was, even with a
+     * declaration that disagrees: rewriting it here would let a wrong
+     * container hint override what the decoder actually produced. */
+    CHECK(NORMALIZE(f, AV_CH_LAYOUT_5POINT1) == 0);
+    CHECK(f->ch_layout.order == AV_CHANNEL_ORDER_NATIVE);
+    CHECK(f->ch_layout.u.mask == before);
+    CHECK(f->ch_layout.nb_channels == 2);
+
+    /* Idempotent: a second call reports the same "nothing to do". */
+    CHECK(NORMALIZE(f, 0) == 0);
+    CHECK(f->ch_layout.u.mask == before);
+
+    av_frame_free(&f);
+}
+
+static void test_normalize_from_declaration(void)
+{
+    AVFrame *f = make_audio_frame(AV_SAMPLE_FMT_FLT, 6, 1536, 48000);
+
+    CHECK(f != NULL);
+    if (!f)
+        return;
+
+    /* Six channels need the container: six channels alone cannot tell 5.1
+     * from 5.1(side) or hexa. */
+    CHECK(NORMALIZE(f, 0) == AVERROR(EINVAL));
+
+    CHECK(NORMALIZE(f, AV_CH_LAYOUT_5POINT1) == 6);
+    CHECK(f->ch_layout.order == AV_CHANNEL_ORDER_NATIVE);
+    CHECK(f->ch_layout.nb_channels == 6);
+    CHECK(f->ch_layout.u.mask == AV_CH_LAYOUT_5POINT1);
+
+    /* Now definite, so the same call becomes a no-op. */
+    CHECK(NORMALIZE(f, AV_CH_LAYOUT_5POINT1) == 0);
+
+    av_frame_free(&f);
+}
+
+static void test_normalize_rejects_mismatched_declaration(void)
+{
+    AVFrame *f = make_audio_frame(AV_SAMPLE_FMT_FLT, 6, 1536, 48000);
+
+    CHECK(f != NULL);
+    if (!f)
+        return;
+
+    /* A stereo declaration describes a different stream; adopting it would
+     * cement a mapping that cannot hold six channels of data. */
+    CHECK(NORMALIZE(f, AV_CH_LAYOUT_STEREO) == AVERROR(EINVAL));
+    CHECK(f->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC);
+    CHECK(f->ch_layout.nb_channels == 6);
+
+    /* A single-bit mask whose count happens to match is adopted, even though
+     * the bit has no registered channel id: av_channel_layout_from_mask()
+     * accepts any non-zero mask, so the count check is the only thing between
+     * the frame and a wrong mapping. Pinning the actual behaviour here keeps
+     * that boundary honest. */
+    CHECK(NORMALIZE(f, (jlong)(2 | 4)) == AVERROR(EINVAL));  /* FL+FR vs 6ch */
+    av_channel_layout_uninit(&f->ch_layout);
+    f->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+    f->ch_layout.nb_channels = 1;
+    CHECK(NORMALIZE(f, (jlong)(1ULL << 61)) == 1);
+    CHECK(f->ch_layout.nb_channels == 1);
+    av_channel_layout_uninit(&f->ch_layout);
+
+    av_frame_free(&f);
+}
+
+static void test_normalize_mono_stereo_defaults(void)
+{
+    AVFrame *mono   = make_audio_frame(AV_SAMPLE_FMT_FLT, 1, 64, 44100);
+    AVFrame *stereo = make_audio_frame(AV_SAMPLE_FMT_FLT, 2, 64, 44100);
+
+    CHECK(mono != NULL);
+    CHECK(stereo != NULL);
+    if (!mono || !stereo) {
+        av_frame_free(&mono);
+        av_frame_free(&stereo);
+        return;
+    }
+
+    CHECK(NORMALIZE(stereo, 0) == 2);
+    CHECK(stereo->ch_layout.order == AV_CHANNEL_ORDER_NATIVE);
+    CHECK(stereo->ch_layout.u.mask == AV_CH_LAYOUT_STEREO);
+
+    /* Mono becomes FRONT_CENTER by convention; only the count is asserted
+     * here because the default is a policy choice, not a property of the
+     * data. */
+    CHECK(NORMALIZE(mono, 0) == 1);
+    CHECK(mono->ch_layout.order == AV_CHANNEL_ORDER_NATIVE);
+    CHECK(mono->ch_layout.nb_channels == 1);
+
+    av_frame_free(&mono);
+    av_frame_free(&stereo);
+}
+
+static void test_normalize_invalid_arguments(void)
+{
+    AVFrame f;
+
+    /* NULL frame. */
+    CHECK(NORMALIZE(NULL, AV_CH_LAYOUT_STEREO) == AVERROR(EINVAL));
+
+    /* UNSPEC with no channel count at all. */
+    memset(&f, 0, sizeof(f));
+    CHECK(NORMALIZE(&f, 0) == AVERROR(EINVAL));
+
+    /* Negative channel count. */
+    memset(&f, 0, sizeof(f));
+    f.ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+    f.ch_layout.nb_channels = -1;
+    CHECK(NORMALIZE(&f, 0) == AVERROR(EINVAL));
+
+    /* Absurd channel count beyond the layout API's limit. */
+    memset(&f, 0, sizeof(f));
+    f.ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+    f.ch_layout.nb_channels = 4096;
+    CHECK(NORMALIZE(&f, 0) == AVERROR(EINVAL));
+}
+
+/* The regression this whole entry point exists for: an UNSPEC input frame
+ * fed to a real resampler must not produce AVERROR_INPUT_CHANGED on frame 2. */
+static void test_swr_accepts_normalized_stream(void)
+{
+    SwrContext *swr = NULL;
+    AVChannelLayout in = { 0 }, out = { 0 };
+    AVFrame *frame = NULL, *outframe = NULL;
+    int rc, i, normalised = 0;
+
+    /* The resampler is configured with the layout the decoder *should* have
+     * produced (FL|FR). An UNSPEC frame is exactly what does not match it. */
+    av_channel_layout_default(&in, 2);
+    av_channel_layout_default(&out, 2);
+    rc = swr_alloc_set_opts2(&swr, &out, AV_SAMPLE_FMT_FLT, 48000,
+                             &in, AV_SAMPLE_FMT_FLT, 44100, 0, NULL);
+    CHECK_OK(rc);
+    if (rc < 0 || !swr) {
+        av_channel_layout_uninit(&in);
+        av_channel_layout_uninit(&out);
+        return;
+    }
+    CHECK_OK(swr_init(swr));
+
+    frame = av_frame_alloc();
+    outframe = av_frame_alloc();
+    CHECK(frame != NULL);
+    CHECK(outframe != NULL);
+    if (frame && outframe) {
+        CHECK_OK(av_frame_get_buffer(frame, 0));
+        CHECK_OK(av_frame_make_writable(frame));
+        frame->format      = AV_SAMPLE_FMT_FLT;
+        frame->nb_samples  = 1024;
+        frame->sample_rate = 44100;
+        frame->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+        frame->ch_layout.nb_channels = 2;
+
+        /* Deliberately reuse one scratch layout: we assert on the return code,
+         * not on sample content. */
+        for (i = 0; i < 100; i++) {
+            int n;
+
+            /* Normalise before every convert; only the first call may change
+             * anything, and that idempotence is what makes this safe to wire
+             * into a hot decode path. */
+            n = NORMALIZE(frame, 0);
+            CHECK(n == 0 || n == 2);
+            if (i == 0) {
+                CHECK(n == 2);
+                normalised++;
+            } else {
+                CHECK(n == 0);
+            }
+            CHECK(frame->ch_layout.order == AV_CHANNEL_ORDER_NATIVE);
+
+            rc = swr_convert_frame(swr, outframe, frame);
+            CHECK(rc != AVERROR_INPUT_CHANGED);
+            CHECK_OK(rc);
+            av_frame_unref(outframe);
+            av_frame_unref(frame);
+
+            /* Rebuild the UNSPEC state, as a decoder would: the point is that
+             * each new frame arrives without an order and is repaired. */
+            CHECK_OK(av_frame_get_buffer(frame, 0));
+            frame->format      = AV_SAMPLE_FMT_FLT;
+            frame->nb_samples  = 1024;
+            frame->sample_rate = 44100;
+            frame->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+            frame->ch_layout.nb_channels = 2;
+        }
+        CHECK(normalised == 1);
+    }
+
+    av_frame_free(&frame);
+    av_frame_free(&outframe);
+    swr_free(&swr);
+    av_channel_layout_uninit(&in);
+    av_channel_layout_uninit(&out);
+}
+
+/* Same normalisation decision without a frame, for pre-flight checks. */
+static void test_normalize_mask_helper(void)
+{
+    CHECK(NORMALIZE_MASK(0, 0) == AVERROR(EINVAL));
+    CHECK(NORMALIZE_MASK(0, -2) == AVERROR(EINVAL));
+    /* A definite mask consistent with the count is accepted unchanged. */
+    CHECK(NORMALIZE_MASK(AV_CH_LAYOUT_5POINT1, 6) == 6);
+    /* Two channels with no mask can be defaulted. */
+    CHECK(NORMALIZE_MASK(0, 2) == 2);
+    /* Six channels with no mask cannot. */
+    CHECK(NORMALIZE_MASK(0, 6) == AVERROR(EINVAL));
+    /* A mask that contradicts the count is not silently used. */
+    CHECK(NORMALIZE_MASK(AV_CH_LAYOUT_STEREO, 6) == AVERROR(EINVAL));
+    CHECK(NORMALIZE_MASK(AV_CH_LAYOUT_5POINT1, 2) == AVERROR(EINVAL));
+}
+
 int main(void)
 {
     test_plain_payload();
@@ -375,6 +640,13 @@ int main(void)
     test_overflow_is_reported();
     test_budget_add_overflow();
     test_clone_independence();
+    test_normalize_already_definite_is_noop();
+    test_normalize_from_declaration();
+    test_normalize_rejects_mismatched_declaration();
+    test_normalize_mono_stereo_defaults();
+    test_normalize_invalid_arguments();
+    test_swr_accepts_normalized_stream();
+    test_normalize_mask_helper();
 
     printf("%d checks, %d failures\n", checks, failures);
     if (failures) {

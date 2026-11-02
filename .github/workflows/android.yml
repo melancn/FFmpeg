@@ -492,7 +492,8 @@ jobs:
           # rebuilt without them would silently fall back to "capability
           # unavailable" in every consumer.
           for sym in getBridgeApiVersion getBridgeCapabilities getBridgeBuildInfo \
-                     packetGetBudgetInfo; do
+                     packetGetBudgetInfo frameNormalizeChannelLayout \
+                     channelLayoutNormalizeMask; do
             grep -qx "Java_org_ffmpeg_FFMpegNative_$sym" /tmp/implemented_jni.txt || {
               echo "::error::bridge contract entry point missing: $sym"
               exit 1
@@ -623,6 +624,8 @@ jobs:
                      Java_org_ffmpeg_FFMpegNative_setContextPktTimebase \
                      Java_org_ffmpeg_FFMpegNative_streamGetParProfile \
                      Java_org_ffmpeg_FFMpegNative_streamGetParChannelLayout \
+                     Java_org_ffmpeg_FFMpegNative_frameNormalizeChannelLayout \
+                     Java_org_ffmpeg_FFMpegNative_channelLayoutNormalizeMask \
                      Java_org_ffmpeg_FFMpegNative_windowRendererCreate \
                      Java_org_ffmpeg_FFMpegNative_windowRendererSetSize \
                      Java_org_ffmpeg_FFMpegNative_windowRendererRender \
