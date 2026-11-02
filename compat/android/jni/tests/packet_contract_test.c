@@ -377,13 +377,16 @@ static void test_clone_independence(void)
 /* reproduced (and proven fixed) on the device.                        */
 /* ------------------------------------------------------------------ */
 
-/* Called exactly as the JNI shim calls it, with a NULL JNIEnv: the entry point
- * touches neither env nor the class, and going through the real symbol keeps
- * the test bound to the shipped signature rather than a local copy. */
+/* Called exactly as the JNI shim calls it, with NULL for both JNIEnv and the
+ * class/object: these entry points touch neither, and going through the real
+ * symbol keeps the test bound to the shipped signature (env, thiz, args...)
+ * rather than a local copy. Passing the wrong arity here is a compile error,
+ * which is the point. */
 #define NORMALIZE(frame, mask) \
-    Java_org_ffmpeg_FFMpegNative_frameNormalizeChannelLayout(NULL, (jlong)(intptr_t)(frame), (mask))
+    Java_org_ffmpeg_FFMpegNative_frameNormalizeChannelLayout(NULL, NULL, \
+                                                            (jlong)(intptr_t)(frame), (mask))
 #define NORMALIZE_MASK(mask, ch) \
-    Java_org_ffmpeg_FFMpegNative_channelLayoutNormalizeMask(NULL, (mask), (ch))
+    Java_org_ffmpeg_FFMpegNative_channelLayoutNormalizeMask(NULL, NULL, (mask), (ch))
 
 static AVFrame *make_audio_frame(enum AVSampleFormat fmt, int nb_channels,
                                 int nb_samples, int rate)
