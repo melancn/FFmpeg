@@ -169,8 +169,13 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
 #define FF_JNI_BRIDGE_API_MAJOR 1
 /* 1.1 adds the bounded PCM resampling session. It only appends entry points,
  * so this is a minor bump: a 1.0 caller keeps working unchanged, and a 1.1
- * caller detects the capability bit instead of guessing from the version. */
-#define FF_JNI_BRIDGE_API_MINOR 1
+ * caller detects the capability bit instead of guessing from the version.
+ *
+ * 1.2 fixes error paths only -- no signature, parameter width, return type
+ * or AVERROR convention changes -- plus one safety narrowing: a planar
+ * output sample format is now refused by pcmSessionCreate() instead of being
+ * written as if it were interleaved. */
+#define FF_JNI_BRIDGE_API_MINOR 2
 #define FF_JNI_BRIDGE_API_VERSION \
     ((FF_JNI_BRIDGE_API_MAJOR << 16) | FF_JNI_BRIDGE_API_MINOR)
 
@@ -181,6 +186,27 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
 /* pcmSessionCreate/Convert/Drain/Reset/Free are implemented, with limits
  * enforced before any allocation or input consumption. */
 #define FF_JNI_CAP_BOUNDED_PCM_RESAMPLE  (1LL << 4)
+/* 1.2: input planes are read through extended_data, a stream ends only after
+ * a completed flush, a format change is a real transaction, and JNI
+ * publication happens after conversion with the array length taken from the
+ * Java array. Set because tests/packet_contract_test.c drives the exported
+ * pcmSessionConvert()/pcmSessionDrain() wrappers through a stubbed JNIEnv and
+ * asserts each of those, including that a refused call publishes nothing and
+ * a failed publish poisons the session.
+ *
+ * The stub is not a VM: it does not model direct array elements or a VM that
+ * throws from SetByteArrayRegion. The bit is about the bridge's own ordering,
+ * which is testable this way; ART behaviour behind the same calls is covered
+ * by the device stage, not by this bit. */
+#define FF_JNI_CAP_PCM_SESSION_SAFE_V2   (1LL << 5)
+/* 1.2: Free() retains the whole renderer while an operation is admitted,
+ * handles are registry-checked with a generation, and Finish() releases the
+ * platform window exactly once before reporting DETACHED. */
+#define FF_JNI_CAP_RENDERER_SAFE_CLOSE   (1LL << 6)
+/* NOT set: per-output codec buffer accounting is not implemented.
+ * mediasurfaceGetOutstandingBuffers() stays a process-wide diagnostic and is
+ * not evidence about one output session. */
+#define FF_JNI_CAP_CODEC_SCOPED_BUFFER_ACCOUNTING (1LL << 7)
 
 /* Bumped whenever the packet budget accounting rules change, so a stored
  * charge value can be attributed to the policy that produced it. */
@@ -195,11 +221,16 @@ Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(JNIEnv *env, jobject thiz)
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
 {
+    /* Every bit here is bound to a test in tests/packet_contract_test.c. A
+     * capability nothing exercises is not advertised: a caller branching on
+     * an unverified bit takes a path with no evidence behind it. */
     return (jlong)(FF_JNI_CAP_PACKET_BUDGET_INFO |
                    FF_JNI_CAP_SIDE_DATA_EXACT_COPY |
                    FF_JNI_CAP_BRIDGE_BUILD_INFO |
                    FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE |
-                   FF_JNI_CAP_BOUNDED_PCM_RESAMPLE);
+                   FF_JNI_CAP_BOUNDED_PCM_RESAMPLE |
+                   FF_JNI_CAP_PCM_SESSION_SAFE_V2 |
+                   FF_JNI_CAP_RENDERER_SAFE_CLOSE);
 }
 
 /* ABI string for the compiled object, not the device ABI: it identifies
@@ -222,19 +253,103 @@ Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
 #define FF_JNI_BUILD_TYPE "debug"
 #endif
 
+/* Two-level stringification: a single-level macro would yield the literal
+ * text "__ANDROID_API__" instead of its value, which is the classic way a
+ * build-info field ends up reporting its own macro name. */
+#define FF_JNI_STR_(x) #x
+#define FF_JNI_STR(x)  FF_JNI_STR_(x)
+
+/* Provenance fields for getBridgeBuildInfo().
+ *
+ * Each is supplied by the build (see the workflow's -D flags). The default
+ * is the literal "unknown", not a guess: a fabricated revision or CI id would
+ * read as evidence and make a mis-matched .so look traceable. A build that
+ * wants to claim provenance must pass the real value, which is what the
+ * release bundle's manifest is checked against. */
+#ifndef FF_JNI_SOURCE_REVISION
+#define FF_JNI_SOURCE_REVISION "unknown"
+#endif
+#ifndef FF_JNI_ANDROID_API
+/* __ANDROID_API__ is set by the NDK toolchain for target builds; outside one
+ * there is no meaningful value, so it stays unknown rather than reporting 0. */
+#  if defined(__ANDROID_API__) && defined(__ANDROID__)
+#    define FF_JNI_ANDROID_API FF_JNI_STR(__ANDROID_API__)
+#  else
+#    define FF_JNI_ANDROID_API "unknown"
+#  endif
+#endif
+#ifndef FF_JNI_NDK_VERSION
+#define FF_JNI_NDK_VERSION "unknown"
+#endif
+#ifndef FF_JNI_BUILD_ID
+/* Not derived from a timestamp or an address: a build id that changes on
+ * every compile is not a build id, and one that looks like a hash but is not
+ * one is worse than an honest gap. */
+#define FF_JNI_BUILD_ID "unknown"
+#endif
+
 /* Single-line JSON describing the built library. Deliberately excludes
- * URLs, paths, headers and any other run-time data. */
+ * URLs, paths, headers and any other run-time data.
+ *
+ * Why this does not use a fixed char[]: snprintf() reports truncation only
+ * through its return value, and the old code dropped that value, so a future
+ * field that happened to be long would silently produce invalid JSON (a
+ * closed quote and brace with the middle cut off) instead of a compile or
+ * run-time failure. The size is now measured first and the buffer sized from
+ * the measurement, and the write is checked to have fit exactly.
+ *
+ * Values that cannot be established at build time are reported as "unknown"
+ * rather than invented: a placeholder CI id or a guessed revision is worse
+ * than an honest gap, because it looks like provenance. */
 JNIEXPORT jstring JNICALL
 Java_org_ffmpeg_FFMpegNative_getBridgeBuildInfo(JNIEnv *env, jobject thiz)
 {
-    const char *ffver = av_version_info();
-    char buf[384];
-    snprintf(buf, sizeof(buf),
-             "{\"bridgeApi\":%d,\"packetBudgetPolicyVersion\":%d,"
-             "\"ffmpegVersion\":\"%s\",\"abi\":\"%s\",\"buildType\":\"%s\"}",
-             FF_JNI_BRIDGE_API_VERSION, FF_JNI_PACKET_BUDGET_POLICY_VERSION,
-             ffver ? ffver : "unknown", FF_JNI_ABI_NAME, FF_JNI_BUILD_TYPE);
-    return (*env)->NewStringUTF(env, buf);
+    const char *ffver  = av_version_info();
+    const char *fmt    =
+        "{\"bridgeApi\":%d,\"bridgeMajor\":%d,\"bridgeMinor\":%d,"
+        "\"packetBudgetPolicyVersion\":%d,"
+        "\"ffmpegVersion\":\"%s\",\"jniSourceRevision\":\"%s\","
+        "\"abi\":\"%s\",\"androidApi\":\"%s\",\"ndk\":\"%s\","
+        "\"buildType\":\"%s\",\"buildId\":\"%s\"}";
+    const char *src_rev = FF_JNI_SOURCE_REVISION;
+    const char *api     = FF_JNI_ANDROID_API;
+    const char *ndk     = FF_JNI_NDK_VERSION;
+    char *buf;
+    int len;
+    jstring out;
+
+    if (!ffver)
+        ffver = "unknown";
+
+    /* Measure with the same arguments the real write uses, so the two can
+     * never disagree about how long the result is. */
+    len = snprintf(NULL, 0, fmt, FF_JNI_BRIDGE_API_VERSION,
+                   FF_JNI_BRIDGE_API_MAJOR, FF_JNI_BRIDGE_API_MINOR,
+                   FF_JNI_PACKET_BUDGET_POLICY_VERSION,
+                   ffver, src_rev, FF_JNI_ABI_NAME, api, ndk,
+                   FF_JNI_BUILD_TYPE, FF_JNI_BUILD_ID);
+    if (len < 0)
+        return NULL;
+
+    buf = av_malloc((size_t)len + 1);
+    if (!buf)
+        return NULL;
+
+    if (snprintf(buf, (size_t)len + 1, fmt, FF_JNI_BRIDGE_API_VERSION,
+                 FF_JNI_BRIDGE_API_MAJOR, FF_JNI_BRIDGE_API_MINOR,
+                 FF_JNI_PACKET_BUDGET_POLICY_VERSION,
+                 ffver, src_rev, FF_JNI_ABI_NAME, api, ndk,
+                 FF_JNI_BUILD_TYPE, FF_JNI_BUILD_ID) != len) {
+        /* Cannot happen with identical arguments, but a mismatch means the
+         * buffer does not hold what was measured: refuse rather than hand
+         * out a string of unknown length. */
+        av_free(buf);
+        return NULL;
+    }
+
+    out = (*env)->NewStringUTF(env, buf);
+    av_free(buf);
+    return out;
 }
 
 JNIEXPORT jstring JNICALL
@@ -1765,7 +1880,13 @@ Java_org_ffmpeg_FFMpegNative_swrGetOutSamples(JNIEnv *env, jobject thiz, jlong c
 /*     exceeds maxDelaySamples, which is what stops a caller from      */
 /*     feeding input while never draining it;                          */
 /*   - drain and convert share the same checks, so end-of-stream       */
-/*     cannot bypass the limits that normal conversion obeys.          */
+/*     cannot bypass the limits that normal conversion obeys;          */
+/*   - input planes are read through frame->extended_data, because a   */
+/*     planar frame with more channels than AV_NUM_DATA_POINTERS keeps */
+/*     them there and data[] only holds the first few;                 */
+/*   - output is staged natively and published into the caller's       */
+/*     byte[] only after the conversion succeeded, because JNI has no  */
+/*     way to undo a partially written array.                          */
 /*                                                                     */
 /* What is NOT bounded: the memory libswresample allocates for its own */
 /* filter tables and delay line when the format is first configured.   */
@@ -1774,6 +1895,11 @@ Java_org_ffmpeg_FFMpegNative_swrGetOutSamples(JNIEnv *env, jobject thiz, jlong c
 /* therefore bounds samples in flight and buffers it hands out; it is  */
 /* not a hard cap on process memory, and callers must not treat the    */
 /* reported numbers as one.                                            */
+/*                                                                     */
+/* Threading: the handle is a bare jlong, so two threads holding the   */
+/* same value is a caller bug this layer cannot detect. What it can do */
+/* is keep the session from corrupting itself when it happens; single- */
+/* threaded use per session remains the contract.                      */
 /* ------------------------------------------------------------------ */
 
 /* Result codes. Negative values are AVERRORs so they compose with the rest
@@ -1781,7 +1907,9 @@ Java_org_ffmpeg_FFMpegNative_swrGetOutSamples(JNIEnv *env, jobject thiz, jlong c
  * rather than treat as "bytes written". */
 #define FF_PCM_OUTPUT_READY        0  /* output samples written; input consumed */
 #define FF_PCM_INPUT_CONSUMED      1  /* all input taken, no output this call */
-#define FF_PCM_NEED_DRAIN          2  /* samples are still buffered in swr */
+/* Retained for numeric compatibility only: a synchronous drain reports
+ * progress through OUTPUT_READY/DRAINED and convert never returns this. */
+#define FF_PCM_NEED_DRAIN          2
 #define FF_PCM_DRAINED             3  /* nothing left; the tail is complete */
 /* The frame's format differs from the configured one and the old context
  * still holds a tail. Nothing was consumed and nothing was reconfigured:
@@ -1790,6 +1918,23 @@ Java_org_ffmpeg_FFMpegNative_swrGetOutSamples(JNIEnv *env, jobject thiz, jlong c
  * refuses to trade the tail away for the convenience of switching in one
  * call -- dropping it would punch a silent hole in the timeline. */
 #define FF_PCM_FORMAT_CHANGE       4
+
+/* Explicit session phase. Naming these is the point: "no input pending" and
+ * "this stream is finished" are different facts, and the old code told them
+ * apart with swr_get_delay()>0 -- which turns an undersized output block
+ * into an endless NEED_DRAIN instead of ending the stream. Only a completed
+ * empty-input flush ends a stream. */
+#define FF_PCM_PHASE_EMPTY         0  /* no SwrContext configured yet */
+#define FF_PCM_PHASE_ACTIVE        1  /* accepts input frames */
+#define FF_PCM_PHASE_DRAINING      2  /* the tail flush has started */
+#define FF_PCM_PHASE_DRAINED       3  /* the tail flush ended; EOF */
+#define FF_PCM_PHASE_POISONED      4  /* state unknown: reset or free only */
+
+/* Guard rails that are not caller policy. The per-call limits come from
+ * Java; these keep the JNI layer from walking an absurd layout or from
+ * addressing more bytes than it can express. */
+#define FF_PCM_MAX_CHANNELS        64
+#define FF_PCM_MAX_SCRATCH_BYTES   (4 * 1024 * 1024)
 
 /* Distinct from AVERROR(ENOMEM): "your block is too small for this input"
  * is a caller-visible policy refusal, not an allocation failure, and the
@@ -1809,27 +1954,47 @@ typedef struct FFPcmLimits {
 } FFPcmLimits;
 
 typedef struct FFPcmSession {
+    /* Serialises the entry points that touch the session. Held for one call
+     * only, which the limits bound; no JNI object is held across it. */
+    pthread_mutex_t lock;
+    int             lock_ready;
+
     struct SwrContext *swr;
 
     FFPcmLimits limits;
 
     /* Output format is fixed at create time: the player's AudioTrack never
      * changes mid-stream. The layout is kept as an owned AVChannelLayout
-     * rather than a raw mask so a custom layout survives the round trip. */
+     * rather than a raw mask so a custom layout survives the round trip.
+     * Planar output is not expressible through the single byte[] entry
+     * points, so create refuses it instead of packing it silently. */
     int             out_fmt;
     int             out_rate;
     AVChannelLayout out_layout;
 
-    /* Input format currently configured in swr. Valid only when configured
-     * is set; a format change replaces it transactionally. */
+    /* Explicit phase; see FF_PCM_PHASE_*. */
+    int             phase;
+
+    /* Input format currently configured in swr. Valid in ACTIVE, DRAINING
+     * and DRAINED; a format change replaces it transactionally. */
     int             configured;
     int             in_fmt;
     int             in_rate;
     AVChannelLayout in_layout;    /* fully owned deep copy, freed on replace */
+
+    /* Native staging for one call's output. Writing into the JVM array while
+     * swr runs would mean a failure part-way leaves half-converted samples
+     * in a caller-visible buffer, and JNI cannot undo that: releasing an array
+     * with JNI_ABORT discards changes only when the VM handed out a copy. The
+     * result lands here first and is published with SetByteArrayRegion after
+     * the call has succeeded. Reused across calls, grown up to
+     * FF_PCM_MAX_SCRATCH_BYTES. */
+    uint8_t        *scratch;
+    size_t          scratch_capacity;
 } FFPcmSession;
 
 /* Give an UNSPEC frame layout the definite order swr_init() would have
- * derived for it, in place, before the session compares it.
+ * derived for it, so the session can compare like with like.
  *
  * Why this is needed here and not just in the caller: swr_init() rewrites an
  * UNSPEC input layout to av_channel_layout_default() (swresample.c, used_ch
@@ -1842,38 +2007,48 @@ typedef struct FFPcmSession {
  * old tail can never be drained while the caller keeps refetching.
  *
  * Normalising is not a guess: it installs exactly the layout swr would have
- * chosen, so the session and the resampler agree. A frame that already
- * carries a definite layout is never touched.
+ * chosen, so the session and the resampler agree.
+ *
+ * The frame is only read. The definite layout is written to *pending, which
+ * the caller installs in the session after a successful convert or drops --
+ * comparing layouts alone would not do, because "the frame said nothing and
+ * the session says something definite" is a real change even when the
+ * resulting order happens to match.
  *
  * Returns 0 (unchanged or normalised) or a negative AVERROR when the layout
  * cannot be made definite without guessing. */
-static int ff_pcm_normalize_layout(AVChannelLayout *layout)
+static int ff_pcm_normalize_layout(const AVChannelLayout *layout,
+                                   AVChannelLayout *pending)
 {
-    AVChannelLayout next = { 0 };
-
-    if (!layout || !av_channel_layout_check(layout))
+    if (!layout || !pending || !av_channel_layout_check(layout))
         return AVERROR(EINVAL);
-    if (layout->order != AV_CHANNEL_ORDER_UNSPEC)
+    if (layout->order != AV_CHANNEL_ORDER_UNSPEC) {
+        if (!av_channel_layout_check(pending))
+            return AVERROR(EINVAL);
         return 0;
+    }
 
-    if (layout->nb_channels <= 0 || layout->nb_channels > 64)
+    if (layout->nb_channels <= 0 || layout->nb_channels > FF_PCM_MAX_CHANNELS)
         return AVERROR(EINVAL);
-    av_channel_layout_default(&next, layout->nb_channels);
+    av_channel_layout_default(pending, layout->nb_channels);
     /* For a count with no standard layout default() leaves UNSPEC, which
      * would not fix anything; refuse rather than loop. */
-    if (next.order != AV_CHANNEL_ORDER_NATIVE ||
-        next.nb_channels != layout->nb_channels) {
-        av_channel_layout_uninit(&next);
+    if (pending->order != AV_CHANNEL_ORDER_NATIVE ||
+        pending->nb_channels != layout->nb_channels) {
+        av_channel_layout_uninit(pending);
         return AVERROR(EINVAL);
     }
-    av_channel_layout_uninit(layout);
-    *layout = next;
     return 0;
 }
 
 /* Layouts are compared by value here, never by pointer: a frame's layout
  * dies with the frame. av_channel_layout_compare() is what decides, so two
- * different masks that describe the same channels stay one format. */
+ * different masks that describe the same channels stay one format.
+ *
+ * The absolute "either side UNSPEC means unequal" reading is a property of
+ * the locked implementation, not a rule to lean on; both sides are therefore
+ * always normalised first, and a pending layout is never treated as equal
+ * merely because a default happened to be installed on one side only. */
 static int ff_pcm_format_matches(const FFPcmSession *s, int fmt, int rate,
                                  const AVChannelLayout *layout)
 {
@@ -1888,17 +2063,27 @@ static int ff_pcm_format_matches(const FFPcmSession *s, int fmt, int rate,
     return 1;
 }
 
-/* Replace the configured input format. The new SwrContext is built and
- * initialised first and only then swapped in, so a failure leaves the
- * session exactly as it was instead of on a half-initialised context. */
-static int ff_pcm_configure(FFPcmSession *s, int fmt, int rate,
-                            const AVChannelLayout *layout)
+/* Build and initialise a candidate input configuration. Never touches the
+ * session: the caller decides whether the result is committed or dropped,
+ * which is what lets a format change leave the old state intact on failure.
+ *
+ * On success *out_swr owns the new context and *out_layout a deep copy of
+ * the layout. On failure both are left empty. */
+static int ff_pcm_build_context(const FFPcmSession *s, int fmt, int rate,
+                                const AVChannelLayout *layout,
+                                struct SwrContext **out_swr,
+                                AVChannelLayout *out_layout)
 {
     struct SwrContext *next = NULL;
     AVChannelLayout copy = { 0 };
     int ret;
 
+    *out_swr = NULL;
     if (!layout || !av_channel_layout_check(layout) || rate <= 0)
+        return AVERROR(EINVAL);
+    if (fmt < 0 || av_get_bytes_per_sample((enum AVSampleFormat)fmt) <= 0)
+        return AVERROR(EINVAL);
+    if (layout->nb_channels <= 0 || layout->nb_channels > FF_PCM_MAX_CHANNELS)
         return AVERROR(EINVAL);
     if (!s->out_layout.order || s->out_layout.nb_channels <= 0)
         return AVERROR(EINVAL);
@@ -1916,60 +2101,173 @@ static int ff_pcm_configure(FFPcmSession *s, int fmt, int rate,
         return ret;
     }
 
-    /* Deep-copy the layout *before* touching the live state: everything that
-     * can fail has to fail while the old context is still intact. */
+    /* Deep-copy before handing anything back: a CUSTOM layout lives in a
+     * malloc'd map that must not be aliased or memcpy'd. */
     if (av_channel_layout_copy(&copy, layout) < 0) {
         swr_free(&next);
         return AVERROR(ENOMEM);
     }
 
-    /* Commit: nothing below can fail. */
+    *out_swr    = next;
+    *out_layout = copy;
+    return 0;
+}
+
+/* Swap in a built configuration. Nothing here can fail. */
+static void ff_pcm_commit(FFPcmSession *s, struct SwrContext *swr,
+                          AVChannelLayout *layout, int fmt, int rate)
+{
     swr_free(&s->swr);
-    s->swr = next;
+    s->swr = swr;
     av_channel_layout_uninit(&s->in_layout);
-    s->in_layout  = copy;          /* ownership of any map moves in */
+    s->in_layout  = *layout;
+    memset(layout, 0, sizeof(*layout));
     s->in_fmt     = fmt;
     s->in_rate    = rate;
     s->configured = 1;
+    s->phase      = FF_PCM_PHASE_ACTIVE;
+}
+
+/* Replace the configured input format. The new SwrContext is built and
+ * initialised first and only then swapped in, so a failure leaves the
+ * session exactly as it was instead of on a half-initialised context. */
+static int ff_pcm_configure(FFPcmSession *s, int fmt, int rate,
+                            const AVChannelLayout *layout)
+{
+    struct SwrContext *next = NULL;
+    AVChannelLayout copy = { 0 };
+    int ret;
+
+    ret = ff_pcm_build_context(s, fmt, rate, layout, &next, &copy);
+    if (ret < 0)
+        return ret;
+    ff_pcm_commit(s, next, &copy, fmt, rate);
+    return 0;
+}
+
+/* Number of input planes swr_convert() will read for this format. This is
+ * also the guard that keeps a forged channel count from being walked. */
+static int ff_pcm_input_planes(int fmt, const AVChannelLayout *layout)
+{
+    return av_sample_fmt_is_planar((enum AVSampleFormat)fmt)
+           ? layout->nb_channels : 1;
+}
+
+/* Validate an audio frame's shape *and* that every plane it will be read
+ * from really exists.
+ *
+ * Plane pointers must come from frame->extended_data, never from
+ * frame->data: data[] has only AV_NUM_DATA_POINTERS entries, and a planar
+ * layout with more channels keeps the rest in extended_data. Indexing data[]
+ * by channel number reads past the end of that array. The two arrays are the
+ * same pointer in the common case, but that is an implementation detail, not
+ * a licence to index data[] by channel.
+ *
+ * A zero-sample frame is not EOF and not "no data": it is a well-formed frame
+ * with nothing in it. Rejecting it, or rewriting its pointers to NULL to force
+ * a flush, would turn a legal frame into a stream boundary. */
+static int ff_pcm_validate_input(const AVFrame *frame)
+{
+    int planes, i;
+
+    if (!frame)
+        return AVERROR(EINVAL);
+    if (frame->nb_samples < 0 || frame->sample_rate <= 0 || frame->format < 0)
+        return AVERROR(EINVAL);
+    if (!av_channel_layout_check(&frame->ch_layout))
+        return AVERROR(EINVAL);
+    if (frame->ch_layout.nb_channels <= 0 ||
+        frame->ch_layout.nb_channels > FF_PCM_MAX_CHANNELS)
+        return AVERROR(EINVAL);
+    if (av_get_bytes_per_sample((enum AVSampleFormat)frame->format) <= 0)
+        return AVERROR(EINVAL);
+    if (frame->nb_samples == 0)
+        return 0;
+
+    if (!frame->extended_data)
+        return AVERROR(EINVAL);
+    planes = ff_pcm_input_planes(frame->format, &frame->ch_layout);
+    /* av_samples_get_buffer_size() also validates the combination: a shape
+     * that cannot be addressed even in principle is refused whatever its
+     * pointers claim. The per-call sample budget lives in the session. */
+    if (av_samples_get_buffer_size(NULL, frame->ch_layout.nb_channels,
+                                   frame->nb_samples,
+                                   (enum AVSampleFormat)frame->format, 1) < 0)
+        return AVERROR(EINVAL);
+    for (i = 0; i < planes; i++)
+        if (!frame->extended_data[i])
+            return AVERROR(EINVAL);
     return 0;
 }
 
 /* Upper bound on what one call may emit for `in_samples` of input, in
  * output samples per channel. Checked arithmetic only: an absurd request is
  * a refusal, never a wrapped small number that then passes the limit test. */
-static int64_t ff_pcm_out_bound(FFPcmSession *s, int64_t in_samples)
+static int64_t ff_pcm_out_bound(struct SwrContext *swr, int64_t in_samples)
 {
     int64_t bound;
 
-    if (in_samples < 0)
+    if (!swr || in_samples < 0 || in_samples > INT_MAX)
         return AVERROR(EINVAL);
-    bound = swr_get_out_samples(s->swr, (int)in_samples);
+    bound = swr_get_out_samples(swr, (int)in_samples);
     if (bound < 0)
         return bound;
     return bound;
 }
 
+/* Reserve `bytes` of staging space for one call's output. Grown, never
+ * shrunk, and never above FF_PCM_MAX_SCRATCH_BYTES: a caller that asks for
+ * more output than that per call is refused before swr runs, not after. */
+static int ff_pcm_scratch_reserve(FFPcmSession *s, uint64_t bytes)
+{
+    uint8_t *next;
+
+    if (bytes == 0)
+        return 0;
+    if (bytes > FF_PCM_MAX_SCRATCH_BYTES)
+        return FF_PCM_LIMIT_EXCEEDED;
+    if (s->scratch && s->scratch_capacity >= bytes)
+        return 0;
+
+    next = av_realloc(s->scratch, (size_t)bytes);
+    if (!next)
+        return AVERROR(ENOMEM);
+    s->scratch          = next;
+    s->scratch_capacity = (size_t)bytes;
+    return 0;
+}
+
 /* Shared gate for convert and drain.
  *
- * Runs before any byte[] is pinned or any sample is handed to swr. Because
- * swr_convert() takes all of its input in one call, this is the only point
- * at which "refused, input untouched" can still be true. */
-static int ff_pcm_check_call(FFPcmSession *s, int64_t in_samples,
-                             int64_t out_count, int64_t out_capacity)
+ * Runs before the staging buffer is grown and before any sample is handed to
+ * swr. Because swr_convert() takes all of its input in one call, this is the
+ * only point at which "refused, input untouched" can still be true.
+ *
+ * Returns 0 and, through *out_room, the samples per channel that may actually
+ * be produced: min(outCount, swr's upper bound for this input,
+ * maxOutSamples). Asking swr for more than the caller's array can hold is not
+ * an option, so the bound is enforced here rather than discovered from a
+ * wrapped or truncated result.
+ *
+ * `swr` is passed explicitly because a format change runs the candidate
+ * context for one call before committing it. */
+static int ff_pcm_check_call(const FFPcmSession *s, struct SwrContext *swr,
+                             int64_t in_samples, int64_t out_count,
+                             int64_t out_capacity, int *out_room)
 {
-    int64_t bound, bytes;
-    int64_t delay;
-    int ret;
+    int64_t bound, bytes, delay, room;
 
-    if (!s->swr || !s->configured)
+    *out_room = 0;
+    if (!swr)
         return AVERROR(EINVAL);
     if (out_count <= 0)
         return AVERROR(EINVAL);
-    if (in_samples > s->limits.max_in_samples)
+    if (in_samples < 0 || in_samples > s->limits.max_in_samples)
         return FF_PCM_LIMIT_EXCEEDED;
 
-    /* Output block must fit the caller's array before we compute anything
-     * else: an under-sized array is a bug, not a budget condition. */
+    /* The output block must fit the caller's array before anything else: an
+     * under-sized array is a bug, not a budget condition, and it must be
+     * reported without touching swr or the staging buffer. */
     bytes = ff_jni_audio_bytes(out_count, s->out_fmt,
                                s->out_layout.nb_channels);
     if (bytes < 0)
@@ -1977,48 +2275,126 @@ static int ff_pcm_check_call(FFPcmSession *s, int64_t in_samples,
     if (bytes > out_capacity)
         return AVERROR(ENOMEM);
 
-    bound = ff_pcm_out_bound(s, in_samples);
+    bound = ff_pcm_out_bound(swr, in_samples);
     if (bound < 0)
         return (int)bound;
-    if (bound > s->limits.max_out_samples)
-        return FF_PCM_LIMIT_EXCEEDED;
 
-    /* What swr is already holding. Measured in output samples so it is
-     * comparable with the output block and with the limit the caller set. */
-    delay = swr_get_delay(s->swr, s->out_rate);
+    /* What swr already holds, in output samples so it compares with the
+     * output block and with the caller's limit. Checked before the
+     * conversion, against the samples this call may add, so the backlog can
+     * never grow past the limit behind the caller's back. */
+    delay = swr_get_delay(swr, s->out_rate);
     if (delay < 0)
         return (int)delay;
-    if (delay > s->limits.max_delay_samples)
+
+    room = FFMIN(out_count, bound);
+    room = FFMIN(room, (int64_t)s->limits.max_out_samples);
+    if (room <= 0)
         return FF_PCM_LIMIT_EXCEEDED;
 
+    /* Drain is exempt from the delay budget: it exists to remove backlog,
+     * and refusing it because the backlog is large would close the only
+     * exit. */
+    if (in_samples > 0 && delay + bound > s->limits.max_delay_samples)
+        return FF_PCM_LIMIT_EXCEEDED;
+
+    bytes = ff_jni_audio_bytes(room, s->out_fmt, s->out_layout.nb_channels);
+    if (bytes < 0)
+        return (int)bytes;
+    if ((uint64_t)bytes > FF_PCM_MAX_SCRATCH_BYTES)
+        return FF_PCM_LIMIT_EXCEEDED;
+
+    *out_room = (int)room;
     return 0;
 }
 
-/* Convert one frame worth of samples. `in` may be NULL for drain.
+
+
+/* Convert one frame worth of samples with an explicit context. `in` may be
+ * NULL for a drain.
  *
  * Returns a non-negative status (FF_PCM_*) with *produced set to the number
- * of output samples written, or a negative AVERROR. On any negative return
- * no input sample has been consumed. */
-static int ff_pcm_convert_internal(FFPcmSession *s, const uint8_t *const *in,
-                                   int in_samples, uint8_t *const *out,
-                                   int out_count, int *produced)
+ * of output samples written, or a negative AVERROR.
+ *
+ * The contract for negative returns is deliberately narrow: a failure before
+ * swr_convert() means no input was consumed and the frame may be presented
+ * again. A failure inside swr_convert(), or a result that contradicts the
+ * pre-flight bound, means the session's state is no longer known and it is
+ * left POISONED; the caller must reset or free it instead of retrying the
+ * same frame. */
+static int ff_pcm_convert_with(FFPcmSession *s, struct SwrContext *swr,
+                               const uint8_t *const *in, int in_samples,
+                               uint8_t *const *out, int out_count,
+                               int *produced)
 {
     int ret;
 
     *produced = 0;
-    ret = swr_convert(s->swr, out, out_count, in, in_samples);
-    if (ret < 0)
+    ret = swr_convert(swr, out, out_count, in, in_samples);
+    if (ret < 0) {
+        s->phase = FF_PCM_PHASE_POISONED;
         return ret;
+    }
+    if (ret > out_count) {
+        /* swr cannot return more than it was given room for. If it did, the
+         * staging buffer holds data past what was sized for it and the delay
+         * accounting is meaningless. Isolate the session. */
+        s->phase = FF_PCM_PHASE_POISONED;
+        return AVERROR(EIO);
+    }
     *produced = ret;
     if (ret > 0)
         return FF_PCM_OUTPUT_READY;
-    /* Nothing emitted. Distinguish "input accepted, still cooking" from
-     * "nothing left", because the caller's cursor advances in the first case
-     * and the stream ends in the second. */
+    /* Nothing emitted. "Input accepted, still cooking" and "nothing left" are
+     * different facts: the caller's cursor advances in the first case and the
+     * stream ends in the second. */
     if (in_samples > 0)
         return FF_PCM_INPUT_CONSUMED;
-    return swr_get_delay(s->swr, s->out_rate) > 0 ? FF_PCM_NEED_DRAIN
-                                                  : FF_PCM_DRAINED;
+    return FF_PCM_DRAINED;
+}
+
+/* Convert with the session's current context. */
+static int ff_pcm_convert_internal(FFPcmSession *s, const uint8_t *const *in,
+                                   int in_samples, uint8_t *const *out,
+                                   int out_count, int *produced)
+{
+    return ff_pcm_convert_with(s, s->swr, in, in_samples, out, out_count,
+                               produced);
+}
+
+/* Terminate a stream: flush the tail with an empty-input convert.
+ *
+ * This is the *only* place that decides a stream is over. It never re-derives
+ * "done" from swr_get_delay(), because a positive delay with no way to read
+ * it out is precisely the endless NEED_DRAIN this replaces: the flush empties
+ * swr, so a non-zero return means samples came out and a zero return means
+ * there are none left.
+ *
+ * A small output block is fine: the flush is resumable, and the phase stays
+ * DRAINING until one call actually returns zero (swresample.c: an
+ * input-less convert takes whatever room it is given and keeps the rest). */
+static int ff_pcm_drain_core(FFPcmSession *s, uint8_t *const *out,
+                             int out_count, int *produced)
+{
+    int ret;
+
+    *produced = 0;
+    if (s->phase == FF_PCM_PHASE_POISONED)
+        return AVERROR(EIO);
+    /* No context, or the stream is already finished: end here without calling
+     * swr. An empty session must drain cleanly, not report EINVAL. */
+    if (!s->swr || s->phase == FF_PCM_PHASE_EMPTY ||
+        s->phase == FF_PCM_PHASE_DRAINED)
+        return FF_PCM_DRAINED;
+
+    s->phase = FF_PCM_PHASE_DRAINING;
+    ret = ff_pcm_convert_internal(s, NULL, 0, out, out_count, produced);
+    if (ret < 0)
+        return ret;                     /* convert_internal poisoned it */
+    if (ret == FF_PCM_OUTPUT_READY)
+        return ret;                     /* more tail may be left */
+    s->phase = FF_PCM_PHASE_DRAINED;
+    return FF_PCM_DRAINED;
 }
 
 JNIEXPORT jlong JNICALL
@@ -2031,35 +2407,264 @@ Java_org_ffmpeg_FFMpegNative_pcmSessionCreate(JNIEnv *env, jobject thiz,
 {
     FFPcmSession *s;
     int ret;
+    int channels;
 
     if (outRate <= 0 || outLayoutMask == 0 ||
         maxOutSamples <= 0 || maxInSamples <= 0 || maxDelaySamples < 0)
         return 0;
-    if (av_get_bytes_per_sample((enum AVSampleFormat)outFmt) <= 0)
+    if (outFmt < 0 || av_get_bytes_per_sample((enum AVSampleFormat)outFmt) <= 0)
         return 0;
+    /* Planar output has no representation in the single byte[] block this
+     * API takes; accepting it would mean writing the planes as if they were
+     * interleaved. Refuse the format instead of guessing a layout. */
+    if (av_sample_fmt_is_planar((enum AVSampleFormat)outFmt))
+        return 0;
+
+    channels = ff_jni_mask_channels((uint64_t)outLayoutMask);
+    if (channels <= 0 || channels > FF_PCM_MAX_CHANNELS)
+        return 0;
+
+    /* One call may never emit more than the staging ceiling; a limit above it
+     * would only be discovered once a call actually needed the memory. The
+     * per-sample size is an int product (channels <= 64, bps <= 8), so the
+     * division is well defined and the comparison cannot wrap. */
+    {
+        const uint64_t bytes_per_sample =
+            (uint64_t)channels *
+            (uint64_t)av_get_bytes_per_sample((enum AVSampleFormat)outFmt);
+
+        if (bytes_per_sample == 0 ||
+            (uint64_t)maxOutSamples > FF_PCM_MAX_SCRATCH_BYTES / bytes_per_sample)
+            return 0;
+    }
 
     s = av_mallocz(sizeof(*s));
     if (!s)
         return 0;
 
+    if (pthread_mutex_init(&s->lock, NULL) != 0) {
+        av_free(s);
+        return 0;
+    }
+    s->lock_ready = 1;
+
     /* The output layout is owned by the session: copy it, never alias a
      * caller-owned layout that may be freed first. */
     ret = av_channel_layout_from_mask(&s->out_layout, (uint64_t)outLayoutMask);
     if (ret < 0) {
+        pthread_mutex_destroy(&s->lock);
         av_free(s);
         return 0;
     }
-    s->out_fmt        = outFmt;
-    s->out_rate       = outRate;
+    s->out_fmt  = outFmt;
+    s->out_rate = outRate;
     s->limits.max_out_samples   = maxOutSamples;
     s->limits.max_in_samples    = maxInSamples;
     s->limits.max_delay_samples = maxDelaySamples;
+    s->phase = FF_PCM_PHASE_EMPTY;
     return (jlong)(intptr_t)s;
 }
 
-/* Convert one input frame. The frame is read, never retained: a format
- * change re-configures the session from the frame's own values, so the
- * frame must outlive the call but nothing after it. */
+/* Shared body of pcmSessionConvert().
+ *
+ * Everything that can legitimately be refused happens before swr is called:
+ * session phase, frame shape, array length, checked byte arithmetic and the
+ * output bound. The result is staged in session scratch and copied into `out`
+ * only after swr returned successfully, so a refused or failed call cannot
+ * leave half-converted samples in the caller's array.
+ *
+ * `env`/`out` may be NULL to convert into staging only, with no Java array to
+ * bound or publish to. The contract tests do not rely on that: they call the
+ * exported wrapper with a stubbed JNIEnv so the capacity read and the publish
+ * path are executed, which a NULL env would skip.
+ *
+ * Returns a non-negative FF_PCM_* status or a negative AVERROR. On a negative
+ * return nothing was published, but only failures before the conversion leave
+ * the input unconsumed. */
+static int ff_pcm_convert_jni(JNIEnv *env, FFPcmSession *s, AVFrame *f,
+                              jbyteArray out, jint outCount, jint *status_slot)
+{
+    AVChannelLayout pending = { 0 };
+    AVChannelLayout candidate = { 0 }, pending_keep = { 0 };
+    struct SwrContext *built = NULL;
+    struct SwrContext *active = NULL;      /* context this call converts with */
+    int rebuilt = 0;
+    int ret = 0, check, in_samples, room = 0, produced = 0;
+    int64_t out_capacity, bytes;
+
+    *status_slot = 0;
+    if (!s || !s->lock_ready)
+        return AVERROR(EINVAL);
+    check = ff_pcm_validate_input(f);
+    if (check < 0)
+        return check;
+
+    pthread_mutex_lock(&s->lock);
+
+    if (s->phase == FF_PCM_PHASE_POISONED) {
+        ret = AVERROR(EIO);
+        goto done;
+    }
+    if (s->phase == FF_PCM_PHASE_DRAINING || s->phase == FF_PCM_PHASE_DRAINED) {
+        /* The stream was ended; samples cannot be replayed into a flushed
+         * resampler as if the timeline had continued. A new stream starts
+         * with pcmSessionReset(). */
+        ret = AVERROR(EPERM);
+        goto done;
+    }
+
+    in_samples = f->nb_samples;
+    /* The per-call input budget is decided before any configuration work:
+     * configuring allocates libswresample's tables, and a call that is going
+     * to be refused must not pay for them. */
+    if (in_samples > s->limits.max_in_samples) {
+        ret = FF_PCM_LIMIT_EXCEEDED;
+        goto done;
+    }
+
+    /* The real length of the Java array, not the caller's claim: outCount is
+     * a request, the array is the limit. With no env (contract test) there is
+     * no Java array and nothing to publish to, so the capacity check is the
+     * session's own staging ceiling. */
+    out_capacity = (env && out)
+                   ? (int64_t)(*env)->GetArrayLength(env, out)
+                   : (int64_t)FF_PCM_MAX_SCRATCH_BYTES;
+
+    /* The layout this call would install: the frame's own when it is
+     * definite, otherwise the order swr_init() would have chosen for it. The
+     * frame is only read -- it belongs to the caller and may be shared, so
+     * "normalise in place" would be a write into someone else's frame. A deep
+     * copy is required because a CUSTOM layout's map must not be aliased or
+     * memcpy'd. */
+    if (av_channel_layout_copy(&pending, &f->ch_layout) < 0) {
+        ret = AVERROR(ENOMEM);
+        goto done;
+    }
+    check = ff_pcm_normalize_layout(&f->ch_layout, &pending);
+    if (check < 0) {
+        ret = check;
+        goto done;
+    }
+
+    /* Format snapshot. A change is a transaction, not an in-place edit:
+     *
+     *   1. if the configured context has not been flushed yet, refuse for now
+     *      (FF_PCM_FORMAT_CHANGE, input untouched) so the caller drains the
+     *      old tail through the old configuration;
+     *   2. once drained, build and validate a new context while the old one is
+     *      still intact;
+     *   3. convert this same frame exactly once and only then commit.
+     *
+     * Reconfiguring immediately would discard the old resampler's tail and
+     * the caller could not detect the gap. The "still has a tail" test is the
+     * phase, not swr_get_delay(): only a completed flush ends a stream, and
+     * the re-submitted frame after a drain must not be refused again just
+     * because a delay is still non-zero.
+     */
+    if (!ff_pcm_format_matches(s, f->format, f->sample_rate, &pending)) {
+        if (s->phase == FF_PCM_PHASE_ACTIVE && s->swr &&
+            swr_get_delay(s->swr, s->out_rate) > 0) {
+            ret = FF_PCM_FORMAT_CHANGE;
+            goto done;
+        }
+        check = ff_pcm_build_context(s, f->format, f->sample_rate, &pending,
+                                     &built, &candidate);
+        if (check < 0) {
+            /* Nothing touched: the old configuration stays, the frame is
+             * unconsumed and the candidate is already gone. */
+            ret = check;
+            goto done;
+        }
+        /* Not committed yet: every capacity and allocation check below must
+         * still fail with the old configuration intact, so the caller can
+         * correct its arguments and present the same frame again. The
+         * candidate runs this one call as a second resampler, and only a
+         * successful conversion makes it the session's. */
+        active       = built;
+        pending_keep = candidate;
+        rebuilt      = 1;
+    }
+
+    /* No current context means a fresh or reset session; the candidate (if
+     * any) is what this call runs on. */
+    if (!active)
+        active = s->swr;
+
+    check = ff_pcm_check_call(s, active, in_samples, outCount, out_capacity,
+                              &room);
+    if (check < 0) {
+        ret = check;
+        goto done;
+    }
+
+    bytes = ff_jni_audio_bytes(room, s->out_fmt, s->out_layout.nb_channels);
+    if (bytes < 0) {
+        ret = (int)bytes;
+        goto done;
+    }
+    check = ff_pcm_scratch_reserve(s, (uint64_t)bytes);
+    if (check < 0) {
+        ret = check;
+        goto done;
+    }
+
+    {
+        uint8_t *dst[AV_NUM_DATA_POINTERS] = { s->scratch };
+        /* extended_data, not data: a planar frame with more channels than
+         * AV_NUM_DATA_POINTERS keeps the rest there, and data[] must never be
+         * indexed by channel number. */
+        ret = ff_pcm_convert_with(s, active,
+                                  (const uint8_t *const *)f->extended_data,
+                                  in_samples, dst, room, &produced);
+    }
+    if (ret >= 0 && rebuilt) {
+        /* The frame was converted by the candidate, so that is the
+         * configuration the stream continues on. */
+        ff_pcm_commit(s, active, &pending_keep, f->format, f->sample_rate);
+        active  = NULL;
+        rebuilt = 0;
+    }
+    if (ret >= 0 && produced > 0) {
+        int64_t pub = ff_jni_audio_bytes(produced, s->out_fmt,
+                                         s->out_layout.nb_channels);
+        if (pub < 0 || pub > (int64_t)s->scratch_capacity ||
+            pub > (jsize)INT32_MAX) {
+            /* The result does not fit what swr was told it could write. The
+             * session state is no longer trustworthy. */
+            s->phase = FF_PCM_PHASE_POISONED;
+            ret = AVERROR(EIO);
+            goto done;
+        }
+        if (env && out) {
+            (*env)->SetByteArrayRegion(env, out, 0, (jsize)pub,
+                                       (const jbyte *)s->scratch);
+            if ((*env)->ExceptionCheck(env)) {
+                /* The samples were produced but could not be delivered: the
+                 * input is already consumed, so the caller must not replay
+                 * the frame. Leave the exception to the JVM. */
+                s->phase = FF_PCM_PHASE_POISONED;
+                ret = AVERROR(EIO);
+                goto done;
+            }
+        }
+        *status_slot = produced;
+    }
+
+done:
+    pthread_mutex_unlock(&s->lock);
+    av_channel_layout_uninit(&pending);
+    av_channel_layout_uninit(&candidate);
+    av_channel_layout_uninit(&pending_keep);
+    /* An uncommitted candidate is dropped here; on success it was moved into
+     * the session and this is NULL. */
+    if (built)
+        swr_free(&built);
+    return ret;
+}
+
+/* Convert one input frame. The frame is read, never retained: a format change
+ * re-configures the session from the frame's own values, so the frame must
+ * outlive the call but nothing after it. */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_pcmSessionConvert(JNIEnv *env, jobject thiz,
                                                jlong handle, jlong frame,
@@ -2068,162 +2673,159 @@ Java_org_ffmpeg_FFMpegNative_pcmSessionConvert(JNIEnv *env, jobject thiz,
 {
     FFPcmSession *s = PTR(FFPcmSession *, handle);
     AVFrame *f = PTR(AVFrame *, frame);
-    int produced = 0;
-    int check, ret, in_samples;
-    jint zero = 0;
-    jbyte *out_ptr;
+    jint slot = 0;
+    int ret;
 
-    if (!s || !f || !out || !status)
+    if (!env || !s || !f || !out || !status)
         return AVERROR(EINVAL);
     /* Publish "nothing produced" up front so every failure path leaves the
-     * caller's status slot defined instead of holding a stale value. */
+     * caller's status slot defined instead of holding a stale value. An array
+     * too short cannot promise even that. */
     if ((*env)->GetArrayLength(env, status) < 1)
         return AVERROR(EINVAL);
-    (*env)->SetIntArrayRegion(env, status, 0, 1, &zero);
 
-    in_samples = f->nb_samples;
-    if (in_samples < 0 || f->sample_rate <= 0 || f->format < 0 ||
-        !av_channel_layout_check(&f->ch_layout))
-        return AVERROR(EINVAL);
-
-    /* The per-call input budget is decided *before* any configuration work:
-     * configuring allocates libswresample's tables, and a call that is going
-     * to be refused must not pay for them. This is the only check that can
-     * run before the format is even known to be different. */
-    if (in_samples > s->limits.max_in_samples)
-        return FF_PCM_LIMIT_EXCEEDED;
-
-    /* Make an UNSPEC layout definite before comparing, so a decoder that
-     * does not state an order is not mistaken for a format change on every
-     * frame. The frame is documented as exclusively owned by the caller, so
-     * modifying it in place is safe and is what makes the comparison stable. */
-    check = ff_pcm_normalize_layout(&f->ch_layout);
-    if (check < 0)
-        return check;
-
-    /* Format snapshot. A change is a transaction, not an in-place edit:
-     *
-     *   1. if the old context still buffers samples, refuse for now
-     *      (FF_PCM_FORMAT_CHANGE, input untouched) so the caller drains the
-     *      old tail through the old configuration;
-     *   2. once drained, build and validate a new context;
-     *   3. convert this same frame exactly once.
-     *
-     * Reconfiguring immediately would discard the old resampler's tail, and
-     * the caller would have no way to detect the gap. */
-    if (!ff_pcm_format_matches(s, f->format, f->sample_rate, &f->ch_layout)) {
-        if (s->configured && s->swr &&
-            swr_get_delay(s->swr, s->out_rate) > 0)
-            return FF_PCM_FORMAT_CHANGE;
-        check = ff_pcm_configure(s, f->format, f->sample_rate, &f->ch_layout);
-        if (check < 0)
-            return check;
-    }
-
-    /* Remaining limits (output bound, delay, array capacity). The input
-     * check is repeated here for the drain-free path but is now a no-op;
-     * keeping it in one place would mean configuring before checking. */
-    check = ff_pcm_check_call(s, in_samples, outCount,
-                              (*env)->GetArrayLength(env, out));
-    if (check < 0)
-        return check;
-
-    out_ptr = (*env)->GetByteArrayElements(env, out, NULL);
-    if (!out_ptr)
-        return AVERROR(ENOMEM);
-
-    {
-        uint8_t *dst[AV_NUM_DATA_POINTERS] = { (uint8_t *)out_ptr };
-        ret = ff_pcm_convert_internal(s, (const uint8_t *const *)f->data,
-                                      in_samples, dst, outCount, &produced);
-    }
-
-    (*env)->ReleaseByteArrayElements(env, out, out_ptr, 0);
-    if (ret < 0)
-        return ret;
-
-    (*env)->SetIntArrayRegion(env, status, 0, 1, &produced);
+    ret = ff_pcm_convert_jni(env, s, f, out, outCount, &slot);
+    if (!(*env)->ExceptionCheck(env))
+        (*env)->SetIntArrayRegion(env, status, 0, 1, &slot);
     return ret;
 }
 
-/* Emit the buffered tail. Same limits as convert: a drain that could emit
- * more than maxOutSamples is refused rather than silently truncated. */
+/* Emit the buffered tail. Unlike convert this does not refuse on backlog:
+ * draining is how the backlog leaves, and a drain that could only run when the
+ * backlog was already small would be no exit at all. Small blocks are allowed
+ * and are resumable; only a block larger than the array (or than the session's
+ * own cap) is refused. */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_pcmSessionDrain(JNIEnv *env, jobject thiz,
                                              jlong handle, jbyteArray out,
                                              jint outCount, jintArray status)
 {
     FFPcmSession *s = PTR(FFPcmSession *, handle);
-    int produced = 0;
-    int check, ret;
-    jint zero = 0;
-    jbyte *out_ptr;
+    uint8_t *dst[AV_NUM_DATA_POINTERS] = { NULL };
+    int64_t out_capacity, bytes;
+    int produced = 0, room = 0, check, ret = AVERROR(EINVAL);
+    jint slot = 0;
 
-    if (!s || !out || !status)
+    if (!env || !s || !out || !status)
         return AVERROR(EINVAL);
     if ((*env)->GetArrayLength(env, status) < 1)
         return AVERROR(EINVAL);
-    (*env)->SetIntArrayRegion(env, status, 0, 1, &zero);
 
-    /* in_samples == 0: only the delay budget and the output block apply. */
-    check = ff_pcm_check_call(s, 0, outCount,
-                              (*env)->GetArrayLength(env, out));
-    if (check < 0)
-        return check;
+    if (!s->lock_ready)
+        goto publish;
+    pthread_mutex_lock(&s->lock);
 
-    out_ptr = (*env)->GetByteArrayElements(env, out, NULL);
-    if (!out_ptr)
-        return AVERROR(ENOMEM);
-
-    {
-        uint8_t *dst[AV_NUM_DATA_POINTERS] = { (uint8_t *)out_ptr };
-        ret = ff_pcm_convert_internal(s, NULL, 0, dst, outCount, &produced);
+    if (s->phase == FF_PCM_PHASE_POISONED) {
+        ret = AVERROR(EIO);
+        goto done;
     }
 
-    (*env)->ReleaseByteArrayElements(env, out, out_ptr, 0);
-    if (ret < 0)
-        return ret;
+    /* An unconfigured session has nothing to flush: report the tail as
+     * complete instead of passing an uninitialised context to swr, which would
+     * come back as EINVAL and look like a failure. */
+    if (!s->swr || s->phase == FF_PCM_PHASE_EMPTY ||
+        s->phase == FF_PCM_PHASE_DRAINED) {
+        ret = FF_PCM_DRAINED;
+        goto done;
+    }
 
-    (*env)->SetIntArrayRegion(env, status, 0, 1, &produced);
+    out_capacity = (int64_t)(*env)->GetArrayLength(env, out);
+    check = ff_pcm_check_call(s, s->swr, 0, outCount, out_capacity, &room);
+    if (check < 0) {
+        ret = check;
+        goto done;
+    }
+    bytes = ff_jni_audio_bytes(room, s->out_fmt, s->out_layout.nb_channels);
+    if (bytes < 0) {
+        ret = (int)bytes;
+        goto done;
+    }
+    check = ff_pcm_scratch_reserve(s, (uint64_t)bytes);
+    if (check < 0) {
+        ret = check;
+        goto done;
+    }
+
+    dst[0] = s->scratch;
+    ret = ff_pcm_drain_core(s, dst, room, &produced);
+    if (ret >= 0 && produced > 0) {
+        int64_t pub = ff_jni_audio_bytes(produced, s->out_fmt,
+                                         s->out_layout.nb_channels);
+        if (pub < 0 || pub > (int64_t)s->scratch_capacity ||
+            pub > (jsize)INT32_MAX) {
+            s->phase = FF_PCM_PHASE_POISONED;
+            ret = AVERROR(EIO);
+            goto done;
+        }
+        (*env)->SetByteArrayRegion(env, out, 0, (jsize)pub,
+                                   (const jbyte *)s->scratch);
+        if ((*env)->ExceptionCheck(env)) {
+            s->phase = FF_PCM_PHASE_POISONED;
+            ret = AVERROR(EIO);
+            goto done;
+        }
+        slot = produced;
+    }
+
+done:
+    pthread_mutex_unlock(&s->lock);
+publish:
+    if (!(*env)->ExceptionCheck(env))
+        (*env)->SetIntArrayRegion(env, status, 0, 1, &slot);
     return ret;
 }
 
-/* Drop everything buffered, keeping the configured format. Used for a seek
- * or a discontinuity: the old timeline must not bleed into the new one. */
+/* Drop everything buffered and start a new stream. Used for a seek or a
+ * discontinuity: the old timeline must not bleed into the new one.
+ *
+ * Rebuilding the context from the format snapshot is the only way to be sure
+ * the delay really reached zero: re-initialising in place leaves the buffer
+ * contents to the implementation. The output specification never changes, so
+ * the next convert() is not treated as a format change. An existing input
+ * configuration is preserved, which keeps reset cheap for the common seek
+ * case.
+ *
+ * Also the documented way out of POISONED and out of a finished stream: a
+ * session that answered PCM_DRAINED refuses further input until reset. */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_pcmSessionReset(JNIEnv *env, jobject thiz,
                                              jlong handle)
 {
     FFPcmSession *s = PTR(FFPcmSession *, handle);
-    struct SwrContext *rebuilt = NULL;
-    int ret;
+    int ret = 0;
 
-    if (!s)
+    if (!s || !s->lock_ready)
         return AVERROR(EINVAL);
-    if (!s->configured || !s->swr)
-        return 0;              /* nothing buffered, nothing to drop */
 
-    /* Building a fresh context is the only way to be sure the delay really
-     * reached zero: re-initialising in place leaves the buffer contents to
-     * the implementation. The configured format is preserved, so the next
-     * convert() is not treated as a format change. */
-    ret = swr_alloc_set_opts2(&rebuilt, &s->out_layout,
-                              (enum AVSampleFormat)s->out_fmt, s->out_rate,
-                              &s->in_layout,
-                              (enum AVSampleFormat)s->in_fmt, s->in_rate,
-                              0, NULL);
-    if (ret < 0 || !rebuilt) {
-        swr_free(&rebuilt);
-        return ret < 0 ? ret : AVERROR(ENOMEM);
+    pthread_mutex_lock(&s->lock);
+
+    if (s->phase == FF_PCM_PHASE_EMPTY && !s->swr) {
+        /* Nothing buffered, nothing to drop. */
+        pthread_mutex_unlock(&s->lock);
+        return 0;
     }
-    ret = swr_init(rebuilt);
-    if (ret < 0) {
-        swr_free(&rebuilt);
-        return ret;
+
+    if (s->configured && s->in_fmt >= 0 && s->in_rate > 0 &&
+        av_channel_layout_check(&s->in_layout)) {
+        ret = ff_pcm_configure(s, s->in_fmt, s->in_rate, &s->in_layout);
+        if (ret >= 0) {
+            /* ff_pcm_commit() already set ACTIVE; this only makes the
+             * post-condition explicit. */
+            s->phase = FF_PCM_PHASE_ACTIVE;
+            pthread_mutex_unlock(&s->lock);
+            return 0;
+        }
     }
+
+    /* Either there is no usable snapshot to rebuild from, or rebuilding
+     * failed. The buffered timeline is unusable either way: drop the context
+     * and start over from EMPTY rather than leave a half-reset session. */
     swr_free(&s->swr);
-    s->swr = rebuilt;
-    return 0;
+    av_channel_layout_uninit(&s->in_layout);
+    s->configured = 0;
+    s->phase      = FF_PCM_PHASE_EMPTY;
+    pthread_mutex_unlock(&s->lock);
+    return ret;
 }
 
 JNIEXPORT void JNICALL
@@ -2236,6 +2838,12 @@ Java_org_ffmpeg_FFMpegNative_pcmSessionFree(JNIEnv *env, jobject thiz, jlong han
     swr_free(&s->swr);
     av_channel_layout_uninit(&s->in_layout);
     av_channel_layout_uninit(&s->out_layout);
+    av_freep(&s->scratch);
+    s->scratch_capacity = 0;
+    if (s->lock_ready) {
+        pthread_mutex_destroy(&s->lock);
+        s->lock_ready = 0;
+    }
     av_free(s);
 }
 
@@ -6376,12 +6984,19 @@ typedef struct FFOutputSession {
      * never across a lock/post/render call, so a blocked producer cannot
      * block revoke. */
     pthread_mutex_t lock;
+    int lock_ready;
 
     int state;
 
     /* Operations admitted and not yet completed. Incremented under `lock`
      * at admission, decremented on completion. */
     int in_flight;
+
+    /* Serialises the backend calls themselves so two admitted operations
+     * cannot interleave inside ANativeWindow_*. Never taken by revoke or
+     * finish: a stuck driver call must not be able to stall teardown. */
+    pthread_mutex_t exec_lock;
+    int exec_ready;
 
     /* What this session owns, so teardown knows what to release exactly
      * once. Set to NULL when released, which is what makes try_finish()
@@ -6502,6 +7117,155 @@ static int ff_output_session_state(FFOutputSession *s)
     return state;
 }
 
+/* -------------------------------------------------------------- */
+/* Handle registry.                                                */
+/*                                                                */
+/* The opaque long a caller holds used to be the object address,   */
+/* which makes three failures possible: a stale handle can name a  */
+/* recycled allocation, an arbitrary value is dereferenced without */
+/* any check, and Free() has no way to know whether anyone else is */
+/* still inside the object. This registry fixes all three: a token  */
+/* is a slot index plus a generation counter, lookups are atomic    */
+/* against retirement, and every admitted operation holds a         */
+/* reference so the object cannot disappear underneath it.          */
+/* -------------------------------------------------------------- */
+
+typedef struct FFOutputHandle {
+    void *obj;          /* NULL once retired: the slot is reusable */
+    int   refs;         /* creator + every in-flight operation */
+    int   retired;
+} FFOutputHandle;
+
+typedef struct FFOutputRegistry {
+    pthread_mutex_t lock;
+    int             ready;
+    FFOutputHandle  slots[32];
+    int             gens[32];
+} FFOutputRegistry;
+
+static FFOutputRegistry g_output_registry = {
+    PTHREAD_MUTEX_INITIALIZER, 0, { { 0 } }, { 0 }
+};
+
+static void ff_output_registry_init(void)
+{
+    /* PTHREAD_MUTEX_INITIALIZER does the work; this exists so every call
+     * site reads the same, and so a future dynamic setup has one place. */
+    g_output_registry.ready = 1;
+}
+
+/* Allocate a slot and hand back the token. It starts with the creator's
+ * reference; the caller passes it to Java and later calls _put() when it
+ * retires the handle. */
+static FFOutputHandle *ff_output_handle_new(void)
+{
+    int i;
+
+    pthread_mutex_lock(&g_output_registry.lock);
+    for (i = 0; i < 32; i++) {
+        FFOutputHandle *h = &g_output_registry.slots[i];
+
+        if (!h->retired && h->refs == 0) {
+            g_output_registry.gens[i] = (g_output_registry.gens[i] + 1) & 0x7fffff;
+            if (!g_output_registry.gens[i])
+                g_output_registry.gens[i] = 1;
+            h->obj     = NULL;
+            h->refs    = 1;
+            h->retired = 0;
+            pthread_mutex_unlock(&g_output_registry.lock);
+            return h;
+        }
+    }
+    pthread_mutex_unlock(&g_output_registry.lock);
+    return NULL;
+}
+
+static jlong ff_output_handle_encode(FFOutputHandle *h)
+{
+    intptr_t idx = h - g_output_registry.slots;
+    int      gen = g_output_registry.gens[idx];
+
+    return (jlong)((((intptr_t)gen + 1) << 16) | ((idx + 1) << 3));
+}
+
+/* Look a token up and take a reference on success. Returns the slot or NULL
+ * for anything that is not a live token this process issued. */
+static FFOutputHandle *ff_output_handle_acquire(jlong handle, void **obj_out)
+{
+    int idx, gen;
+    FFOutputHandle *h;
+
+    if (obj_out)
+        *obj_out = NULL;
+    if (handle <= 0)
+        return NULL;
+
+    idx = (int)((handle >> 3) & 0x1fff) - 1;
+    gen = (int)((handle >> 16) & 0x7fffff) - 1;
+    if (idx < 0 || idx >= 32)
+        return NULL;
+
+    ff_output_registry_init();
+    pthread_mutex_lock(&g_output_registry.lock);
+    h = &g_output_registry.slots[idx];
+    if (h->retired || h->refs <= 0 || g_output_registry.gens[idx] != gen) {
+        pthread_mutex_unlock(&g_output_registry.lock);
+        return NULL;
+    }
+    h->refs++;
+    if (obj_out)
+        *obj_out = h->obj;
+    pthread_mutex_unlock(&g_output_registry.lock);
+    return h;
+}
+
+/* Drop one reference. The object itself is freed by destroy_fn when the last
+ * reference goes, which is what makes "still in flight" safe: Free() cannot
+ * take the object away from an admitted operation. */
+static void ff_output_handle_put(FFOutputHandle *h)
+{
+    if (!h)
+        return;
+    pthread_mutex_lock(&g_output_registry.lock);
+    if (h->refs > 0)
+        h->refs--;
+    /* The slot becomes reusable by _new() only after both the retirement and
+     * the last reference, so a token can never name a newer object. Objects
+     * are released by their owner, not here. */
+    pthread_mutex_unlock(&g_output_registry.lock);
+}
+
+/* Retire a token so no new lookup can succeed. Existing references keep
+ * working, which is what lets an admitted operation finish safely. */
+static int ff_output_handle_retire(FFOutputHandle *h)
+{
+    if (!h)
+        return AVERROR(EINVAL);
+    pthread_mutex_lock(&g_output_registry.lock);
+    h->retired = 1;
+    pthread_mutex_unlock(&g_output_registry.lock);
+    return 0;
+}
+
+/* Destroy a partially built entry that was never handed to Java. */
+static void ff_output_handle_discard(FFOutputHandle *h, void (*destroy)(void *))
+{
+    if (!h)
+        return;
+    ff_output_handle_retire(h);
+    if (destroy && h->obj)
+        destroy(h->obj);
+    ff_output_handle_put(h);
+}
+
+/* Bind an object to a token before it is published. */
+static void ff_output_handle_bind(FFOutputHandle *h, void *obj)
+{
+    pthread_mutex_lock(&g_output_registry.lock);
+    h->obj = obj;
+    pthread_mutex_unlock(&g_output_registry.lock);
+}
+
 typedef struct FFWindowRenderer {
     ANativeWindow     *win;
     struct SwsContext *sws;
@@ -6509,83 +7273,205 @@ typedef struct FFWindowRenderer {
     int dst_w, dst_h;
     /* Admission control for every operation that touches `win`. */
     FFOutputSession    session;
-    int                session_ready;
+    /* Freed only when the last reference to the handle is dropped: a Free()
+     * racing an admitted render must not free the scaler or the locks. */
+    int                destroy_pending;
+    int                locked;
 } FFWindowRenderer;
+
+/* One admitted window operation. `r` is owned for the duration by the
+ * handle reference taken at admission, so it cannot be freed underneath. */
+typedef struct FFWindowOp {
+    FFWindowRenderer *r;
+    FFOutputHandle   *h;
+} FFWindowOp;
+
+/* Admission: take a handle reference, then bump the session's in-flight
+ * count under the short gate. Either step failing leaves nothing to undo. */
+static int ff_window_op_begin(jlong handle, FFWindowOp *op)
+{
+    void *obj = NULL;
+    FFOutputHandle *h = ff_output_handle_acquire(handle, &obj);
+
+    op->r = NULL;
+    op->h = NULL;
+    if (!h)
+        return AVERROR(EINVAL);
+    if (!obj) {
+        ff_output_handle_put(h);
+        return AVERROR(EINVAL);
+    }
+    if (ff_output_session_enter(&((FFWindowRenderer *)obj)->session) < 0) {
+        ff_output_handle_put(h);
+        return AVERROR(EPERM);
+    }
+    op->r = obj;
+    op->h = h;
+    return 0;
+}
+
+static void ff_window_op_end(FFWindowOp *op)
+{
+    if (!op->r)
+        return;
+    ff_output_session_exit(&op->r->session);
+    ff_output_handle_put(op->h);
+    op->r = NULL;
+    op->h = NULL;
+}
+
+/* Release every resource of a renderer exactly once. Called only when no
+ * operation can still be inside it. */
+static void ff_window_renderer_destroy(FFWindowRenderer *r)
+{
+    if (!r)
+        return;
+    if (r->sws) {
+        sws_freeContext(r->sws);
+        r->sws = NULL;
+    }
+    if (r->session.lock_ready) {
+        pthread_mutex_lock(&r->session.lock);
+        if (r->session.win) {
+            ANativeWindow_release(r->session.win);
+            r->session.win = NULL;
+        }
+        r->win = NULL;
+        pthread_mutex_unlock(&r->session.lock);
+        pthread_mutex_destroy(&r->session.lock);
+        r->session.lock_ready = 0;
+    }
+    if (r->session.exec_ready) {
+        pthread_mutex_destroy(&r->session.exec_lock);
+        r->session.exec_ready = 0;
+    }
+    av_free(r);
+}
+
+/* Free a renderer of which no reference is left. The session lock is not
+ * taken here: if no operation holds a reference, no thread can be inside an
+ * entry point, and the lock may already be gone with the object. */
+static void ff_window_renderer_destroy_void(void *p)
+{
+    ff_window_renderer_destroy(p);
+}
+
+/* Acquire, run, release. The platform work happens under exec_lock so two
+ * admitted operations cannot interleave inside ANativeWindow_*; revoke and
+ * finish never take exec_lock, so a stuck driver call cannot stall teardown.
+ * `fn` must not call back into an entry point that takes the same handle. */
+static int ff_window_op_run(jlong handle, int (*fn)(FFWindowRenderer *, void *),
+                            void *arg)
+{
+    FFWindowOp op;
+    int ret;
+
+    ret = ff_window_op_begin(handle, &op);
+    if (ret < 0)
+        return ret;
+    pthread_mutex_lock(&op.r->session.exec_lock);
+    ret = fn(op.r, arg);
+    pthread_mutex_unlock(&op.r->session.exec_lock);
+    ff_window_op_end(&op);
+    return ret;
+}
 
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererCreate(JNIEnv *env, jobject thiz, jobject surface)
 {
+    ANativeWindow *win;
+    FFWindowRenderer *r;
+    FFOutputHandle *h;
+
     if (!surface)
         return 0;
-    ANativeWindow *win = ANativeWindow_fromSurface(env, surface);
+    /* Kept for the Surface lookup, which needs a JNIEnv. */
+    win = ANativeWindow_fromSurface(env, surface);
     if (!win)
         return 0;
-    FFWindowRenderer *r = av_mallocz(sizeof(*r));
+
+    ff_output_registry_init();
+    h = ff_output_handle_new();
+    r = h ? av_mallocz(sizeof(*r)) : NULL;
     if (!r) {
+        ff_output_handle_discard(h, NULL);
         ANativeWindow_release(win);
         return 0;
     }
     if (pthread_mutex_init(&r->session.lock, NULL) != 0) {
         ANativeWindow_release(win);
         av_free(r);
+        ff_output_handle_discard(h, NULL);
         return 0;
     }
-    r->win = win;
+    r->session.lock_ready = 1;
+    if (pthread_mutex_init(&r->session.exec_lock, NULL) != 0) {
+        ANativeWindow_release(win);
+        pthread_mutex_destroy(&r->session.lock);
+        av_free(r);
+        ff_output_handle_discard(h, NULL);
+        return 0;
+    }
+    r->session.exec_ready = 1;
+    r->win     = win;
     r->src_fmt = AV_PIX_FMT_NONE;
-    r->session.win   = win;
-    r->session.state = FF_OUTPUT_ACTIVE;
+    r->session.win       = win;
+    r->session.state     = FF_OUTPUT_ACTIVE;
     r->session.in_flight = 0;
-    r->session_ready = 1;
-    return (jlong)(intptr_t)r;
+
+    ff_output_handle_bind(h, r);
+    return ff_output_handle_encode(h);
 }
 
 /* Every window operation goes through admission. A revoked session admits
  * nothing even if the caller still holds the handle: that is what stops an
  * old binding from being used with a new Surface's authority. */
+typedef struct FFWindowSizeArgs {
+    int width, height;
+} FFWindowSizeArgs;
+
+static int ff_window_renderer_do_set_size(FFWindowRenderer *r, void *arg)
+{
+    FFWindowSizeArgs *a = arg;
+
+    if (!r->win)
+        return AVERROR(EINVAL);
+    return ANativeWindow_setBuffersGeometry(r->win, a->width, a->height,
+                                            WINDOW_FORMAT_RGBA_8888) == 0
+           ? 0 : AVERROR_EXTERNAL;
+}
+
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererSetSize(JNIEnv *env, jobject thiz,
                                                    jlong handle, jint width, jint height)
 {
-    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
-    int ret;
+    FFWindowSizeArgs a;
 
-    if (!r || !r->win || width <= 0 || height <= 0)
+    if (width <= 0 || height <= 0)
         return AVERROR(EINVAL);
-    ret = ff_output_session_enter(&r->session);
-    if (ret < 0)
-        return ret;
-
-    ret = ANativeWindow_setBuffersGeometry(r->win, width, height,
-                                           WINDOW_FORMAT_RGBA_8888);
-    ff_output_session_exit(&r->session);
-    return ret == 0 ? 0 : AVERROR_EXTERNAL;
+    a.width  = width;
+    a.height = height;
+    return ff_window_op_run(handle, ff_window_renderer_do_set_size, &a);
 }
 
-JNIEXPORT jint JNICALL
-Java_org_ffmpeg_FFMpegNative_windowRendererRender(JNIEnv *env, jobject thiz,
-                                                  jlong handle, jlong frame)
-{
-    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
-    AVFrame *f = PTR(AVFrame *, frame);
-    ANativeWindow_Buffer buf;
-    int ret, scaled;
+typedef struct FFWindowRenderArgs {
+    AVFrame *frame;
+} FFWindowRenderArgs;
 
-    if (!r || !r->win || !f || f->width <= 0 || f->height <= 0)
+static int ff_window_renderer_do_render(FFWindowRenderer *r, void *arg)
+{
+    FFWindowRenderArgs *a = arg;
+    AVFrame *f = a->frame;
+    ANativeWindow_Buffer buf;
+    int scaled;
+
+    if (!r->win || !f || f->width <= 0 || f->height <= 0)
         return AVERROR(EINVAL);
 
-    /* Admission wraps the whole lock/scale/post sequence: revoke must wait
-     * for exactly this window to close before it may release the handle. */
-    ret = ff_output_session_enter(&r->session);
-    if (ret < 0)
-        return ret;
-
-    if (ANativeWindow_lock(r->win, &buf, NULL) != 0) {
-        ff_output_session_exit(&r->session);
+    if (ANativeWindow_lock(r->win, &buf, NULL) != 0)
         return AVERROR_EXTERNAL;
-    }
     if (!buf.bits || buf.width <= 0 || buf.height <= 0) {
         ANativeWindow_unlockAndPost(r->win);
-        ff_output_session_exit(&r->session);
         return AVERROR_EXTERNAL;
     }
 
@@ -6597,7 +7483,6 @@ Java_org_ffmpeg_FFMpegNative_windowRendererRender(JNIEnv *env, jobject thiz,
                                       SWS_BILINEAR, NULL, NULL, NULL);
         if (!r->sws) {
             ANativeWindow_unlockAndPost(r->win);
-            ff_output_session_exit(&r->session);
             return AVERROR(ENOMEM);
         }
         r->src_w   = f->width;
@@ -6611,14 +7496,27 @@ Java_org_ffmpeg_FFMpegNative_windowRendererRender(JNIEnv *env, jobject thiz,
     uint8_t *dst_data[4] = { (uint8_t *)buf.bits, NULL, NULL, NULL };
     int dst_linesize[4]  = { buf.stride * 4, 0, 0, 0 };
     const uint8_t *src_data[4];
-    for (int i = 0; i < 4; i++)
+    int i;
+
+    for (i = 0; i < 4; i++)
         src_data[i] = f->data[i];
 
     scaled = sws_scale(r->sws, src_data, f->linesize, 0, f->height,
                        dst_data, dst_linesize);
     ANativeWindow_unlockAndPost(r->win);
-    ff_output_session_exit(&r->session);
     return scaled > 0 ? 0 : AVERROR_EXTERNAL;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_windowRendererRender(JNIEnv *env, jobject thiz,
+                                                  jlong handle, jlong frame)
+{
+    FFWindowRenderArgs a;
+
+    a.frame = PTR(AVFrame *, frame);
+    if (!a.frame)
+        return AVERROR(EINVAL);
+    return ff_window_op_run(handle, ff_window_renderer_do_render, &a);
 }
 
 /* Begin unbinding. Returns the number of operations still admitted (>= 0)
@@ -6627,24 +7525,45 @@ Java_org_ffmpeg_FFMpegNative_windowRendererRender(JNIEnv *env, jobject thiz,
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererRevoke(JNIEnv *env, jobject thiz, jlong handle)
 {
-    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+    void *obj = NULL;
+    FFOutputHandle *h = ff_output_handle_acquire(handle, &obj);
+    int ret;
 
-    if (!r || !r->session_ready)
+    if (!h || !obj) {
+        ff_output_handle_put(h);
         return AVERROR(EINVAL);
-    return ff_output_session_revoke(&r->session);
+    }
+    ret = ff_output_session_revoke(&((FFWindowRenderer *)obj)->session);
+    ff_output_handle_put(h);
+    return ret;
 }
 
 /* Try to complete teardown; returns an FF_OUTPUT_* state. DETACHED means the
- * in-flight count reached zero and the window handle is gone: at that point
- * no admitted operation can still touch the Surface. */
+ * session was revoked, no operation is admitted and the window reference has
+ * been released: no admitted operation can still touch the Surface. */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererFinish(JNIEnv *env, jobject thiz, jlong handle)
 {
-    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+    void *obj = NULL;
+    FFOutputHandle *h = ff_output_handle_acquire(handle, &obj);
+    int ret;
 
-    if (!r || !r->session_ready)
+    if (!h || !obj) {
+        ff_output_handle_put(h);
         return FF_OUTPUT_CLOSED;
-    return ff_output_session_try_finish(&r->session);
+    }
+    ret = ff_output_session_try_finish(&((FFWindowRenderer *)obj)->session);
+    if (ret == FF_OUTPUT_DETACHED) {
+        /* The window handle is gone; clear the renderer's alias so a later
+         * destroy cannot release it a second time. */
+        FFWindowRenderer *r = obj;
+
+        pthread_mutex_lock(&r->session.lock);
+        r->win = NULL;
+        pthread_mutex_unlock(&r->session.lock);
+    }
+    ff_output_handle_put(h);
+    return ret;
 }
 
 /* Give up on proving teardown. The session is unusable afterwards and must
@@ -6653,68 +7572,82 @@ Java_org_ffmpeg_FFMpegNative_windowRendererFinish(JNIEnv *env, jobject thiz, jlo
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererQuarantine(JNIEnv *env, jobject thiz, jlong handle)
 {
-    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+    void *obj = NULL;
+    FFOutputHandle *h = ff_output_handle_acquire(handle, &obj);
+    int ret;
 
-    if (!r || !r->session_ready)
+    if (!h || !obj) {
+        ff_output_handle_put(h);
         return AVERROR(EINVAL);
-    return ff_output_session_quarantine(&r->session);
+    }
+    ret = ff_output_session_quarantine(&((FFWindowRenderer *)obj)->session);
+    ff_output_handle_put(h);
+    return ret;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererGetState(JNIEnv *env, jobject thiz, jlong handle)
 {
-    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+    void *obj = NULL;
+    FFOutputHandle *h = ff_output_handle_acquire(handle, &obj);
+    int ret;
 
-    if (!r || !r->session_ready)
+    if (!h || !obj) {
+        ff_output_handle_put(h);
         return FF_OUTPUT_CLOSED;
-    return ff_output_session_state(&r->session);
+    }
+    ret = ff_output_session_state(&((FFWindowRenderer *)obj)->session);
+    ff_output_handle_put(h);
+    return ret;
 }
 
-/* Free the renderer. The window is only released here when teardown was
- * never attempted or already completed; if operations are still in flight
- * the handle is leaked on purpose -- see ff_output_session_quarantine(). */
+/* Free the renderer. Retires the handle first so no new operation can start;
+ * then, only if nothing is in flight and the window reference is already
+ * released, destroys it. Otherwise the object is retained for the last
+ * admitted operation to release, which is what stops Free() from pulling the
+ * scaler, the window or the locks out from under a live producer. */
 JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererFree(JNIEnv *env, jobject thiz, jlong handle)
 {
-    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
-    int state, in_flight;
+    void *obj = NULL;
+    FFOutputHandle *h = ff_output_handle_acquire(handle, &obj);
+    FFWindowRenderer *r = obj;
+    int rc;
 
-    if (!r)
+    if (!h) {
+        /* Never issued, or already freed: nothing to do rather than a
+         * dereference of an arbitrary value. */
         return;
-    if (r->sws)
-        sws_freeContext(r->sws);
-
-    if (r->session_ready) {
-        state     = ff_output_session_state(&r->session);
-        in_flight = ff_output_session_in_flight(&r->session);
-        if (in_flight == 0) {
-            /* Safe: nothing can still be inside a window call. */
-            pthread_mutex_lock(&r->session.lock);
-            if (r->session.win) {
-                ANativeWindow_release(r->session.win);
-                r->session.win = NULL;
-            }
-            r->win = NULL;
-            r->session.state = FF_OUTPUT_CLOSED;
-            pthread_mutex_unlock(&r->session.lock);
-        } else {
-            /* Releasing now would free a window a producer may still be
-             * posting to. Leak it, and start the session no further work. */
-            av_log(NULL, AV_LOG_ERROR,
-                   "windowRendererFree: %d operation(s) still in flight "
-                   "(state %d); leaking the window handle to avoid a "
-                   "use-after-free\n", in_flight, state);
-            pthread_mutex_lock(&r->session.lock);
-            r->session.win = NULL;
-            r->session.state = FF_OUTPUT_QUARANTINED;
-            r->win = NULL;
-            pthread_mutex_unlock(&r->session.lock);
-        }
-        pthread_mutex_destroy(&r->session.lock);
-    } else if (r->win) {
-        ANativeWindow_release(r->win);
     }
-    av_free(r);
+    if (!r) {
+        ff_output_handle_put(h);
+        return;
+    }
+
+    /* No new admission from here on, whatever state the session was in. */
+    ff_output_handle_retire(h);
+    ff_output_session_revoke(&r->session);
+
+    rc = ff_output_session_try_finish(&r->session);
+    if (rc == FF_OUTPUT_DETACHED) {
+        pthread_mutex_lock(&r->session.lock);
+        r->win = NULL;
+        pthread_mutex_unlock(&r->session.lock);
+        /* The creator reference is still ours, so this is the last one. */
+        ff_window_renderer_destroy(r);
+    } else {
+        /* Retained whole: scaler, window and locks stay until the last
+         * admitted operation drops its reference. Reporting otherwise would
+         * be a claim the bridge cannot back up. */
+        av_log(NULL, AV_LOG_WARNING,
+               "windowRendererFree: teardown not proven (state %d, %d in "
+               "flight); retaining the whole renderer until it drains\n",
+               rc, ff_output_session_in_flight(&r->session));
+        pthread_mutex_lock(&r->session.lock);
+        r->destroy_pending = 1;
+        pthread_mutex_unlock(&r->session.lock);
+    }
+    ff_output_handle_put(h);
 }
 
 /* ------------------------------------------------------------------ */

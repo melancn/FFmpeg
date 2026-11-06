@@ -110,8 +110,17 @@ public final class FFMpegNative {
     /** Bridge contract major version implemented by this JAR. */
     public static final int BRIDGE_API_MAJOR = 1;
 
-    /** Bridge contract minor version implemented by this JAR. */
-    public static final int BRIDGE_API_MINOR = 1;
+    /**
+     * Bridge contract minor version implemented by this JAR.
+     *
+     * <p>1.2 changes no signature, parameter width, return type or AVERROR
+     * convention. It fixes error paths in the PCM session and the window
+     * renderer and adds {@link #CAP_PCM_SESSION_SAFE_V2} /
+     * {@link #CAP_RENDERER_SAFE_CLOSE}. One safety narrowing is worth
+     * repeating here: {@link #pcmSessionCreate} now refuses a planar output
+     * sample format instead of writing it as if it were interleaved.
+     */
+    public static final int BRIDGE_API_MINOR = 2;
 
     /** {@code major << 16 | minor}; first release is {@code 0x00010000}. */
     public static final int BRIDGE_API_VERSION = (BRIDGE_API_MAJOR << 16) | BRIDGE_API_MINOR;
@@ -144,6 +153,47 @@ public final class FFMpegNative {
      * @see #pcmSessionCreate
      */
     public static final long CAP_BOUNDED_PCM_RESAMPLE = 1L << 4;
+
+    /**
+     * The PCM session obeys its 1.2 contract: input planes are read through
+     * the frame's full plane list, {@link #PCM_DRAINED} is only reported after
+     * a completed flush (never derived from a non-zero internal delay), a
+     * format change is refused until the old tail is drained and then commits
+     * exactly once, and bytes are copied into {@code out} only after the
+     * conversion has succeeded.
+     *
+     * <p>Check this bit before relying on any of that; a 1.1 library still
+     * answers {@link #CAP_BOUNDED_PCM_RESAMPLE} but can answer
+     * {@link #PCM_NEED_DRAIN} forever on an undersized block.
+     */
+    public static final long CAP_PCM_SESSION_SAFE_V2 = 1L << 5;
+
+    /**
+     * The window renderer obeys its 1.2 close contract: {@link
+     * #windowRendererFree} retains the whole renderer (scaler, window and
+     * locks) while an operation is admitted instead of freeing part of it,
+     * handles are registry-checked and become unusable after Free, and
+     * {@link #windowRendererFinish} reports {@link #OUTPUT_SESSION_DETACHED}
+     * only after the platform window has been released exactly once.
+     */
+    public static final long CAP_RENDERER_SAFE_CLOSE = 1L << 6;
+
+    /**
+     * Reserved for per-output-instance hardware buffer accounting. Not
+     * implemented by this build and deliberately never returned:
+     * {@link #mediasurfaceGetOutstandingBuffers} is a process-wide counter
+     * and is not evidence about a single output session.
+     *
+     * <p>Deferred by decision, not by omission. Closing it needs two things
+     * this bridge cannot provide on its own: a way to read the decoder's
+     * own hardware-frame count (private to libavcodec, with no exported
+     * accessor) and sole ownership of the codec's lifetime (which
+     * {@link #codecFreeContext} on a raw pointer cannot enforce). Until both
+     * exist, the parallel hardware-decode restriction stands: do not run two
+     * FFmpeg MediaCodec outputs at once, and do not read a zero outstanding
+     * count as proof that every underlying reference is gone.
+     */
+    public static final long CAP_CODEC_SCOPED_BUFFER_ACCOUNTING = 1L << 7;
 
     /**
      * Number of elements {@link #packetGetBudgetInfo} requires in its output
@@ -1278,13 +1328,23 @@ public final class FFMpegNative {
     /* Protocol: revoke -> poll finish until DETACHED -> free.             */
     /* If your deadline expires first, call quarantine, then free. Never   */
     /* treat a timeout as DETACHED, and never rebind a quarantined handle. */
+    /*                                                                     */
+    /* What DETACHED does NOT mean: the bridge never blocks inside         */
+    /* ANativeWindow_lock()/post or a MediaCodec call on your behalf, so   */
+    /* no poll count, sleep interval or watchdog in this layer can turn an  */
+    /* uncancellable platform call into a bounded exit. A timeout is        */
+    /* QUARANTINED, and a quarantined session keeps its resources.          */
     /* ------------------------------------------------------------------ */
 
     /** Session accepts work. */
     public static final int OUTPUT_SESSION_ACTIVE = 0;
     /** Revoked: no new work is admitted; admitted work is draining. */
     public static final int OUTPUT_SESSION_REVOKING = 1;
-    /** In-flight count reached zero and the handle is released. */
+    /**
+     * Revoked, no operation is admitted any more, and the platform window
+     * reference has been released exactly once. Nothing this renderer still
+     * does can touch the old Surface.
+     */
     public static final int OUTPUT_SESSION_DETACHED = 2;
     /** Teardown could not be proven; the handle is unusable and must be dropped. */
     public static final int OUTPUT_SESSION_QUARANTINED = 3;
@@ -1294,25 +1354,32 @@ public final class FFMpegNative {
     /**
      * Stop admitting work and begin unbinding.
      *
+     * <p>Returns immediately: it never waits for admitted work. An operation
+     * already inside the driver cannot be interrupted from this layer, so
+     * waiting here would only mean waiting on a timeout.
+     *
      * @return the number of operations still in flight (>= 0), or a negative
-     *         AVERROR. Poll {@link #windowRendererFinish} until it returns
-     *         {@link #OUTPUT_SESSION_DETACHED}.
+     *         AVERROR (including {@code EINVAL} for a handle that was never
+     *         issued or is already freed). Poll {@link #windowRendererFinish}
+     *         until it returns {@link #OUTPUT_SESSION_DETACHED}.
      */
     public native int windowRendererRevoke(long handle);
 
     /**
      * Attempt to complete teardown without waiting.
      *
-     * @return an {@code OUTPUT_SESSION_*} state. {@link #OUTPUT_SESSION_DETACHED}
-     *         means the in-flight count reached zero and nothing can still
-     *         touch the Surface.
+     * @return an {@code OUTPUT_SESSION_*} state.
+     *         {@link #OUTPUT_SESSION_DETACHED} means all three of: the session
+     *         was revoked, no operation is admitted, and the window reference
+     *         has been released. It is never returned because a poll budget
+     *         ran out.
      */
     public native int windowRendererFinish(long handle);
 
     /**
      * Abandon teardown. The handle becomes unusable and must not be reused
-     * or rebound; freeing it will deliberately leak the platform handle
-     * rather than risk freeing one a producer may still be posting to.
+     * or rebound. Quarantine refuses reuse; it does not authorise freeing
+     * anything a producer may still be using.
      *
      * @return the number of operations still in flight, for diagnostics
      */
@@ -1324,8 +1391,15 @@ public final class FFMpegNative {
     /**
      * Release the renderer, its scaler, and the underlying window reference.
      *
-     * <p>If operations are still in flight, the window handle is leaked on
-     * purpose instead of being freed under a live producer.
+     * <p>Retires the handle first, so no new operation can start. If an
+     * operation is still admitted, it does <em>not</em> free the scaler, the
+     * window, the locks or the object: the whole renderer is retained until
+     * the last admitted call returns, then released. Calling Free twice, or
+     * with a handle that was already freed, is a no-op.
+     *
+     * <p>Calling Free without revoking first is supported (it revokes
+     * internally), but it gives you no chance to observe
+     * {@link #OUTPUT_SESSION_DETACHED}; prefer the full protocol.
      */
     public native void windowRendererFree(long handle);
 
@@ -1701,13 +1775,26 @@ public final class FFMpegNative {
     /**
      * All input was taken but nothing could be emitted yet (a filter that
      * needs look-ahead). Advance your input cursor and feed the next frame.
+     *
+     * <p>A zero-sample frame is not EOF: converting one returns this status
+     * with {@code status[0] == 0}, and it never flushes the session.
      */
     public static final int PCM_INPUT_CONSUMED = 1;
 
-    /** Samples remain buffered inside the session; call {@link #pcmSessionDrain}. */
+    /**
+     * Retained for numeric compatibility only. A synchronous drain reports
+     * progress as {@link #PCM_OUTPUT_READY} / {@link #PCM_DRAINED}, and
+     * {@link #pcmSessionConvert} never returns this: a drain is no longer
+     * driven by polling an internal delay figure.
+     */
     public static final int PCM_NEED_DRAIN = 2;
 
-    /** Nothing is buffered: the tail is complete for the current format. */
+    /**
+     * The tail is complete. Only {@link #pcmSessionDrain} reports this, and
+     * only after an empty-input flush actually returned no samples; an empty
+     * or already-finished session reports it without touching the resampler.
+     * {@code status[0]} is 0 in that case.
+     */
     public static final int PCM_DRAINED = 3;
 
     /**
@@ -1745,13 +1832,23 @@ public final class FFMpegNative {
      * <p>These bound samples in flight and buffers handed out; they are
      * <em>not</em> a hard cap on process memory. libswresample allocates its
      * filter tables and delay line inside {@code swr_init()}, before any
-     * sample-count check can run. Budget the Java-side copies and the owner's
+     * sample-count check can run, and the bridge keeps its own staging buffer
+     * (at most 4 MiB, reused across calls) to publish results only after a
+     * conversion succeeds. Budget the Java-side copies and the owner's
      * copies separately.
      *
-     * @param outFmt           {@code AV_SAMPLE_FMT_*} of the output
+     * <p><b>Output must be interleaved.</b> {@code outFmt} may not be a
+     * planar format: the single {@code byte[]} entry points have no way to
+     * express a plane layout, and a planar format is refused (0 returned)
+     * rather than written as if it were packed. This is a deliberate
+     * narrowing in 1.2; convert to packed on the caller side or use the
+     * frame-based {@code swrConvert} path if planar output is needed.
+     *
+     * @param outFmt           {@code AV_SAMPLE_FMT_*} of the output, packed
      * @param outRate          output sample rate in Hz
      * @param outLayoutMask    {@code AV_CH_LAYOUT_*} of the output
-     * @param maxOutSamples    per-call output limit, per channel
+     * @param maxOutSamples    per-call output limit, per channel; also
+     *                         bounded by the bridge staging ceiling
      * @param maxInSamples     per-call input limit, per channel
      * @param maxDelaySamples  internal backlog limit, in output samples
      * @return session handle, or 0 on invalid arguments
@@ -1765,17 +1862,32 @@ public final class FFMpegNative {
     /**
      * Convert one frame into {@code out}.
      *
-     * <p>{@code outCount} is the output capacity in samples per channel;
-     * {@code out} must hold {@code outCount * outChannels *
-     * bytesPerSample(outFmt)} bytes, and that is checked before converting.
+     * <p>{@code outCount} is the output capacity in samples per channel, and
+     * a request, not a promise: the array's real length is what limits the
+     * call. {@code out} must hold {@code outCount * outChannels *
+     * bytesPerSample(outFmt)} bytes; a shorter array is refused before the
+     * resampler runs.
+     *
+     * <p>All input sample count, rate, format and channel layout are read
+     * from {@code frame} for this call. A planar frame is read through its
+     * full plane list, so multi-channel planar input works beyond the eight
+     * inline plane pointers.
      *
      * <p>{@code status[0]} receives the number of output samples written (0
      * on any failure, including a refusal). The return value says what
      * happened, see the {@code PCM_*} constants.
      *
-     * @return a {@code PCM_*} status, or a negative AVERROR (including
-     *         {@code AVERROR(ENOSPC)} for a limit refusal, where the input is
-     *         guaranteed unconsumed)
+     * <p><b>Retry contract.</b> Negative returns fall into two groups. A
+     * refusal that happens before conversion ({@code EINVAL},
+     * {@code ENOMEM} for an undersized array, {@code ENOSPC} for a session
+     * limit, {@code EOVERFLOW}) leaves the input unconsumed, so the frame may
+     * be presented again with corrected arguments. A failure after
+     * conversion started, including a failure to publish into {@code out},
+     * leaves the session unusable ({@code EIO}); call
+     * {@link #pcmSessionReset} or {@link #pcmSessionFree} and do not replay
+     * the frame.
+     *
+     * @return a {@code PCM_*} status, or a negative AVERROR
      */
     public native int pcmSessionConvert(long handle, long frame,
                                         byte[] out, int outCount,
@@ -1784,19 +1896,33 @@ public final class FFMpegNative {
     /**
      * Emit the buffered tail into {@code out}.
      *
-     * <p>Obeys the same limits as {@link #pcmSessionConvert}: a drain that
-     * could emit more than {@code maxOutSamples} is refused rather than
-     * truncated. Returns {@link #PCM_DRAINED} when the tail is complete.
+     * <p>This is the only way a stream ends. Each call flushes with empty
+     * input; a non-empty result means more tail is left, and an empty result
+     * means the tail is complete and {@link #PCM_DRAINED} is reported with
+     * {@code status[0] == 0}.
+     *
+     * <p>Small blocks are the intended use: the flush is resumable, so
+     * {@code outCount} does not have to hold the whole tail, and a large
+     * backlog never prevents draining. An unconfigured or already-finished
+     * session reports {@link #PCM_DRAINED} without touching the resampler.
+     *
+     * <p>Drain does not obey {@code maxDelaySamples} (it is the way the
+     * backlog is removed), but it does obey the output block limits.
      */
     public native int pcmSessionDrain(long handle, byte[] out, int outCount,
                                       int[] status);
 
     /**
-     * Drop everything buffered, keeping the configured format.
+     * Drop everything buffered and start a new stream.
      *
-     * <p>For a seek or a discontinuity. Do not use it to retry a format
-     * change: the old timeline must not bleed into the new one, and mixing
-     * the two would make a gap indistinguishable from a reset.
+     * <p>For a seek or a discontinuity: the old timeline must not bleed into
+     * the new one. Do not use it to retry a format change (drain instead) and
+     * do not use it to recover from a mid-conversion failure expecting the
+     * old samples back. The output format never changes; a previously
+     * configured input format is rebuilt from the snapshot, so the next
+     * convert is not treated as a format change.
+     *
+     * <p>Also the only way to feed input again after {@link #PCM_DRAINED}.
      *
      * @return 0, or negative AVERROR
      */
