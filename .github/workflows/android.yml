@@ -495,7 +495,9 @@ jobs:
                      packetGetBudgetInfo frameNormalizeChannelLayout \
                      channelLayoutNormalizeMask pcmSessionCreate \
                      pcmSessionConvert pcmSessionDrain pcmSessionReset \
-                     pcmSessionFree; do
+                     pcmSessionFree windowRendererRevoke windowRendererFinish \
+                     windowRendererQuarantine windowRendererGetState \
+                     mediasurfaceGetOutstandingBuffers; do
             grep -qx "Java_org_ffmpeg_FFMpegNative_$sym" /tmp/implemented_jni.txt || {
               echo "::error::bridge contract entry point missing: $sym"
               exit 1

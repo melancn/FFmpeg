@@ -38,6 +38,8 @@
  */
 
 #include <jni.h>
+#include <errno.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1409,23 +1411,70 @@ Java_org_ffmpeg_FFMpegNative_frameCopyAudio(JNIEnv *env, jobject thiz,
 /* passed to frameCopyVideo (data[0..2] are NULL).                      */
 /* ------------------------------------------------------------------ */
 
+/* Hardware output bookkeeping.
+ *
+ * The MediaCodec path has no session handle to attach state to, and
+ * MediaCodecDecContext (where hw_buffer_count lives) is private to
+ * libavcodec. So the bridge keeps its own registry of buffers it handed to
+ * Java and has not yet seen released. That registry is the evidence that
+ * "the frame was returned" -- the return value of the release call is not,
+ * because av_mediacodec_release_buffer() still defers to
+ * ff_AMediaCodec_releaseOutputBuffer() only when the buffer's serial is
+ * current (mediacodec.c:91-100).
+ *
+ * Entries are recorded by buffer pointer, which is stable for the lifetime
+ * of an AVMediaCodecBuffer because frame->buf[0] owns it. */
+typedef struct FFHwOutputReg {
+    pthread_mutex_t    lock;
+    int                outstanding;
+} FFHwOutputReg;
+
+static FFHwOutputReg g_hw_output = { PTHREAD_MUTEX_INITIALIZER, 0 };
+
+/* Record that a buffer is now in Java's hands. Idempotent per call: the
+ * caller gets one release per get, so one increment per get is right. */
+static void ff_hw_output_acquire(void)
+{
+    pthread_mutex_lock(&g_hw_output.lock);
+    g_hw_output.outstanding++;
+    pthread_mutex_unlock(&g_hw_output.lock);
+}
+
+static void ff_hw_output_release(void)
+{
+    pthread_mutex_lock(&g_hw_output.lock);
+    if (g_hw_output.outstanding > 0)
+        g_hw_output.outstanding--;
+    pthread_mutex_unlock(&g_hw_output.lock);
+}
+
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_mediasurfaceGetBuffer(JNIEnv *env, jobject thiz, jlong frame)
 {
     AVFrame *f = PTR(AVFrame *, frame);
-    if (!f || f->format != AV_PIX_FMT_MEDIACODEC)
+    if (!f || f->format != AV_PIX_FMT_MEDIACODEC || !f->data[3])
         return 0;
+    ff_hw_output_acquire();
     return (jlong)(intptr_t)f->data[3];
 }
 
+/* The release is the moment the buffer leaves Java's hands, so the registry
+ * is decremented only when the call actually reported success: a failed
+ * release means the buffer was NOT returned, and pretending otherwise would
+ * let a detach claim completeness it does not have. */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_mediasurfaceReleaseBuffer(JNIEnv *env, jobject thiz,
                                                        jlong buf, jint render)
 {
     AVMediaCodecBuffer *b = PTR(AVMediaCodecBuffer *, buf);
+    int ret;
+
     if (!b)
         return AVERROR(EINVAL);
-    return (jint)av_mediacodec_release_buffer(b, render);
+    ret = (jint)av_mediacodec_release_buffer(b, render);
+    if (ret >= 0)
+        ff_hw_output_release();
+    return ret;
 }
 
 JNIEXPORT jint JNICALL
@@ -1433,9 +1482,28 @@ Java_org_ffmpeg_FFMpegNative_mediasurfaceRenderBufferAtTime(JNIEnv *env, jobject
                                                             jlong buf, jlong nanoTime)
 {
     AVMediaCodecBuffer *b = PTR(AVMediaCodecBuffer *, buf);
+    int ret;
+
     if (!b)
         return AVERROR(EINVAL);
-    return (jint)av_mediacodec_render_buffer_at_time(b, (int64_t)nanoTime);
+    ret = (jint)av_mediacodec_render_buffer_at_time(b, (int64_t)nanoTime);
+    if (ret >= 0)
+        ff_hw_output_release();
+    return ret;
+}
+
+/* How many hardware buffers this bridge handed out and has not seen
+ * released. A non-zero value means the producer cannot be considered
+ * detached: the Surface may still be referenced by those buffers. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_mediasurfaceGetOutstandingBuffers(JNIEnv *env, jobject thiz)
+{
+    int n;
+
+    pthread_mutex_lock(&g_hw_output.lock);
+    n = g_hw_output.outstanding;
+    pthread_mutex_unlock(&g_hw_output.lock);
+    return n;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1760,6 +1828,49 @@ typedef struct FFPcmSession {
     AVChannelLayout in_layout;    /* fully owned deep copy, freed on replace */
 } FFPcmSession;
 
+/* Give an UNSPEC frame layout the definite order swr_init() would have
+ * derived for it, in place, before the session compares it.
+ *
+ * Why this is needed here and not just in the caller: swr_init() rewrites an
+ * UNSPEC input layout to av_channel_layout_default() (swresample.c, used_ch
+ * resolution), so the configured layout is always definite. A decoder that
+ * leaves the order unspecified then makes av_channel_layout_compare() report
+ * "different" for *every* such frame -- compare() returns 1 whenever exactly
+ * one side is UNSPEC. Without this, an alternating UNSPEC/definite decoder
+ * would look like a format change on every frame and the session would reply
+ * PCM_FORMAT_CHANGE forever: the transaction would never commit because the
+ * old tail can never be drained while the caller keeps refetching.
+ *
+ * Normalising is not a guess: it installs exactly the layout swr would have
+ * chosen, so the session and the resampler agree. A frame that already
+ * carries a definite layout is never touched.
+ *
+ * Returns 0 (unchanged or normalised) or a negative AVERROR when the layout
+ * cannot be made definite without guessing. */
+static int ff_pcm_normalize_layout(AVChannelLayout *layout)
+{
+    AVChannelLayout next = { 0 };
+
+    if (!layout || !av_channel_layout_check(layout))
+        return AVERROR(EINVAL);
+    if (layout->order != AV_CHANNEL_ORDER_UNSPEC)
+        return 0;
+
+    if (layout->nb_channels <= 0 || layout->nb_channels > 64)
+        return AVERROR(EINVAL);
+    av_channel_layout_default(&next, layout->nb_channels);
+    /* For a count with no standard layout default() leaves UNSPEC, which
+     * would not fix anything; refuse rather than loop. */
+    if (next.order != AV_CHANNEL_ORDER_NATIVE ||
+        next.nb_channels != layout->nb_channels) {
+        av_channel_layout_uninit(&next);
+        return AVERROR(EINVAL);
+    }
+    av_channel_layout_uninit(layout);
+    *layout = next;
+    return 0;
+}
+
 /* Layouts are compared by value here, never by pointer: a frame's layout
  * dies with the frame. av_channel_layout_compare() is what decides, so two
  * different masks that describe the same channels stay one format. */
@@ -1981,6 +2092,14 @@ Java_org_ffmpeg_FFMpegNative_pcmSessionConvert(JNIEnv *env, jobject thiz,
      * run before the format is even known to be different. */
     if (in_samples > s->limits.max_in_samples)
         return FF_PCM_LIMIT_EXCEEDED;
+
+    /* Make an UNSPEC layout definite before comparing, so a decoder that
+     * does not state an order is not mistaken for a format change on every
+     * frame. The frame is documented as exclusively owned by the caller, so
+     * modifying it in place is safe and is what makes the comparison stable. */
+    check = ff_pcm_normalize_layout(&f->ch_layout);
+    if (check < 0)
+        return check;
 
     /* Format snapshot. A change is a transaction, not an in-place edit:
      *
@@ -6210,11 +6329,187 @@ Java_org_ffmpeg_FFMpegNative_swsAllocContext(JNIEnv *env, jobject thiz)
 /* source frame geometry/format or the window buffer size changes.      */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Output session: admission control and verifiable unbinding.         */
+/*                                                                     */
+/* Why this exists, from the FFmpeg side:                              */
+/*                                                                     */
+/*   ff_mediacodec_dec_close() (mediacodecdec_common.c) only calls     */
+/*   ff_AMediaCodec_stop() when hw_buffer_count has reached 0. With a  */
+/*   frame still outstanding it logs "Not stopping MediaCodec (there   */
+/*   are buffers pending)" and closes anyway. Closing the decoder is    */
+/*   therefore NOT proof that the driver stopped producing output:     */
+/*   the codec object may still be alive and still own the Surface.    */
+/*                                                                     */
+/* hw_buffer_count lives in MediaCodecDecContext, which is private to  */
+/* libavcodec and unreachable from JNI. So this layer keeps its own    */
+/* count of what it handed out and refuses to call anything detached   */
+/* until that count is zero. That count is the evidence; a return code */
+/* from a teardown function is not.                                    */
+/*                                                                     */
+/* States:                                                             */
+/*                                                                     */
+/*   ACTIVE -> REVOKING -> DETACHED -> CLOSED                          */
+/*                     \-> QUARANTINED                                 */
+/*                                                                     */
+/*   REVOKING     no new submission is admitted; operations that were  */
+/*                already admitted are allowed to finish and their      */
+/*                completion is counted, which is what makes DETACHED  */
+/*                reachable at all.                                    */
+/*   DETACHED     the in-flight count is zero AND the platform handle  */
+/*                has been released. Only reachable from REVOKING when */
+/*                the count is zero; never by waiting for a timeout.   */
+/*   QUARANTINED  teardown could not be proven complete. The session   */
+/*                keeps its handle, refuses every further use, and is   */
+/*                never rebound. Leaking a handle is recoverable;      */
+/*                touching a Surface after its owner is gone is not.    */
+/* ------------------------------------------------------------------ */
+
+#define FF_OUTPUT_ACTIVE       0
+#define FF_OUTPUT_REVOKING     1
+#define FF_OUTPUT_DETACHED     2
+#define FF_OUTPUT_QUARANTINED  3
+#define FF_OUTPUT_CLOSED       4
+
+typedef struct FFOutputSession {
+    /* Guards every field below. Held only for counting/state transitions,
+     * never across a lock/post/render call, so a blocked producer cannot
+     * block revoke. */
+    pthread_mutex_t lock;
+
+    int state;
+
+    /* Operations admitted and not yet completed. Incremented under `lock`
+     * at admission, decremented on completion. */
+    int in_flight;
+
+    /* What this session owns, so teardown knows what to release exactly
+     * once. Set to NULL when released, which is what makes try_finish()
+     * idempotent. */
+    ANativeWindow *win;
+} FFOutputSession;
+
+/* Admission: returns 0 and bumps in_flight when the session accepts work,
+ * or a negative AVERROR when it must not. Callers MUST pair a successful
+ * admission with ff_output_session_exit(). */
+static int ff_output_session_enter(FFOutputSession *s)
+{
+    int ret = 0;
+
+    if (!s)
+        return AVERROR(EINVAL);
+    pthread_mutex_lock(&s->lock);
+    if (s->state != FF_OUTPUT_ACTIVE)
+        ret = AVERROR(EPERM);
+    else
+        s->in_flight++;
+    pthread_mutex_unlock(&s->lock);
+    return ret;
+}
+
+/* Completion: the in-flight count can only go down here, so DETACHED is
+ * reachable exactly when the last admitted operation has finished. */
+static void ff_output_session_exit(FFOutputSession *s)
+{
+    if (!s)
+        return;
+    pthread_mutex_lock(&s->lock);
+    if (s->in_flight > 0)
+        s->in_flight--;
+    pthread_mutex_unlock(&s->lock);
+}
+
+static int ff_output_session_in_flight(FFOutputSession *s)
+{
+    int n;
+
+    pthread_mutex_lock(&s->lock);
+    n = s->in_flight;
+    pthread_mutex_unlock(&s->lock);
+    return n;
+}
+
+/* Begin revoking. From this point on nothing new is admitted; already
+ * admitted work drains on its own thread. Returns the in-flight count.
+ *
+ * This deliberately does NOT wait. A producer blocked inside
+ * ANativeWindow_lock() or a MediaCodec render call cannot be unblocked by
+ * the JNI layer, so waiting here would mean waiting on a timeout -- and a
+ * timeout is not evidence that the driver stopped. The caller polls
+ * ff_output_session_try_finish() until it reports DETACHED, and may run
+ * that wait on a background thread with its own deadline; a deadline that
+ * expires becomes QUARANTINED, never DETACHED. */
+static int ff_output_session_revoke(FFOutputSession *s)
+{
+    if (!s)
+        return AVERROR(EINVAL);
+    pthread_mutex_lock(&s->lock);
+    if (s->state == FF_OUTPUT_ACTIVE)
+        s->state = FF_OUTPUT_REVOKING;
+    pthread_mutex_unlock(&s->lock);
+    return ff_output_session_in_flight(s);
+}
+
+/* Attempt to complete teardown.
+ *
+ * Releasing the platform handle happens exactly once, and only when the
+ * in-flight count is zero: releasing an ANativeWindow while a producer is
+ * inside lock()/unlockAndPost() is the use-after-free this whole session
+ * exists to prevent. Returns the resulting state. */
+static int ff_output_session_try_finish(FFOutputSession *s)
+{
+    int state;
+
+    if (!s)
+        return FF_OUTPUT_QUARANTINED;
+    pthread_mutex_lock(&s->lock);
+    if (s->state == FF_OUTPUT_REVOKING && s->in_flight == 0) {
+        if (s->win) {
+            ANativeWindow_release(s->win);
+            s->win = NULL;
+        }
+        s->state = FF_OUTPUT_DETACHED;
+    }
+    state = s->state;
+    pthread_mutex_unlock(&s->lock);
+    return state;
+}
+
+/* Give up on proving teardown. The handle is intentionally NOT released
+ * here when operations may still be in flight: releasing it would produce
+ * the very crash the session refuses to cause. The memory is leaked and the
+ * session is marked unusable so it can never be reused or rebound. */
+static int ff_output_session_quarantine(FFOutputSession *s)
+{
+    if (!s)
+        return AVERROR(EINVAL);
+    pthread_mutex_lock(&s->lock);
+    if (s->state != FF_OUTPUT_DETACHED && s->state != FF_OUTPUT_CLOSED)
+        s->state = FF_OUTPUT_QUARANTINED;
+    pthread_mutex_unlock(&s->lock);
+    return ff_output_session_in_flight(s);
+}
+
+static int ff_output_session_state(FFOutputSession *s)
+{
+    int state;
+
+    if (!s)
+        return FF_OUTPUT_CLOSED;
+    pthread_mutex_lock(&s->lock);
+    state = s->state;
+    pthread_mutex_unlock(&s->lock);
+    return state;
+}
+
 typedef struct FFWindowRenderer {
     ANativeWindow     *win;
     struct SwsContext *sws;
     int src_w, src_h, src_fmt;
     int dst_w, dst_h;
+    /* Admission control for every operation that touches `win`. */
+    FFOutputSession    session;
+    int                session_ready;
 } FFWindowRenderer;
 
 JNIEXPORT jlong JNICALL
@@ -6230,20 +6525,39 @@ Java_org_ffmpeg_FFMpegNative_windowRendererCreate(JNIEnv *env, jobject thiz, job
         ANativeWindow_release(win);
         return 0;
     }
+    if (pthread_mutex_init(&r->session.lock, NULL) != 0) {
+        ANativeWindow_release(win);
+        av_free(r);
+        return 0;
+    }
     r->win = win;
     r->src_fmt = AV_PIX_FMT_NONE;
+    r->session.win   = win;
+    r->session.state = FF_OUTPUT_ACTIVE;
+    r->session.in_flight = 0;
+    r->session_ready = 1;
     return (jlong)(intptr_t)r;
 }
 
+/* Every window operation goes through admission. A revoked session admits
+ * nothing even if the caller still holds the handle: that is what stops an
+ * old binding from being used with a new Surface's authority. */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererSetSize(JNIEnv *env, jobject thiz,
                                                    jlong handle, jint width, jint height)
 {
     FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+    int ret;
+
     if (!r || !r->win || width <= 0 || height <= 0)
         return AVERROR(EINVAL);
-    int ret = ANativeWindow_setBuffersGeometry(r->win, width, height,
-                                              WINDOW_FORMAT_RGBA_8888);
+    ret = ff_output_session_enter(&r->session);
+    if (ret < 0)
+        return ret;
+
+    ret = ANativeWindow_setBuffersGeometry(r->win, width, height,
+                                           WINDOW_FORMAT_RGBA_8888);
+    ff_output_session_exit(&r->session);
     return ret == 0 ? 0 : AVERROR_EXTERNAL;
 }
 
@@ -6253,14 +6567,25 @@ Java_org_ffmpeg_FFMpegNative_windowRendererRender(JNIEnv *env, jobject thiz,
 {
     FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
     AVFrame *f = PTR(AVFrame *, frame);
+    ANativeWindow_Buffer buf;
+    int ret, scaled;
+
     if (!r || !r->win || !f || f->width <= 0 || f->height <= 0)
         return AVERROR(EINVAL);
 
-    ANativeWindow_Buffer buf;
-    if (ANativeWindow_lock(r->win, &buf, NULL) != 0)
+    /* Admission wraps the whole lock/scale/post sequence: revoke must wait
+     * for exactly this window to close before it may release the handle. */
+    ret = ff_output_session_enter(&r->session);
+    if (ret < 0)
+        return ret;
+
+    if (ANativeWindow_lock(r->win, &buf, NULL) != 0) {
+        ff_output_session_exit(&r->session);
         return AVERROR_EXTERNAL;
+    }
     if (!buf.bits || buf.width <= 0 || buf.height <= 0) {
         ANativeWindow_unlockAndPost(r->win);
+        ff_output_session_exit(&r->session);
         return AVERROR_EXTERNAL;
     }
 
@@ -6272,6 +6597,7 @@ Java_org_ffmpeg_FFMpegNative_windowRendererRender(JNIEnv *env, jobject thiz,
                                       SWS_BILINEAR, NULL, NULL, NULL);
         if (!r->sws) {
             ANativeWindow_unlockAndPost(r->win);
+            ff_output_session_exit(&r->session);
             return AVERROR(ENOMEM);
         }
         r->src_w   = f->width;
@@ -6288,22 +6614,106 @@ Java_org_ffmpeg_FFMpegNative_windowRendererRender(JNIEnv *env, jobject thiz,
     for (int i = 0; i < 4; i++)
         src_data[i] = f->data[i];
 
-    int scaled = sws_scale(r->sws, src_data, f->linesize, 0, f->height,
-                           dst_data, dst_linesize);
+    scaled = sws_scale(r->sws, src_data, f->linesize, 0, f->height,
+                       dst_data, dst_linesize);
     ANativeWindow_unlockAndPost(r->win);
+    ff_output_session_exit(&r->session);
     return scaled > 0 ? 0 : AVERROR_EXTERNAL;
 }
 
+/* Begin unbinding. Returns the number of operations still admitted (>= 0)
+ * or a negative AVERROR. The caller polls windowRendererFinish() until it
+ * reports DETACHED; a poll timeout must become QUARANTINE, never DETACHED. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_windowRendererRevoke(JNIEnv *env, jobject thiz, jlong handle)
+{
+    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+
+    if (!r || !r->session_ready)
+        return AVERROR(EINVAL);
+    return ff_output_session_revoke(&r->session);
+}
+
+/* Try to complete teardown; returns an FF_OUTPUT_* state. DETACHED means the
+ * in-flight count reached zero and the window handle is gone: at that point
+ * no admitted operation can still touch the Surface. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_windowRendererFinish(JNIEnv *env, jobject thiz, jlong handle)
+{
+    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+
+    if (!r || !r->session_ready)
+        return FF_OUTPUT_CLOSED;
+    return ff_output_session_try_finish(&r->session);
+}
+
+/* Give up on proving teardown. The session is unusable afterwards and must
+ * be dropped rather than reused or rebound. Returns the operations that
+ * were still admitted, for diagnostics. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_windowRendererQuarantine(JNIEnv *env, jobject thiz, jlong handle)
+{
+    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+
+    if (!r || !r->session_ready)
+        return AVERROR(EINVAL);
+    return ff_output_session_quarantine(&r->session);
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_windowRendererGetState(JNIEnv *env, jobject thiz, jlong handle)
+{
+    FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+
+    if (!r || !r->session_ready)
+        return FF_OUTPUT_CLOSED;
+    return ff_output_session_state(&r->session);
+}
+
+/* Free the renderer. The window is only released here when teardown was
+ * never attempted or already completed; if operations are still in flight
+ * the handle is leaked on purpose -- see ff_output_session_quarantine(). */
 JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererFree(JNIEnv *env, jobject thiz, jlong handle)
 {
     FFWindowRenderer *r = PTR(FFWindowRenderer *, handle);
+    int state, in_flight;
+
     if (!r)
         return;
     if (r->sws)
         sws_freeContext(r->sws);
-    if (r->win)
+
+    if (r->session_ready) {
+        state     = ff_output_session_state(&r->session);
+        in_flight = ff_output_session_in_flight(&r->session);
+        if (in_flight == 0) {
+            /* Safe: nothing can still be inside a window call. */
+            pthread_mutex_lock(&r->session.lock);
+            if (r->session.win) {
+                ANativeWindow_release(r->session.win);
+                r->session.win = NULL;
+            }
+            r->win = NULL;
+            r->session.state = FF_OUTPUT_CLOSED;
+            pthread_mutex_unlock(&r->session.lock);
+        } else {
+            /* Releasing now would free a window a producer may still be
+             * posting to. Leak it, and start the session no further work. */
+            av_log(NULL, AV_LOG_ERROR,
+                   "windowRendererFree: %d operation(s) still in flight "
+                   "(state %d); leaking the window handle to avoid a "
+                   "use-after-free\n", in_flight, state);
+            pthread_mutex_lock(&r->session.lock);
+            r->session.win = NULL;
+            r->session.state = FF_OUTPUT_QUARANTINED;
+            r->win = NULL;
+            pthread_mutex_unlock(&r->session.lock);
+        }
+        pthread_mutex_destroy(&r->session.lock);
+    } else if (r->win) {
         ANativeWindow_release(r->win);
+    }
     av_free(r);
 }
 

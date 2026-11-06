@@ -1211,6 +1211,24 @@ public final class FFMpegNative {
      */
     public native int mediasurfaceRenderBufferAtTime(long buf, long nanoTime);
 
+    /**
+     * Hardware buffers handed out by {@link #mediasurfaceGetBuffer} that have
+     * not yet been released.
+     *
+     * <p>This is the bridge's own count, not the decoder's: the codec's
+     * internal buffer count is private to libavcodec. A non-zero value means
+     * the MediaCodec producer cannot be considered detached -- those buffers
+     * still reference the Surface, and
+     * {@code ff_mediacodec_dec_close()} will skip stopping the codec while
+     * any are outstanding.
+     *
+     * <p>Close order: release every outstanding buffer (or unref every frame
+     * holding one), confirm this returns 0, and only then free the codec.
+     *
+     * @return the outstanding count (>= 0)
+     */
+    public native int mediasurfaceGetOutstandingBuffers();
+
     /* -------------------------------------------------------------- */
     /* Software video rendering: sws_scale directly into an            */
     /* ANativeWindow buffer. Use this on the software-decode fallback  */
@@ -1245,7 +1263,70 @@ public final class FFMpegNative {
      */
     public native int windowRendererRender(long handle, long frame);
 
-    /** Release the renderer, its scaler, and the underlying window reference. */
+    /* ------------------------------------------------------------------ */
+    /* Output-session unbinding.                                           */
+    /*                                                                     */
+    /* A renderer or a MediaCodec binding is a buffer producer attached to */
+    /* a Surface. Detaching is asynchronous on the driver side, so a       */
+    /* function returning proves nothing: ff_mediacodec_dec_close() only   */
+    /* calls FF_AMediaCodec_stop() when no hardware buffer is outstanding, */
+    /* and otherwise closes the decoder while the codec may still be       */
+    /* live (mediacodecdec_common.c). The session therefore tracks its own */
+    /* admitted operations and reports DETACHED only when that count has   */
+    /* reached zero.                                                       */
+    /*                                                                     */
+    /* Protocol: revoke -> poll finish until DETACHED -> free.             */
+    /* If your deadline expires first, call quarantine, then free. Never   */
+    /* treat a timeout as DETACHED, and never rebind a quarantined handle. */
+    /* ------------------------------------------------------------------ */
+
+    /** Session accepts work. */
+    public static final int OUTPUT_SESSION_ACTIVE = 0;
+    /** Revoked: no new work is admitted; admitted work is draining. */
+    public static final int OUTPUT_SESSION_REVOKING = 1;
+    /** In-flight count reached zero and the handle is released. */
+    public static final int OUTPUT_SESSION_DETACHED = 2;
+    /** Teardown could not be proven; the handle is unusable and must be dropped. */
+    public static final int OUTPUT_SESSION_QUARANTINED = 3;
+    /** Freed. */
+    public static final int OUTPUT_SESSION_CLOSED = 4;
+
+    /**
+     * Stop admitting work and begin unbinding.
+     *
+     * @return the number of operations still in flight (>= 0), or a negative
+     *         AVERROR. Poll {@link #windowRendererFinish} until it returns
+     *         {@link #OUTPUT_SESSION_DETACHED}.
+     */
+    public native int windowRendererRevoke(long handle);
+
+    /**
+     * Attempt to complete teardown without waiting.
+     *
+     * @return an {@code OUTPUT_SESSION_*} state. {@link #OUTPUT_SESSION_DETACHED}
+     *         means the in-flight count reached zero and nothing can still
+     *         touch the Surface.
+     */
+    public native int windowRendererFinish(long handle);
+
+    /**
+     * Abandon teardown. The handle becomes unusable and must not be reused
+     * or rebound; freeing it will deliberately leak the platform handle
+     * rather than risk freeing one a producer may still be posting to.
+     *
+     * @return the number of operations still in flight, for diagnostics
+     */
+    public native int windowRendererQuarantine(long handle);
+
+    /** @return the current {@code OUTPUT_SESSION_*} state. */
+    public native int windowRendererGetState(long handle);
+
+    /**
+     * Release the renderer, its scaler, and the underlying window reference.
+     *
+     * <p>If operations are still in flight, the window handle is leaked on
+     * purpose instead of being freed under a live producer.
+     */
     public native void windowRendererFree(long handle);
 
     /* -------------------------------------------------------------- */

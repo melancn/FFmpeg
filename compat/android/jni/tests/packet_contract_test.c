@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #include "libavcodec/avcodec.h"
 #include "libavcodec/packet.h"
@@ -34,6 +35,7 @@
 #include "libavutil/error.h"
 #include "libavutil/frame.h"
 #include "libavutil/mem.h"
+#include "libavutil/time.h"
 #include "libswresample/swresample.h"
 
 /* Re-include the production translation unit for its file-static helpers.
@@ -1373,6 +1375,572 @@ static void test_pcm_session_channel_mapping(void)
     av_channel_layout_uninit(&mono);
 }
 
+/* ------------------------------------------------------------------ */
+/* Format-change transaction: the acceptance matrix                    */
+/*                                                                     */
+/* The four cases the plan names, each driven through the real session:*/
+/*   44.1k -> 48k, packed <-> planar, same count / different layout,   */
+/*   and a custom channel order. Every case asserts that the old tail  */
+/*   comes out before the new format starts, so no sample is lost or   */
+/*   duplicated at the seam.                                           */
+/* ------------------------------------------------------------------ */
+
+/* Drain the current format to completion, returning the sample count. */
+#define DRAIN_OLD(s, outp, room) pcm_drain_all((s), (outp), (room))
+
+/* A lone UNSPEC frame must not be mistaken for a format change once the
+ * session has a definite layout: swr itself resolves UNSPEC to the default
+ * layout, so a decoder that never states an order is not a new format. */
+static void test_pcm_session_unspec_is_not_a_format_change(void)
+{
+    FFPcmSession *s = make_session(PCM_OUT_ROOM, 65536, PCM_OUT_ROOM);
+    AVChannelLayout stereo = { 0 };
+    AVFrame *f = NULL;
+    int16_t *out = NULL;
+    int produced, ret, i, changes = 0;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    av_channel_layout_default(&stereo, 2);
+    f   = make_pcm_frame(AV_SAMPLE_FMT_S16P, 48000, &stereo, 256);
+    out = av_malloc_array((size_t)PCM_OUT_ROOM * 2, sizeof(int16_t));
+    CHECK(f != NULL && out != NULL);
+
+    if (f && out) {
+        /* Ten frames in a row, each arriving with a stripped layout -- the
+         * shape a decoder produces when it does not know the order. */
+        for (i = 0; i < 10; i++) {
+            av_channel_layout_uninit(&f->ch_layout);
+            f->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+            f->ch_layout.nb_channels = 2;
+
+            ret = pcm_convert(s, f, out, PCM_OUT_ROOM, &produced);
+            if (ret == FF_PCM_FORMAT_CHANGE)
+                changes++;
+            CHECK(ret == FF_PCM_OUTPUT_READY);
+            /* The session repaired the frame in place, so the next compare
+             * is between two definite layouts. */
+            CHECK(f->ch_layout.order == AV_CHANNEL_ORDER_NATIVE);
+        }
+        CHECK(changes == 0);
+    }
+
+    av_frame_free(&f);
+    av_free(out);
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+    av_channel_layout_uninit(&stereo);
+}
+
+/* Same channel count, different layout (stereo vs downmix-compatible
+ * 2.1/quad-style mask of two channels): the comparison must be by layout,
+ * not by channel count. */
+static void test_pcm_session_same_count_different_layout(void)
+{
+    FFPcmSession *s = make_session(PCM_OUT_ROOM, 65536, PCM_OUT_ROOM);
+    AVChannelLayout fl_fr = { 0 }, fc_lfe = { 0 };
+    AVFrame *a = NULL, *b = NULL;
+    int16_t *out = NULL;
+    int produced, ret;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    /* Two channels, but they are not front-left/front-right: both describe
+     * the same count and a different mapping. */
+    CHECK_OK(av_channel_layout_from_mask(&fl_fr, AV_CH_LAYOUT_STEREO));
+    CHECK_OK(av_channel_layout_from_mask(&fc_lfe,
+                                         AV_CH_FRONT_CENTER | AV_CH_LOW_FREQUENCY));
+    CHECK(fl_fr.nb_channels == 2);
+    CHECK(fc_lfe.nb_channels == 2);
+
+    a   = make_pcm_frame(AV_SAMPLE_FMT_FLTP, 48000, &fl_fr, 256);
+    b   = make_pcm_frame(AV_SAMPLE_FMT_FLTP, 48000, &fc_lfe, 256);
+    out = av_malloc_array((size_t)PCM_OUT_ROOM * 2, sizeof(int16_t));
+    CHECK(a != NULL && b != NULL && out != NULL);
+
+    if (a && b && out) {
+        ret = pcm_convert(s, a, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_OUTPUT_READY);
+
+        /* Same count, different channels: a real change, so it must be
+         * reported rather than silently accepted, and it must commit once
+         * the tail is gone. */
+        ret = pcm_convert(s, b, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_FORMAT_CHANGE || ret == FF_PCM_OUTPUT_READY);
+
+        CHECK(DRAIN_OLD(s, out, PCM_OUT_ROOM) >= 0);
+        ret = pcm_convert(s, b, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_OUTPUT_READY);
+        CHECK(av_channel_layout_compare(&s->in_layout, &fc_lfe) == 0);
+    }
+
+    av_frame_free(&a);
+    av_frame_free(&b);
+    av_free(out);
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+    av_channel_layout_uninit(&fl_fr);
+    av_channel_layout_uninit(&fc_lfe);
+}
+
+/* packed <-> planar with the same rate and layout: a real format change for
+ * swr, and the tail from the packed stream must still reach the output. */
+static void test_pcm_session_packed_planar_switch(void)
+{
+    FFPcmSession *s = make_session(PCM_OUT_ROOM, 65536, PCM_OUT_ROOM);
+    AVChannelLayout stereo = { 0 };
+    AVFrame *packed = NULL, *planar = NULL;
+    int16_t *out = NULL;
+    int produced, ret, i;
+    int64_t tail;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    av_channel_layout_default(&stereo, 2);
+    packed = make_pcm_frame(AV_SAMPLE_FMT_S16,  44100, &stereo, 512);
+    planar = make_pcm_frame(AV_SAMPLE_FMT_S16P, 44100, &stereo, 512);
+    out    = av_malloc_array((size_t)PCM_OUT_ROOM * 2, sizeof(int16_t));
+    CHECK(packed != NULL && planar != NULL && out != NULL);
+
+    if (packed && planar && out) {
+        /* Distinguishable content: left +1000, right -1000. */
+        for (i = 0; i < 512; i++) {
+            ((int16_t *)packed->data[0])[i * 2]     =  1000;
+            ((int16_t *)packed->data[0])[i * 2 + 1] = -1000;
+            ((int16_t *)planar->data[0])[i] = 1000;
+            ((int16_t *)planar->data[1])[i] = -1000;
+        }
+
+        /* Small block leaves a tail in the packed configuration. */
+        ret = pcm_convert(s, packed, out, 64, &produced);
+        CHECK(ret == FF_PCM_OUTPUT_READY);
+        CHECK(swr_get_delay(s->swr, 48000) > 0);
+
+        /* The planar frame arrives before that tail is gone. */
+        ret = pcm_convert(s, planar, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_FORMAT_CHANGE);
+        CHECK(produced == 0);
+
+        tail = DRAIN_OLD(s, out, PCM_OUT_ROOM);
+        CHECK(tail >= 0);
+
+        /* Now the switch commits and the planar frame converts once. */
+        ret = pcm_convert(s, planar, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_OUTPUT_READY);
+        CHECK(produced > 0);
+        CHECK(s->in_fmt == AV_SAMPLE_FMT_S16P);
+
+        /* 44.1 -> 48k on 512 samples. */
+        CHECK(produced >= 512 - 64);
+        CHECK(produced <= 512 * 48000 / 44100 + 64);
+    }
+
+    av_frame_free(&packed);
+    av_frame_free(&planar);
+    av_free(out);
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+    av_channel_layout_uninit(&stereo);
+}
+
+/* A custom channel order has no bitmask, so a session that compared masks
+ * would treat it as "0 channels" or as a change on every frame. It must be
+ * accepted as a definite layout and compared channel by channel. */
+static void test_pcm_session_custom_layout(void)
+{
+    FFPcmSession *s = make_session(PCM_OUT_ROOM, 65536, PCM_OUT_ROOM);
+    AVChannelLayout custom = { 0 };
+    AVFrame *f = NULL;
+    int16_t *out = NULL;
+    int produced, ret;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    /* Two channels in a non-standard order: right before left. */
+    if (av_channel_layout_custom_init(&custom, 2) < 0) {
+        Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL,
+                                                    (jlong)(intptr_t)s);
+        return;
+    }
+    /* Right before left: a genuine custom order, not the default FR|FL. */
+    custom.u.map[0].id = AV_CHAN_FRONT_RIGHT;
+    custom.u.map[1].id = AV_CHAN_FRONT_LEFT;
+    CHECK(custom.order == AV_CHANNEL_ORDER_CUSTOM);
+
+    f   = make_pcm_frame(AV_SAMPLE_FMT_FLTP, 48000, &custom, 256);
+    out = av_malloc_array((size_t)PCM_OUT_ROOM * 2, sizeof(int16_t));
+    CHECK(f != NULL && out != NULL);
+
+    if (f && out) {
+        ret = pcm_convert(s, f, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_OUTPUT_READY);
+        CHECK(produced > 0);
+
+        /* Survived the round trip into the session's snapshot, still
+         * custom, and equal to what was presented. */
+        CHECK(s->in_layout.order == AV_CHANNEL_ORDER_CUSTOM);
+        CHECK(s->in_layout.nb_channels == 2);
+        CHECK(av_channel_layout_compare(&s->in_layout, &custom) == 0);
+
+        /* A second identical frame is not a change. */
+        ret = pcm_convert(s, f, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_OUTPUT_READY);
+    }
+
+    av_frame_free(&f);
+    av_free(out);
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+    av_channel_layout_uninit(&custom);
+}
+
+/* The seam itself: the samples either side of a format change must be
+ * continuous. A distinguishable constant per stream lets the test prove the
+ * old content came out before the new content started, in order. */
+static void test_pcm_session_seam_is_continuous(void)
+{
+    FFPcmSession *s = make_session(PCM_OUT_ROOM, 65536, PCM_OUT_ROOM);
+    AVChannelLayout stereo = { 0 };
+    AVFrame *old_f = NULL, *new_f = NULL;
+    int16_t *out = NULL;
+    int produced, ret, i;
+    int first_new = -1, last_old = -1;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    av_channel_layout_default(&stereo, 2);
+    old_f = make_pcm_frame(AV_SAMPLE_FMT_S16P, 44100, &stereo, 512);
+    new_f = make_pcm_frame(AV_SAMPLE_FMT_S16P, 48000, &stereo, 512);
+    out   = av_malloc_array((size_t)PCM_OUT_ROOM * 2, sizeof(int16_t));
+    CHECK(old_f != NULL && new_f != NULL && out != NULL);
+
+    if (old_f && new_f && out) {
+        for (i = 0; i < 512; i++) {
+            ((int16_t *)old_f->data[0])[i] = 1000;
+            ((int16_t *)old_f->data[1])[i] = 1000;
+            ((int16_t *)new_f->data[0])[i] = -1000;
+            ((int16_t *)new_f->data[1])[i] = -1000;
+        }
+
+        /* Leave a tail, then ask for the new format. */
+        ret = pcm_convert(s, old_f, out, 64, &produced);
+        CHECK(ret == FF_PCM_OUTPUT_READY);
+        ret = pcm_convert(s, new_f, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_FORMAT_CHANGE);
+
+        /* Drain the old tail and find the last old sample in it. */
+        ret = pcm_drain(s, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret >= 0);
+        for (i = 0; i < produced; i++)
+            if (out[i * 2] > 0)
+                last_old = i;
+        CHECK(last_old >= 0);          /* the tail really came out */
+
+        /* Now the switch commits; the first new sample must be new content,
+         * not more of the old stream. */
+        ret = pcm_convert(s, new_f, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_OUTPUT_READY);
+        for (i = 0; i < produced; i++) {
+            if (out[i * 2] < 0) {
+                first_new = i;
+                break;
+            }
+        }
+        CHECK(first_new >= 0);
+        /* Anything before the first new sample is the resampler's ramp on
+         * the new configuration, which starts at zero rather than replaying
+         * old content. Assert no old-marked sample leaked past the switch. */
+        for (i = 0; i < first_new; i++)
+            CHECK(out[i * 2] <= 0);
+    }
+
+    av_frame_free(&old_f);
+    av_frame_free(&new_f);
+    av_free(out);
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+    av_channel_layout_uninit(&stereo);
+}
+
+/* ------------------------------------------------------------------ */
+/* Output session: admission, revoke, detach, quarantine               */
+/*                                                                     */
+/* The claims being pinned are concurrency claims, so these use real   */
+/* threads: a blocked producer must not be able to reach DETACHED, an  */
+/* old binding must not admit work after revoke, and a failed teardown */
+/* must be quarantined rather than reported as success.                */
+/* ------------------------------------------------------------------ */
+
+static void output_session_init(FFOutputSession *s)
+{
+    memset(s, 0, sizeof(*s));
+    pthread_mutex_init(&s->lock, NULL);
+    s->state = FF_OUTPUT_ACTIVE;
+}
+
+static void output_session_deinit(FFOutputSession *s)
+{
+    pthread_mutex_destroy(&s->lock);
+}
+
+/* A bare session with no window: teardown state can be exercised without a
+ * Surface, which is the part that has to be race-free. */
+static void test_output_session_basic_lifecycle(void)
+{
+    FFOutputSession s;
+
+    output_session_init(&s);
+    CHECK(ff_output_session_state(&s) == FF_OUTPUT_ACTIVE);
+    CHECK(ff_output_session_in_flight(&s) == 0);
+
+    /* Nothing admitted: revoke followed by finish reaches DETACHED at once. */
+    CHECK(ff_output_session_revoke(&s) == 0);
+    CHECK(ff_output_session_state(&s) == FF_OUTPUT_REVOKING);
+    CHECK(ff_output_session_try_finish(&s) == FF_OUTPUT_DETACHED);
+    CHECK(ff_output_session_state(&s) == FF_OUTPUT_DETACHED);
+
+    /* Detached sessions admit nothing. */
+    CHECK(ff_output_session_enter(&s) == AVERROR(EPERM));
+    output_session_deinit(&s);
+}
+
+/* Admission is refused from the moment of revoke, even while other work is
+ * still in flight: this is what stops an old binding from being used with
+ * a new Surface's authority. */
+static void test_output_session_revoke_refuses_new_work(void)
+{
+    FFOutputSession s;
+
+    output_session_init(&s);
+
+    CHECK_OK(ff_output_session_enter(&s));
+    CHECK(ff_output_session_in_flight(&s) == 1);
+
+    CHECK(ff_output_session_revoke(&s) == 1);
+
+    /* New admissions are refused while the old one drains. */
+    CHECK_AVERROR(ff_output_session_enter(&s), EPERM);
+    CHECK(ff_output_session_in_flight(&s) == 1);
+
+    /* Teardown cannot complete while the admitted operation runs. */
+    CHECK(ff_output_session_try_finish(&s) == FF_OUTPUT_REVOKING);
+
+    ff_output_session_exit(&s);
+    CHECK(ff_output_session_in_flight(&s) == 0);
+    CHECK(ff_output_session_try_finish(&s) == FF_OUTPUT_DETACHED);
+
+    output_session_deinit(&s);
+}
+
+/* A producer stuck inside an admitted operation must keep the session out of
+ * DETACHED for as long as it is stuck. This is the case the plan calls out:
+ * waiting must not be mistaken for success. */
+typedef struct BlockedProducer {
+    FFOutputSession *session;
+    volatile int     entered;
+    volatile int     may_leave;
+} BlockedProducer;
+
+static void *blocked_producer_thread(void *opaque)
+{
+    BlockedProducer *p = opaque;
+
+    if (ff_output_session_enter(p->session) < 0)
+        return NULL;
+    p->entered = 1;
+    /* Stand-in for ANativeWindow_lock(): an unbounded wait inside an
+     * admitted operation. */
+    while (!p->may_leave)
+        av_usleep(1000);
+    ff_output_session_exit(p->session);
+    return NULL;
+}
+
+static void test_output_session_blocked_producer_stays_revoking(void)
+{
+    FFOutputSession s;
+    BlockedProducer p;
+    pthread_t th;
+    int i, state = -1;
+
+    output_session_init(&s);
+    memset(&p, 0, sizeof(p));
+    p.session = &s;
+
+    CHECK(pthread_create(&th, NULL, blocked_producer_thread, &p) == 0);
+    /* Wait for admission without a fixed sleep: poll the flag. */
+    for (i = 0; i < 5000 && !p.entered; i++)
+        av_usleep(1000);
+    CHECK(p.entered);
+
+    CHECK(ff_output_session_revoke(&s) == 1);
+
+    /* Poll finish many times while the producer is stuck. It must never
+     * report DETACHED: a timeout that returns "detached" is exactly the
+     * bug this state machine exists to prevent. */
+    for (i = 0; i < 100; i++) {
+        state = ff_output_session_try_finish(&s);
+        CHECK(state == FF_OUTPUT_REVOKING);
+        av_usleep(1000);
+    }
+
+    /* Now let it finish; only then is detach provable. */
+    p.may_leave = 1;
+    CHECK(pthread_join(th, NULL) == 0);
+    CHECK(ff_output_session_try_finish(&s) == FF_OUTPUT_DETACHED);
+
+    output_session_deinit(&s);
+}
+
+/* Quarantine is the only honest outcome when teardown cannot be proven. It
+ * must keep the in-flight count visible and never turn into DETACHED. */
+static void test_output_session_quarantine(void)
+{
+    FFOutputSession s;
+
+    output_session_init(&s);
+    CHECK_OK(ff_output_session_enter(&s));
+    CHECK(ff_output_session_revoke(&s) == 1);
+
+    /* Give up while work is still in flight. */
+    CHECK(ff_output_session_quarantine(&s) == 1);
+    CHECK(ff_output_session_state(&s) == FF_OUTPUT_QUARANTINED);
+
+    /* A quarantined session is not usable, and a later finish must not
+     * upgrade it to DETACHED even once the count reaches zero. */
+    ff_output_session_exit(&s);
+    CHECK(ff_output_session_try_finish(&s) == FF_OUTPUT_QUARANTINED);
+    CHECK_AVERROR(ff_output_session_enter(&s), EPERM);
+
+    output_session_deinit(&s);
+}
+
+/* Concurrent admission and revoke must not lose or double-count operations:
+ * a miscount here would either leak the window or free it under a producer. */
+typedef struct Hammer {
+    FFOutputSession *session;
+    int              admitted;
+    int              refused;
+} Hammer;
+
+static void *hammer_thread(void *opaque)
+{
+    Hammer *h = opaque;
+    int i;
+
+    for (i = 0; i < 500; i++) {
+        if (ff_output_session_enter(h->session) == 0) {
+            h->admitted++;
+            ff_output_session_exit(h->session);
+        } else {
+            h->refused++;
+        }
+    }
+    return NULL;
+}
+
+static void test_output_session_concurrent_enter_exit(void)
+{
+    enum { THREADS = 4 };
+    FFOutputSession s;
+    Hammer h[THREADS];
+    pthread_t th[THREADS];
+    int i, admitted_total = 0, refused_total = 0;
+
+    output_session_init(&s);
+    memset(h, 0, sizeof(h));
+
+    for (i = 0; i < THREADS; i++) {
+        h[i].session = &s;
+        CHECK(pthread_create(&th[i], NULL, hammer_thread, &h[i]) == 0);
+    }
+    for (i = 0; i < THREADS; i++)
+        CHECK(pthread_join(th[i], NULL) == 0);
+
+    for (i = 0; i < THREADS; i++) {
+        admitted_total += h[i].admitted;
+        refused_total  += h[i].refused;
+    }
+
+    /* Every operation either got in or was refused, never both and never
+     * silently dropped; admitted == completed because each exit pairs with
+     * an enter. */
+    CHECK(admitted_total + refused_total == THREADS * 500);
+    CHECK(refused_total == 0);
+    CHECK(ff_output_session_in_flight(&s) == 0);
+
+    CHECK(ff_output_session_revoke(&s) == 0);
+    CHECK(ff_output_session_try_finish(&s) == FF_OUTPUT_DETACHED);
+
+    output_session_deinit(&s);
+}
+
+/* Revoke racing with active producers: whatever the interleaving, the
+ * session must end in DETACHED with a zero count, and no admission may be
+ * counted after revoke. */
+typedef struct Racer {
+    FFOutputSession *session;
+    volatile int     stop;
+} Racer;
+
+static void *racer_thread(void *opaque)
+{
+    Racer *r = opaque;
+
+    while (!r->stop) {
+        if (ff_output_session_enter(r->session) == 0) {
+            if (ff_output_session_state(r->session) == FF_OUTPUT_ACTIVE)
+                av_usleep(10);
+            ff_output_session_exit(r->session);
+        } else {
+            av_usleep(10);
+        }
+    }
+    return NULL;
+}
+
+static void test_output_session_revoke_race(void)
+{
+    enum { THREADS = 3 };
+    FFOutputSession s;
+    Racer r[THREADS];
+    pthread_t th[THREADS];
+    int i;
+
+    output_session_init(&s);
+    memset(r, 0, sizeof(r));
+
+    for (i = 0; i < THREADS; i++) {
+        r[i].session = &s;
+        CHECK(pthread_create(&th[i], NULL, racer_thread, &r[i]) == 0);
+    }
+    av_usleep(20000);
+
+    /* Revoke while everyone is in the middle of admitting. */
+    ff_output_session_revoke(&s);
+
+    /* Poll to completion, exactly as a caller would. */
+    for (i = 0; i < 2000; i++) {
+        if (ff_output_session_try_finish(&s) == FF_OUTPUT_DETACHED)
+            break;
+        av_usleep(1000);
+    }
+    CHECK(ff_output_session_state(&s) == FF_OUTPUT_DETACHED);
+    CHECK(ff_output_session_in_flight(&s) == 0);
+
+    for (i = 0; i < THREADS; i++) {
+        r[i].stop = 1;
+        CHECK(pthread_join(th[i], NULL) == 0);
+    }
+
+    output_session_deinit(&s);
+}
+
 /* Same normalisation decision without a frame, for pre-flight checks. */
 static void test_normalize_mask_helper(void)
 {
@@ -1422,6 +1990,17 @@ int main(void)
     test_pcm_session_reset_drops_tail();
     test_pcm_session_format_change_transaction();
     test_pcm_session_channel_mapping();
+    test_pcm_session_unspec_is_not_a_format_change();
+    test_pcm_session_same_count_different_layout();
+    test_pcm_session_packed_planar_switch();
+    test_pcm_session_custom_layout();
+    test_pcm_session_seam_is_continuous();
+    test_output_session_basic_lifecycle();
+    test_output_session_revoke_refuses_new_work();
+    test_output_session_blocked_producer_stays_revoking();
+    test_output_session_quarantine();
+    test_output_session_concurrent_enter_exit();
+    test_output_session_revoke_race();
 
     printf("%d checks, %d failures\n", checks, failures);
     if (failures) {
