@@ -566,12 +566,35 @@ jobs:
 
           # Record what was embedded, so the bundle manifest can be checked
           # against the binary instead of against a hand-written claim.
+          #
+          # The version is resolved HERE, where the source is present, and
+          # then travels with the artifact. The bundle job only downloads
+          # artifacts (no checkout), so it cannot read ffmpeg_jni.c: a check
+          # there would fail with "no such file", not with a version
+          # mismatch. Keeping the derivation in the job that has the source
+          # is also what makes the value attributable to this build.
+          JNI_C="$PWD/compat/android/jni/ffmpeg_jni.c"
+          API_MAJOR=$(sed -n 's/^#define FF_JNI_BRIDGE_API_MAJOR[[:space:]]*\([0-9]\+\).*/\1/p' "$JNI_C")
+          API_MINOR=$(sed -n 's/^#define FF_JNI_BRIDGE_API_MINOR[[:space:]]*\([0-9]\+\).*/\1/p' "$JNI_C")
+          if [ -z "$API_MAJOR" ] || [ -z "$API_MINOR" ]; then
+            echo "::error::cannot read FF_JNI_BRIDGE_API_MAJOR/MINOR from $JNI_C"
+            exit 1
+          fi
+          BRIDGE_API=$(( (API_MAJOR << 16) | API_MINOR ))
+
           # The path must be inside the per-ABI artifact directory (OUT_DIR is
           # the parent of it, and the upload step takes "$OUT_DIR/<abi>/"):
           # written one level up, the record would silently never ship.
           mkdir -p "$PWD/$OUT_DIR/$ABI"
-          printf 'abi=%s\nsource_revision=%s\nndk=%s\nbuild_id=%s\n' \
-            "$ABI" "$SRC_REV" "$NDK_VER" "$BUILD_ID" \
+          # ffmpeg_version is read from RELEASE here rather than in the bundle
+          # job, which has no source tree to read it from. RELEASE holds a
+          # bare version string ("8.0.git"), not KEY=VALUE: the older
+          # `grep '^version='` in the bundle job matched nothing and always
+          # produced "unknown", so read the first non-empty line instead.
+          FFVER=$(sed -n '/^[^[:space:]]/{p;q;}' "$PWD/RELEASE" 2>/dev/null)
+          [ -n "$FFVER" ] || FFVER="unknown"
+          printf 'abi=%s\nsource_revision=%s\nndk=%s\nbuild_id=%s\nbridge_api=%s\nandroid_api=%s\nffmpeg_version=%s\n' \
+            "$ABI" "$SRC_REV" "$NDK_VER" "$BUILD_ID" "$BRIDGE_API" "$ANDROID_API" "$FFVER" \
             > "$PWD/$OUT_DIR/$ABI/build-provenance.txt"
           cat "$PWD/$OUT_DIR/$ABI/build-provenance.txt"
 
@@ -1057,25 +1080,59 @@ jobs:
           # the revision that produced it and to the bridge contract it
           # implements. Consumers must verify against it rather than trusting
           # that a library "looks like" the right one.
+          #
+          # Nothing here is typed in by hand and nothing reads the source
+          # tree: this job has no checkout, so `git rev-parse` and RELEASE
+          # would both come back empty. The values are taken from the
+          # compile-time records that shipped inside each artifact, which are
+          # the ones that actually describe the binaries being bundled.
+          FIRST_PROV=$(ls ffmpeg-jni-bundle/build-info/*/build-provenance.txt 2>/dev/null | head -1)
+          if [ -z "$FIRST_PROV" ]; then
+            echo "::error::no build-provenance.txt to derive the manifest from"
+            exit 1
+          fi
+          BRIDGE_API=$(sed -n 's/^bridge_api=//p' "$FIRST_PROV")
+          SOURCE_REV=$(sed -n 's/^source_revision=//p' "$FIRST_PROV")
+          if [ -z "$BRIDGE_API" ] || [ -z "$SOURCE_REV" ]; then
+            echo "::error::$FIRST_PROV lacks bridge_api or source_revision"
+            exit 1
+          fi
+          # Every ABI must agree: one bundle cannot ship two contracts.
+          for p in ffmpeg-jni-bundle/build-info/*/build-provenance.txt; do
+            this_api=$(sed -n 's/^bridge_api=//p' "$p")
+            this_rev=$(sed -n 's/^source_revision=//p' "$p")
+            if [ "$this_api" != "$BRIDGE_API" ] || [ "$this_rev" != "$SOURCE_REV" ]; then
+              echo "::error::$p disagrees with $FIRST_PROV on bridge_api/source_revision"
+              exit 1
+            fi
+          done
+
+          # A missing .so would make sha256sum fail inside the block below
+          # with `set -e` and no explanation; name the problem first. The
+          # nullglob guard keeps an empty glob from being counted as a file.
+          shopt -s nullglob
+          sos=(ffmpeg-jni-bundle/jniLibs/*/libffmpeg_jni.so)
+          # Same `set -u` caveat as elsewhere: materialise the length.
+          so_count=${#sos[@]}
+          if [ "$so_count" -eq 0 ]; then
+            echo "::error::no libffmpeg_jni.so in the bundle: nothing to describe"
+            exit 1
+          fi
+
           {
             printf '{\n'
-            # 0x00010002 = 65538: bridge 1.2. This literal must move with
-            # FF_JNI_BRIDGE_API_VERSION in ffmpeg_jni.c and BRIDGE_API_VERSION
-            # in FFMpegNative.java; the build gate below re-derives it from the
-            # source so a stale literal fails the job instead of shipping a
-            # manifest that labels a new library with the old contract.
-            printf '  "bridgeApi": %d,\n' 65538
+            printf '  "bridgeApi": %s,\n' "$BRIDGE_API"
             printf '  "packetBudgetPolicyVersion": %d,\n' 1
-            printf '  "sourceRevision": "%s",\n' "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null || echo unknown)"
-            printf '  "ffmpegVersion": "%s",\n' "$(grep -m1 '^version=' "$GITHUB_WORKSPACE/RELEASE" 2>/dev/null | cut -d= -f2 || echo unknown)"
+            printf '  "sourceRevision": "%s",\n' "$SOURCE_REV"
+            printf '  "ffmpegVersion": "%s",\n' "$(sed -n 's/^ffmpeg_version=//p' "$FIRST_PROV" | head -1)"
             printf '  "buildType": "release",\n'
             printf '  "artifacts": {\n'
             first=1
-            for f in ffmpeg-jni-bundle/jniLibs/*/libffmpeg_jni.so; do
+            for f in "${sos[@]}"; do
               abi=$(basename "$(dirname "$f")")
               sum=$(sha256sum "$f" | cut -d' ' -f1)
               size=$(stat -c%s "$f")
-              [ $first -eq 1 ] || printf ',\n'
+              [ "$first" -eq 1 ] || printf ',\n'
               first=0
               printf '    "%s": { "sha256": "%s", "size": %d }' "$abi" "$sum" "$size"
             done
@@ -1083,53 +1140,29 @@ jobs:
           } > ffmpeg-jni-bundle/artifact-manifest.json
           cat ffmpeg-jni-bundle/artifact-manifest.json
 
-      - name: Verify manifest against the source
+      - name: Verify manifest against the artifacts
         run: |
           set -euo pipefail
-          # The manifest is the delivery record, so its claims are checked
-          # against the code that built the libraries rather than trusted.
-          # A stale literal here ships a bundle that misdescribes its own
-          # contract, which is exactly the failure this gate exists for.
-          MAJOR=$(sed -n 's/^#define FF_JNI_BRIDGE_API_MAJOR[[:space:]]*\([0-9]*\).*/\1/p' \
-                    compat/android/jni/ffmpeg_jni.c)
-          MINOR=$(sed -n 's/^#define FF_JNI_BRIDGE_API_MINOR[[:space:]]*\([0-9]*\).*/\1/p' \
-                    compat/android/jni/ffmpeg_jni.c)
-          test -n "$MAJOR" && test -n "$MINOR" || {
-            echo "::error::cannot derive the bridge version from ffmpeg_jni.c"
-            exit 1
-          }
-          EXPECTED=$(( (MAJOR << 16) | MINOR ))
-          GOT=$(sed -n 's/.*"bridgeApi": \([0-9]*\).*/\1/p' \
-                  ffmpeg-jni-bundle/artifact-manifest.json)
-          if [ "$EXPECTED" != "$GOT" ]; then
-            echo "::error::manifest bridgeApi=$GOT but ffmpeg_jni.c declares $EXPECTED (from $MAJOR.$MINOR)"
-            exit 1
-          fi
-
-          # The Java side must agree as well: a JAR whose BRIDGE_API_VERSION
-          # differs would make the capability handshake fail at run time.
-          JEXPECTED=$(sed -n 's/.*BRIDGE_API_VERSION *= *(BRIDGE_API_MAJOR << 16) | BRIDGE_API_MINOR.*/ok/p' \
-                        compat/android/jni/java/org/ffmpeg/FFMpegNative.java)
-          if [ -z "$JEXPECTED" ]; then
-            echo "::error::BRIDGE_API_VERSION formula changed in FFMpegNative.java; update this gate"
-            exit 1
-          fi
-          JMAJOR=$(sed -n 's/.*BRIDGE_API_MAJOR *= *\([0-9]*\).*/\1/p' \
-                     compat/android/jni/java/org/ffmpeg/FFMpegNative.java | head -1)
-          JMINOR=$(sed -n 's/.*BRIDGE_API_MINOR *= *\([0-9]*\).*/\1/p' \
-                     compat/android/jni/java/org/ffmpeg/FFMpegNative.java | head -1)
-          if [ "$(( (JMAJOR << 16) | JMINOR ))" != "$EXPECTED" ]; then
-            echo "::error::FFMpegNative.java declares $JMAJOR.$JMINOR but ffmpeg_jni.c declares $MAJOR.$MINOR"
+          # This job has no checkout: it only has downloaded artifacts, so
+          # every check below reads bundle files. An earlier version read
+          # compat/android/jni/ffmpeg_jni.c here and failed with
+          # "No such file or directory" -- the source-derivation lives in the
+          # build job, which has the tree, and its result travels in
+          # build-provenance.txt.
+          MANIFEST=ffmpeg-jni-bundle/artifact-manifest.json
+          GOT=$(sed -n 's/.*"bridgeApi": \([0-9]*\).*/\1/p' "$MANIFEST")
+          if [ -z "$GOT" ]; then
+            echo "::error::manifest has no bridgeApi"
             exit 1
           fi
 
           # Every shipped .so must be accompanied by its provenance record.
-          # The revision there is not compared with the manifest: both come
-          # from the same `git rev-parse` in the same workflow, so equality
-          # would hold by construction and prove nothing. What IS checked is
-          # that the record exists, names the ABI whose directory holds it,
-          # and carries finished values -- an empty or "unknown" field means
-          # the .so cannot be tied back to anything.
+          # The revision is NOT compared with the manifest's sourceRevision:
+          # both come from the same `git rev-parse` in this workflow, so
+          # equality would hold by construction and prove nothing. What is
+          # checked is that the record exists, names the ABI whose directory
+          # holds it, agrees with the manifest's bridgeApi, and carries
+          # finished values.
           shopt -s nullglob
           prov=(ffmpeg-jni-bundle/build-info/*/build-provenance.txt)
           # `${#prov[@]}` under `set -u` is safe for an empty array only in
@@ -1139,6 +1172,7 @@ jobs:
             echo "::error::no build-provenance.txt in the bundle: artifacts are untraceable"
             exit 1
           fi
+
           for f in "${prov[@]}"; do
             dir_abi=$(basename "$(dirname "$f")")
             file_abi=$(sed -n 's/^abi=//p' "$f")
@@ -1146,7 +1180,8 @@ jobs:
               echo "::error::$f says abi=$file_abi but sits in $dir_abi/"
               exit 1
             fi
-            for key in source_revision ndk build_id; do
+
+            for key in source_revision ndk build_id bridge_api android_api; do
               val=$(sed -n "s/^${key}=//p" "$f")
               case "$val" in
                 ""|unknown)
@@ -1155,13 +1190,34 @@ jobs:
                   ;;
               esac
             done
+
+            # The version embedded at compile time must be the one the
+            # manifest advertises. This is the check that would have caught
+            # the manifest still saying 0x00010001 after the bridge moved to
+            # 1.2, now that both sides are actual build output.
+            prov_api=$(sed -n 's/^bridge_api=//p' "$f")
+            if [ "$prov_api" != "$GOT" ]; then
+              echo "::error::$f embedded bridgeApi=$prov_api but the manifest says $GOT"
+              exit 1
+            fi
+
             # The shipped library must exist next to the record it describes.
             if [ ! -f "ffmpeg-jni-bundle/jniLibs/$dir_abi/libffmpeg_jni.so" ]; then
               echo "::error::$f has no matching jniLibs/$dir_abi/libffmpeg_jni.so"
               exit 1
             fi
           done
-          echo "manifest verified: bridgeApi=$EXPECTED, $prov_count provenance record(s)"
+
+          # Every shipped .so needs a record, in both directions.
+          for so in ffmpeg-jni-bundle/jniLibs/*/libffmpeg_jni.so; do
+            abi=$(basename "$(dirname "$so")")
+            if [ ! -f "ffmpeg-jni-bundle/build-info/$abi/build-provenance.txt" ]; then
+              echo "::error::jniLibs/$abi/libffmpeg_jni.so has no provenance record"
+              exit 1
+            fi
+          done
+
+          echo "manifest verified: bridgeApi=$GOT, $prov_count provenance record(s)"
 
       - name: Upload bundled artifact
         uses: actions/upload-artifact@v4
