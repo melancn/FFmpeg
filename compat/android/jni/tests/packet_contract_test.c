@@ -1002,9 +1002,11 @@ typedef struct FFTestJniState {
 
 static FFTestJniState g_fftest_jni;
 
-static void fftest_jni_reset(JNIEnv *env)
+/* Takes no environment: it only clears the recording state, and threading a
+ * JNIEnv through every call site was the source of a pointer-depth mistake
+ * that clang rejected. Nothing here needs the table. */
+static void fftest_jni_reset(void)
 {
-    (void)env;
     memset(&g_fftest_jni, 0, sizeof(g_fftest_jni));
     g_fftest_jni.last_byte_len = -1;
 }
@@ -1024,10 +1026,13 @@ static jsize fftest_array_length(JNIEnv *env, jarray a)
     return arr ? arr->length : 0;
 }
 
-static int fftest_check_exception(JNIEnv *env)
+/* jboolean, not int: the JNINativeInterface slot is jboolean (*)(JNIEnv *),
+ * and clang treats a mismatch as an error under
+ * -Wincompatible-function-pointer-types. */
+static jboolean fftest_check_exception(JNIEnv *env)
 {
     (void)env;
-    return g_fftest_jni.exception;
+    return g_fftest_jni.exception ? JNI_TRUE : JNI_FALSE;
 }
 
 static void fftest_raise_exception(JNIEnv *env)
@@ -1036,11 +1041,14 @@ static void fftest_raise_exception(JNIEnv *env)
     g_fftest_jni.exception = 1;
 }
 
-static void fftest_throw_new(JNIEnv *env, jclass c, const char *msg)
+/* jint, not void: ThrowNew returns a status. Returning 0 means the exception
+ * was thrown successfully. */
+static jint fftest_throw_new(JNIEnv *env, jclass c, const char *msg)
 {
     (void)c;
     (void)msg;
     fftest_raise_exception(env);
+    return 0;
 }
 
 static void fftest_set_byte_region(JNIEnv *env, jbyteArray a, jsize start,
@@ -1139,17 +1147,24 @@ static void fftest_init_functions(void)
     g_fftest_functions.SetIntArrayRegion  = fftest_set_int_region;
 }
 
-static JNIEnv *fftest_jni_env(void)
+/* JNIEnv is a pointer TYPE, not a struct: jni.h declares
+ *   typedef const struct JNINativeInterface *JNIEnv;
+ * so there is no `functions` member to fill in (assigning one does not
+ * compile, which is how an earlier version of this stub failed).
+ *
+ * The value IS the table address. JNI entry points, however, are declared
+ * as `(JNIEnv *env, ...)` -- a pointer to that pointer -- and they reach the
+ * table through (*env)->X(env, ...). So this returns a JNIEnv value and every
+ * call site passes its address: `Java_...( &env, ... )`. */
+static JNIEnv fftest_jni_env(void)
 {
-    static JNIEnv env;
     static int initialised;
 
     if (!initialised) {
         fftest_init_functions();
         initialised = 1;
     }
-    env.functions = &g_fftest_functions;
-    return &env;
+    return (JNIEnv)&g_fftest_functions;
 }
 
 /* Go through the real entry points where possible: the handle is created by
@@ -1173,7 +1188,7 @@ static JNIEnv *fftest_jni_env(void)
 static int pcm_convert(FFPcmSession *s, AVFrame *f, int16_t *out,
                        int out_count, int64_t out_capacity, int *produced)
 {
-    JNIEnv *env = fftest_jni_env();
+    JNIEnv env = fftest_jni_env();
     jbyteArray arr = fftest_new_byte_array(FFTEST_OUT_CAP_MAX);
     jintArray status = fftest_new_int_array(1);
     int ret;
@@ -1185,25 +1200,25 @@ static int pcm_convert(FFPcmSession *s, AVFrame *f, int16_t *out,
     (void)out_capacity;
     *produced = 0;
     if (!s || !f || !arr || !status) {
-        fftest_jni_reset(env);
+        fftest_jni_reset();
         return AVERROR(EINVAL);
     }
 
     ret = Java_org_ffmpeg_FFMpegNative_pcmSessionConvert(
-              env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
+              &env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
               arr, out_count, status);
     /* Report what the bridge actually published. A stale or uninitialised
      * status slot then surfaces as produced != 0 on a refusal instead of
      * being filtered out here. */
     if (ret >= 0 && fftest_last_status() > 0)
         *produced = fftest_last_status();
-    fftest_jni_reset(env);
+    fftest_jni_reset();
     return ret;
 }
 
 static int pcm_drain(FFPcmSession *s, int16_t *out, int out_count, int *produced)
 {
-    JNIEnv *env = fftest_jni_env();
+    JNIEnv env = fftest_jni_env();
     jbyteArray arr = fftest_new_byte_array(FFTEST_OUT_CAP_MAX);
     jintArray status = fftest_new_int_array(1);
     int ret;
@@ -1211,15 +1226,15 @@ static int pcm_drain(FFPcmSession *s, int16_t *out, int out_count, int *produced
     (void)out;
     *produced = 0;
     if (!s || !arr || !status) {
-        fftest_jni_reset(env);
+        fftest_jni_reset();
         return AVERROR(EINVAL);
     }
 
     ret = Java_org_ffmpeg_FFMpegNative_pcmSessionDrain(
-              env, NULL, (jlong)(intptr_t)s, arr, out_count, status);
+              &env, NULL, (jlong)(intptr_t)s, arr, out_count, status);
     if (ret >= 0 && fftest_last_status() > 0)
         *produced = fftest_last_status();
-    fftest_jni_reset(env);
+    fftest_jni_reset();
     return ret;
 }
 
@@ -2837,7 +2852,7 @@ static void test_pcm_session_jni_bounds(void)
     FFPcmSession *s = make_session(PCM_OUT_ROOM, 4096, PCM_OUT_ROOM);
     AVChannelLayout stereo = { 0 };
     AVFrame *f = NULL;
-    JNIEnv *env = fftest_jni_env();
+    JNIEnv env = fftest_jni_env();
     jbyteArray out = NULL;
     jintArray status = NULL;
     int produced = -1, ret;
@@ -2862,12 +2877,12 @@ static void test_pcm_session_jni_bounds(void)
 
         /* One byte short of what the block would need: refused, and the
          * array is left untouched rather than half-written. */
-        fftest_jni_reset(env);
+        fftest_jni_reset();
         out    = fftest_new_byte_array(exact - 1);
         status = fftest_new_int_array(1);
         CHECK(out != NULL && status != NULL);
         ret = Java_org_ffmpeg_FFMpegNative_pcmSessionConvert(
-                  env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
+                  &env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
                   out, 64, status);
         CHECK_AVERROR(ret, ENOMEM);
         CHECK(g_fftest_jni.last_byte_len == -1);   /* nothing published */
@@ -2875,12 +2890,12 @@ static void test_pcm_session_jni_bounds(void)
 
         /* The same request against a block that just fits is accepted, so
          * the refusal above was about the byte count and not about 64. */
-        fftest_jni_reset(env);
+        fftest_jni_reset();
         out = fftest_new_byte_array(exact);
         status = fftest_new_int_array(1);
         CHECK(out != NULL && status != NULL);
         ret = Java_org_ffmpeg_FFMpegNative_pcmSessionConvert(
-                  env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
+                  &env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
                   out, 64, status);
         CHECK(ret == FF_PCM_OUTPUT_READY);
         CHECK(g_fftest_jni.last_byte_len > 0);
@@ -2895,31 +2910,31 @@ static void test_pcm_session_jni_bounds(void)
               av_get_bytes_per_sample((enum AVSampleFormat)s->out_fmt));
 
         /* outCount so large the byte product cannot be expressed. */
-        fftest_jni_reset(env);
+        fftest_jni_reset();
         out    = fftest_new_byte_array(exact);
         status = fftest_new_int_array(1);
         ret = Java_org_ffmpeg_FFMpegNative_pcmSessionConvert(
-                  env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
+                  &env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
                   out, INT_MAX, status);
         CHECK(ret < 0);
         CHECK(g_fftest_jni.last_byte_len == -1);
 
         /* A status array too short for even one slot is refused before
          * anything else happens. */
-        fftest_jni_reset(env);
+        fftest_jni_reset();
         out    = fftest_new_byte_array(exact);
         status = fftest_new_int_array(0);
         ret = Java_org_ffmpeg_FFMpegNative_pcmSessionConvert(
-                  env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
+                  &env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
                   out, 64, status);
         CHECK_AVERROR(ret, EINVAL);
 
         /* A non-positive block is refused, not treated as "drain me". */
-        fftest_jni_reset(env);
+        fftest_jni_reset();
         out    = fftest_new_byte_array(exact);
         status = fftest_new_int_array(1);
         ret = Java_org_ffmpeg_FFMpegNative_pcmSessionConvert(
-                  env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
+                  &env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
                   out, 0, status);
         CHECK(ret < 0);
 
@@ -2932,7 +2947,7 @@ static void test_pcm_session_jni_bounds(void)
     }
 
     av_frame_free(&f);
-    fftest_jni_reset(env);
+    fftest_jni_reset();
     Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
     av_channel_layout_uninit(&stereo);
 }
@@ -2947,7 +2962,7 @@ static void test_pcm_publish_failure_poisons_session(void)
     FFPcmSession *s = make_session(PCM_OUT_ROOM, 4096, PCM_OUT_ROOM);
     AVChannelLayout stereo = { 0 };
     AVFrame *f = NULL;
-    JNIEnv *env = fftest_jni_env();
+    JNIEnv env = fftest_jni_env();
     jbyteArray out = NULL;
     jintArray status = NULL;
     int ret;
@@ -2962,14 +2977,14 @@ static void test_pcm_publish_failure_poisons_session(void)
 
     if (f) {
         /* Inject the failure the VM would raise from SetByteArrayRegion. */
-        fftest_jni_reset(env);
+        fftest_jni_reset();
         g_fftest_jni.fail_publish = 1;
         out    = fftest_new_byte_array(FFTEST_OUT_CAP_MAX);
         status = fftest_new_int_array(1);
         CHECK(out != NULL && status != NULL);
 
         ret = Java_org_ffmpeg_FFMpegNative_pcmSessionConvert(
-                  env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
+                  &env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
                   out, 256, status);
         CHECK(ret < 0);
         /* The exception is still pending: the wrapper must not have
@@ -2978,23 +2993,23 @@ static void test_pcm_publish_failure_poisons_session(void)
         CHECK(s->phase == FF_PCM_PHASE_POISONED);
 
         /* A poisoned session refuses work instead of converting again. */
-        fftest_jni_reset(env);
+        fftest_jni_reset();
         out    = fftest_new_byte_array(FFTEST_OUT_CAP_MAX);
         status = fftest_new_int_array(1);
         ret = Java_org_ffmpeg_FFMpegNative_pcmSessionConvert(
-                  env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
+                  &env, NULL, (jlong)(intptr_t)s, (jlong)(intptr_t)f,
                   out, 256, status);
         CHECK_AVERROR(ret, EIO);
 
         /* Reset is the documented way out of POISONED. */
-        fftest_jni_reset(env);
+        fftest_jni_reset();
         CHECK_OK(Java_org_ffmpeg_FFMpegNative_pcmSessionReset(
                      NULL, NULL, (jlong)(intptr_t)s));
         CHECK(s->phase != FF_PCM_PHASE_POISONED);
     }
 
     av_frame_free(&f);
-    fftest_jni_reset(env);
+    fftest_jni_reset();
     Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
     av_channel_layout_uninit(&stereo);
 }
