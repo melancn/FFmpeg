@@ -541,8 +541,17 @@ jobs:
             */toolchains/llvm/prebuilt/*) NDK_ROOT="${NDK_BIN%%/toolchains/*}" ;;
             *)                            NDK_ROOT="" ;;
           esac
-          NDK_VER="$(basename "${NDK_ROOT:-unknown}")"
+          # `basename ""` prints an empty string, not "unknown", so an empty
+          # NDK_ROOT would write a blank ndk= that the bundle gate rejects.
+          # Default explicitly instead of relying on :- inside the argument.
+          NDK_VER="unknown"
+          if [ -n "$NDK_ROOT" ]; then
+            NDK_VER="$(basename "$NDK_ROOT")"
+          fi
           BUILD_ID="${GITHUB_SHA:-unknown}-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}"
+          if [ -z "$SRC_REV" ]; then
+            SRC_REV="unknown"
+          fi
 
           # Compile the JNI translation unit as C. Passing a .c file to clang++
           # makes NDK 29 treat FFmpeg's C headers and JNIEnv ABI as C++17.
@@ -557,9 +566,14 @@ jobs:
 
           # Record what was embedded, so the bundle manifest can be checked
           # against the binary instead of against a hand-written claim.
+          # The path must be inside the per-ABI artifact directory (OUT_DIR is
+          # the parent of it, and the upload step takes "$OUT_DIR/<abi>/"):
+          # written one level up, the record would silently never ship.
+          mkdir -p "$PWD/$OUT_DIR/$ABI"
           printf 'abi=%s\nsource_revision=%s\nndk=%s\nbuild_id=%s\n' \
             "$ABI" "$SRC_REV" "$NDK_VER" "$BUILD_ID" \
-            >> "$PWD/$OUT_DIR/build-provenance.txt"
+            > "$PWD/$OUT_DIR/$ABI/build-provenance.txt"
+          cat "$PWD/$OUT_DIR/$ABI/build-provenance.txt"
 
           # Link with the API-level-specific clang++ driver because libass is
           # C++; -static-libstdc++ avoids a libc++_shared.so DT_NEEDED entry.
@@ -1024,6 +1038,15 @@ jobs:
             cp "$d/licenses/curl/COPYING" "ffmpeg-jni-bundle/licenses/curl/"
             cp "$d/libcurl.txt" "ffmpeg-jni-bundle/build-info/$abi/"
             cp "$d/test/environment.txt" "ffmpeg-jni-bundle/build-info/$abi/" 2>/dev/null || true
+            # What the .so actually embedded via getBridgeBuildInfo(), written
+            # at compile time. Required, not best-effort: the verification
+            # step below fails the bundle without it, so an untraceable .so
+            # never ships. Failing here names the ABI at the point of loss.
+            if [ ! -f "$d/build-provenance.txt" ]; then
+              echo "::error::$abi was built without build-provenance.txt"
+              exit 1
+            fi
+            cp "$d/build-provenance.txt" "ffmpeg-jni-bundle/build-info/$abi/"
           done
           find ffmpeg-jni-bundle -type f | sort
 
@@ -1036,7 +1059,12 @@ jobs:
           # that a library "looks like" the right one.
           {
             printf '{\n'
-            printf '  "bridgeApi": %d,\n' 65536
+            # 0x00010002 = 65538: bridge 1.2. This literal must move with
+            # FF_JNI_BRIDGE_API_VERSION in ffmpeg_jni.c and BRIDGE_API_VERSION
+            # in FFMpegNative.java; the build gate below re-derives it from the
+            # source so a stale literal fails the job instead of shipping a
+            # manifest that labels a new library with the old contract.
+            printf '  "bridgeApi": %d,\n' 65538
             printf '  "packetBudgetPolicyVersion": %d,\n' 1
             printf '  "sourceRevision": "%s",\n' "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null || echo unknown)"
             printf '  "ffmpegVersion": "%s",\n' "$(grep -m1 '^version=' "$GITHUB_WORKSPACE/RELEASE" 2>/dev/null | cut -d= -f2 || echo unknown)"
@@ -1054,6 +1082,86 @@ jobs:
             printf '\n  }\n}\n'
           } > ffmpeg-jni-bundle/artifact-manifest.json
           cat ffmpeg-jni-bundle/artifact-manifest.json
+
+      - name: Verify manifest against the source
+        run: |
+          set -euo pipefail
+          # The manifest is the delivery record, so its claims are checked
+          # against the code that built the libraries rather than trusted.
+          # A stale literal here ships a bundle that misdescribes its own
+          # contract, which is exactly the failure this gate exists for.
+          MAJOR=$(sed -n 's/^#define FF_JNI_BRIDGE_API_MAJOR[[:space:]]*\([0-9]*\).*/\1/p' \
+                    compat/android/jni/ffmpeg_jni.c)
+          MINOR=$(sed -n 's/^#define FF_JNI_BRIDGE_API_MINOR[[:space:]]*\([0-9]*\).*/\1/p' \
+                    compat/android/jni/ffmpeg_jni.c)
+          test -n "$MAJOR" && test -n "$MINOR" || {
+            echo "::error::cannot derive the bridge version from ffmpeg_jni.c"
+            exit 1
+          }
+          EXPECTED=$(( (MAJOR << 16) | MINOR ))
+          GOT=$(sed -n 's/.*"bridgeApi": \([0-9]*\).*/\1/p' \
+                  ffmpeg-jni-bundle/artifact-manifest.json)
+          if [ "$EXPECTED" != "$GOT" ]; then
+            echo "::error::manifest bridgeApi=$GOT but ffmpeg_jni.c declares $EXPECTED (from $MAJOR.$MINOR)"
+            exit 1
+          fi
+
+          # The Java side must agree as well: a JAR whose BRIDGE_API_VERSION
+          # differs would make the capability handshake fail at run time.
+          JEXPECTED=$(sed -n 's/.*BRIDGE_API_VERSION *= *(BRIDGE_API_MAJOR << 16) | BRIDGE_API_MINOR.*/ok/p' \
+                        compat/android/jni/java/org/ffmpeg/FFMpegNative.java)
+          if [ -z "$JEXPECTED" ]; then
+            echo "::error::BRIDGE_API_VERSION formula changed in FFMpegNative.java; update this gate"
+            exit 1
+          fi
+          JMAJOR=$(sed -n 's/.*BRIDGE_API_MAJOR *= *\([0-9]*\).*/\1/p' \
+                     compat/android/jni/java/org/ffmpeg/FFMpegNative.java | head -1)
+          JMINOR=$(sed -n 's/.*BRIDGE_API_MINOR *= *\([0-9]*\).*/\1/p' \
+                     compat/android/jni/java/org/ffmpeg/FFMpegNative.java | head -1)
+          if [ "$(( (JMAJOR << 16) | JMINOR ))" != "$EXPECTED" ]; then
+            echo "::error::FFMpegNative.java declares $JMAJOR.$JMINOR but ffmpeg_jni.c declares $MAJOR.$MINOR"
+            exit 1
+          fi
+
+          # Every shipped .so must be accompanied by its provenance record.
+          # The revision there is not compared with the manifest: both come
+          # from the same `git rev-parse` in the same workflow, so equality
+          # would hold by construction and prove nothing. What IS checked is
+          # that the record exists, names the ABI whose directory holds it,
+          # and carries finished values -- an empty or "unknown" field means
+          # the .so cannot be tied back to anything.
+          shopt -s nullglob
+          prov=(ffmpeg-jni-bundle/build-info/*/build-provenance.txt)
+          # `${#prov[@]}` under `set -u` is safe for an empty array only in
+          # bash 4.4+; assign a definite length rather than rely on that.
+          prov_count=${#prov[@]}
+          if [ "$prov_count" -eq 0 ]; then
+            echo "::error::no build-provenance.txt in the bundle: artifacts are untraceable"
+            exit 1
+          fi
+          for f in "${prov[@]}"; do
+            dir_abi=$(basename "$(dirname "$f")")
+            file_abi=$(sed -n 's/^abi=//p' "$f")
+            if [ "$dir_abi" != "$file_abi" ]; then
+              echo "::error::$f says abi=$file_abi but sits in $dir_abi/"
+              exit 1
+            fi
+            for key in source_revision ndk build_id; do
+              val=$(sed -n "s/^${key}=//p" "$f")
+              case "$val" in
+                ""|unknown)
+                  echo "::error::$f has ${key}='${val}': the shipped .so carries no ${key}"
+                  exit 1
+                  ;;
+              esac
+            done
+            # The shipped library must exist next to the record it describes.
+            if [ ! -f "ffmpeg-jni-bundle/jniLibs/$dir_abi/libffmpeg_jni.so" ]; then
+              echo "::error::$f has no matching jniLibs/$dir_abi/libffmpeg_jni.so"
+              exit 1
+            fi
+          done
+          echo "manifest verified: bridgeApi=$EXPECTED, $prov_count provenance record(s)"
 
       - name: Upload bundled artifact
         uses: actions/upload-artifact@v4
