@@ -165,7 +165,10 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
 /* ------------------------------------------------------------------ */
 
 #define FF_JNI_BRIDGE_API_MAJOR 1
-#define FF_JNI_BRIDGE_API_MINOR 0
+/* 1.1 adds the bounded PCM resampling session. It only appends entry points,
+ * so this is a minor bump: a 1.0 caller keeps working unchanged, and a 1.1
+ * caller detects the capability bit instead of guessing from the version. */
+#define FF_JNI_BRIDGE_API_MINOR 1
 #define FF_JNI_BRIDGE_API_VERSION \
     ((FF_JNI_BRIDGE_API_MAJOR << 16) | FF_JNI_BRIDGE_API_MINOR)
 
@@ -173,6 +176,9 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
 #define FF_JNI_CAP_SIDE_DATA_EXACT_COPY  (1LL << 1)
 #define FF_JNI_CAP_BRIDGE_BUILD_INFO     (1LL << 2)
 #define FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE (1LL << 3)
+/* pcmSessionCreate/Convert/Drain/Reset/Free are implemented, with limits
+ * enforced before any allocation or input consumption. */
+#define FF_JNI_CAP_BOUNDED_PCM_RESAMPLE  (1LL << 4)
 
 /* Bumped whenever the packet budget accounting rules change, so a stored
  * charge value can be attributed to the policy that produced it. */
@@ -190,7 +196,8 @@ Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
     return (jlong)(FF_JNI_CAP_PACKET_BUDGET_INFO |
                    FF_JNI_CAP_SIDE_DATA_EXACT_COPY |
                    FF_JNI_CAP_BRIDGE_BUILD_INFO |
-                   FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE);
+                   FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE |
+                   FF_JNI_CAP_BOUNDED_PCM_RESAMPLE);
 }
 
 /* ABI string for the compiled object, not the device ABI: it identifies
@@ -864,6 +871,51 @@ static int ff_jni_budget_add(uint64_t *total, uint64_t value)
  * and mirrored by FFMpegNative.PACKET_BUDGET_INFO_SLOTS. */
 #define FF_JNI_PACKET_BUDGET_SLOTS 6
 
+/* Bytes occupied by count samples of the given format and channel count.
+ *
+ * Java passes sample *counts* as jint, and the size is
+ * count * bytes_per_sample * channels. Computing that in int (as swrConvert
+ * used to) wraps for perfectly expressible requests -- 2^28 S16 stereo samples
+ * is 1 GiB, which fits in int64 but not in int -- and a wrapped "capacity" is
+ * then indistinguishable from a real one. The product is therefore formed in
+ * 64 bits with an explicit bound check at each step.
+ *
+ * Planar and interleaved audio occupy the same total number of bytes, so one
+ * formula covers both. Returns the byte count, or a negative AVERROR on
+ * invalid arguments or overflow. */
+static int64_t ff_jni_audio_bytes(int64_t count, int fmt, int channels)
+{
+    const int bps = av_get_bytes_per_sample((enum AVSampleFormat)fmt);
+    const int64_t limit = INT64_MAX;
+
+    /* Divide-by-zero is impossible past this point: bps and channels are
+     * both >= 1, so the two divisions below are always well defined. */
+    if (count < 0 || bps <= 0 || channels <= 0)
+        return AVERROR(EINVAL);
+    if (count > limit / bps)
+        return AVERROR(EOVERFLOW);
+    if (count * bps > limit / channels)
+        return AVERROR(EOVERFLOW);
+    return count * bps * channels;
+}
+
+/* Channel count implied by a layout mask. 0 means "the mask does not describe
+ * a usable layout", which callers treat as "cannot size" rather than
+ * guessing a count. */
+static int ff_jni_mask_channels(uint64_t mask)
+{
+    AVChannelLayout l = { 0 };
+    int ch;
+
+    if (!mask)
+        return 0;
+    if (av_channel_layout_from_mask(&l, mask) < 0)
+        return 0;
+    ch = l.nb_channels;
+    av_channel_layout_uninit(&l);
+    return ch;
+}
+
 /* Fill out[0..FF_JNI_PACKET_BUDGET_SLOTS-1] for a packet. Split from the JNI
  * wrapper so it can be exercised without a JVM. Returns 0 or a negative
  * AVERROR; on failure the caller must not publish the array. */
@@ -1496,51 +1548,101 @@ Java_org_ffmpeg_FFMpegNative_swrInit(JNIEnv *env, jobject thiz, jlong ctx)
     return c ? (jint)swr_init(c) : AVERROR(EINVAL);
 }
 
+/* Capacity check for swrConvert(), split out so the limit can be tested
+ * without a JVM.
+ *
+ * outCount/inCount are sample counts supplied by Java; outCapacity is the
+ * real length of the out array as reported by GetArrayLength(). The old code
+ * computed out_bytes = outCount * bps * channels in int and then never
+ * compared it to anything, so swr_convert() was handed outCount unchecked:
+ * an outCount larger than the array wrote past its end, and an overflowing
+ * product silently turned into an unrelated (or negative) number.
+ *
+ * swr_convert() consumes every input sample it is given in one call, so there
+ * is no point at which a partially-consumed input could be rolled back. The
+ * only safe place to refuse is therefore before the call, which is why this
+ * runs first: on any failure nothing is converted and nothing is consumed.
+ *
+ * A NULL input means "drain", exactly as before; the input size is then not
+ * required. Returns 0 when the request fits, or a negative AVERROR. */
+static int ff_jni_swr_convert_check(int64_t outCount, int64_t outCapacity,
+                                    int64_t inCount, int have_in,
+                                    int outFmt, int outCh,
+                                    int inFmt, int inCh)
+{
+    int64_t out_bytes;
+    int64_t in_bytes;
+
+    if (outCount <= 0 || outCapacity < 0)
+        return AVERROR(EINVAL);
+    if (outCh <= 0)
+        return AVERROR(EINVAL);
+
+    out_bytes = ff_jni_audio_bytes(outCount, outFmt, outCh);
+    if (out_bytes < 0)
+        return (int)out_bytes;
+    /* The array must really hold what the caller asked for. */
+    if (out_bytes > outCapacity)
+        return AVERROR(ENOMEM);
+
+    /* Input size is arithmetic only: swr_convert() reads outCount samples it
+     * was promised, so an input byte count that cannot be formed is a caller
+     * bug worth reporting, not something to clamp. */
+    in_bytes = have_in ? ff_jni_audio_bytes(inCount, inFmt, inCh) : 0;
+    if (in_bytes < 0)
+        return (int)in_bytes;
+    return 0;
+}
+
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_swrConvert(JNIEnv *env, jobject thiz, jlong ctx,
                                         jbyteArray out, jint outCount,
                                         jbyteArray in, jint inCount)
 {
     struct SwrContext *c = PTR(struct SwrContext *, ctx);
+    int64_t out_layout = 0, out_fmt_i = 0;
+    int64_t in_layout = 0, in_fmt_i = 0;
+    int out_ch, in_ch, check;
+    jbyte *out_ptr, *in_ptr = NULL;
+    uint8_t *out_bufs[1];
+    const uint8_t *in_cb[1] = { NULL };
+    int ret;
+
     if (!c || !out)
         return AVERROR(EINVAL);
 
-    int64_t out_layout = 0, out_fmt_i = 0;
     av_opt_get_int(c, "out_channel_layout", 0, &out_layout);
     av_opt_get_int(c, "out_sample_fmt",     0, &out_fmt_i);
-    enum AVSampleFormat out_fmt = (enum AVSampleFormat)(int)out_fmt_i;
-    AVChannelLayout out_ch_layout;
-    if (av_channel_layout_from_mask(&out_ch_layout, (uint64_t)out_layout) < 0) {
-        av_channel_layout_default(&out_ch_layout, 0);
-    }
-    int out_ch = out_ch_layout.nb_channels;
-    av_channel_layout_uninit(&out_ch_layout);
-    int out_bps = av_get_bytes_per_sample(out_fmt);
-    if (out_ch <= 0 || out_bps <= 0 || outCount <= 0)
-        return AVERROR(EINVAL);
-    int out_bytes = outCount * out_bps * out_ch;
-    jbyte *out_ptr = (*env)->GetByteArrayElements(env, out, NULL);
+    av_opt_get_int(c, "in_channel_layout",  0, &in_layout);
+    av_opt_get_int(c, "in_sample_fmt",      0, &in_fmt_i);
+    out_ch = ff_jni_mask_channels((uint64_t)out_layout);
+    in_ch  = ff_jni_mask_channels((uint64_t)in_layout);
+
+    /* Runs before any byte[] is pinned or any sample is consumed. */
+    check = ff_jni_swr_convert_check(outCount,
+                                     (*env)->GetArrayLength(env, out),
+                                     inCount, in != NULL,
+                                     (int)out_fmt_i, out_ch,
+                                     (int)in_fmt_i, in_ch);
+    if (check < 0)
+        return check;
+
+    out_ptr = (*env)->GetByteArrayElements(env, out, NULL);
     if (!out_ptr)
         return AVERROR(ENOMEM);
-
-    uint8_t *out_bufs[1] = { (uint8_t *)out_ptr };
-    uint8_t *in_bufs[1] = { NULL };
-    const uint8_t *in_cb[1] = { NULL };
-    jbyte *in_ptr = NULL;
-    int ret;
+    out_bufs[0] = (uint8_t *)out_ptr;
 
     if (in && inCount > 0) {
         in_ptr = (*env)->GetByteArrayElements(env, in, NULL);
         if (!in_ptr) {
-            (*env)->ReleaseByteArrayElements(env, out, out_ptr, 0);
+            (*env)->ReleaseByteArrayElements(env, out, out_ptr, JNI_ABORT);
             return AVERROR(ENOMEM);
         }
-        in_bufs[0] = (uint8_t *)in_ptr;
-        in_cb[0]   = (const uint8_t *)in_ptr;
+        in_cb[0] = (const uint8_t *)in_ptr;
     }
 
     ret = swr_convert(c, out_bufs, outCount,
-                      in ? (const uint8_t *const *)in_cb : NULL,
+                      in ? in_cb : NULL,
                       in ? inCount : 0);
 
     (*env)->ReleaseByteArrayElements(env, out, out_ptr, 0);
@@ -1569,6 +1671,453 @@ Java_org_ffmpeg_FFMpegNative_swrGetOutSamples(JNIEnv *env, jobject thiz, jlong c
 {
     struct SwrContext *c = PTR(struct SwrContext *, ctx);
     return c ? (jint)swr_get_out_samples(c, inSamples) : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Bounded PCM resampling session.                                     */
+/*                                                                     */
+/* swrConvert()/swrConvertFrame() above are a thin passthrough: the    */
+/* caller sizes one output block and libswresample is free to buffer   */
+/* whatever it could not emit. A Java-side "small block" policy cannot */
+/* stop that, because the buffering happens inside swr after the call  */
+/* returned, and the JNI layer never sees it.                          */
+/*                                                                     */
+/* This session owns the SwrContext *and* the limits, so every limit   */
+/* is enforced here, before anything is allocated or consumed:         */
+/*                                                                     */
+/*   - the output block is sized from swr_get_out_samples() after the  */
+/*     first frame's real format is known, never guessed from a Java   */
+/*     sample count;                                                   */
+/*   - a request whose upper bound exceeds maxOutSamplesPerCall is     */
+/*     refused with FF_PCM_LIMIT_EXCEEDED and the input is NOT         */
+/*     consumed (nothing has entered swr, and swr_convert() has not    */
+/*     been called);                                                   */
+/*   - the delay swr carries between calls is measured through         */
+/*     swr_get_delay() and refused with FF_PCM_LIMIT_EXCEEDED when it  */
+/*     exceeds maxDelaySamples, which is what stops a caller from      */
+/*     feeding input while never draining it;                          */
+/*   - drain and convert share the same checks, so end-of-stream       */
+/*     cannot bypass the limits that normal conversion obeys.          */
+/*                                                                     */
+/* What is NOT bounded: the memory libswresample allocates for its own */
+/* filter tables and delay line when the format is first configured.   */
+/* swr_init() must build those before a single output sample can be    */
+/* produced, so no sample-count check can precede them. The session    */
+/* therefore bounds samples in flight and buffers it hands out; it is  */
+/* not a hard cap on process memory, and callers must not treat the    */
+/* reported numbers as one.                                            */
+/* ------------------------------------------------------------------ */
+
+/* Result codes. Negative values are AVERRORs so they compose with the rest
+ * of the bridge; the non-negative ones are statuses a caller must branch on
+ * rather than treat as "bytes written". */
+#define FF_PCM_OUTPUT_READY        0  /* output samples written; input consumed */
+#define FF_PCM_INPUT_CONSUMED      1  /* all input taken, no output this call */
+#define FF_PCM_NEED_DRAIN          2  /* samples are still buffered in swr */
+#define FF_PCM_DRAINED             3  /* nothing left; the tail is complete */
+/* The frame's format differs from the configured one and the old context
+ * still holds a tail. Nothing was consumed and nothing was reconfigured:
+ * the caller must drain the old tail to completion first, then present the
+ * same frame again, at which point the format change is committed. This
+ * refuses to trade the tail away for the convenience of switching in one
+ * call -- dropping it would punch a silent hole in the timeline. */
+#define FF_PCM_FORMAT_CHANGE       4
+
+/* Distinct from AVERROR(ENOMEM): "your block is too small for this input"
+ * is a caller-visible policy refusal, not an allocation failure, and the
+ * caller must not retry it with the same numbers. */
+static int ff_pcm_limit_exceeded(void)
+{
+    return AVERROR(ENOSPC);
+}
+
+#define FF_PCM_LIMIT_EXCEEDED ff_pcm_limit_exceeded()
+
+/* Defaults are only a starting point; Java always passes explicit limits. */
+typedef struct FFPcmLimits {
+    int max_out_samples;   /* per call, per channel */
+    int max_in_samples;    /* per call, per channel */
+    int max_delay_samples; /* swr internal backlog, in output samples */
+} FFPcmLimits;
+
+typedef struct FFPcmSession {
+    struct SwrContext *swr;
+
+    FFPcmLimits limits;
+
+    /* Output format is fixed at create time: the player's AudioTrack never
+     * changes mid-stream. The layout is kept as an owned AVChannelLayout
+     * rather than a raw mask so a custom layout survives the round trip. */
+    int             out_fmt;
+    int             out_rate;
+    AVChannelLayout out_layout;
+
+    /* Input format currently configured in swr. Valid only when configured
+     * is set; a format change replaces it transactionally. */
+    int             configured;
+    int             in_fmt;
+    int             in_rate;
+    AVChannelLayout in_layout;    /* fully owned deep copy, freed on replace */
+} FFPcmSession;
+
+/* Layouts are compared by value here, never by pointer: a frame's layout
+ * dies with the frame. av_channel_layout_compare() is what decides, so two
+ * different masks that describe the same channels stay one format. */
+static int ff_pcm_format_matches(const FFPcmSession *s, int fmt, int rate,
+                                 const AVChannelLayout *layout)
+{
+    if (!s->configured)
+        return 0;
+    if (s->in_fmt != fmt || s->in_rate != rate)
+        return 0;
+    if (!layout || !av_channel_layout_check(layout))
+        return 0;
+    if (av_channel_layout_compare(&s->in_layout, layout) != 0)
+        return 0;
+    return 1;
+}
+
+/* Replace the configured input format. The new SwrContext is built and
+ * initialised first and only then swapped in, so a failure leaves the
+ * session exactly as it was instead of on a half-initialised context. */
+static int ff_pcm_configure(FFPcmSession *s, int fmt, int rate,
+                            const AVChannelLayout *layout)
+{
+    struct SwrContext *next = NULL;
+    AVChannelLayout copy = { 0 };
+    int ret;
+
+    if (!layout || !av_channel_layout_check(layout) || rate <= 0)
+        return AVERROR(EINVAL);
+    if (!s->out_layout.order || s->out_layout.nb_channels <= 0)
+        return AVERROR(EINVAL);
+
+    ret = swr_alloc_set_opts2(&next, &s->out_layout,
+                              (enum AVSampleFormat)s->out_fmt, s->out_rate,
+                              layout,
+                              (enum AVSampleFormat)fmt, rate, 0, NULL);
+    if (ret < 0 || !next)
+        return ret < 0 ? ret : AVERROR(ENOMEM);
+
+    ret = swr_init(next);
+    if (ret < 0) {
+        swr_free(&next);
+        return ret;
+    }
+
+    /* Deep-copy the layout *before* touching the live state: everything that
+     * can fail has to fail while the old context is still intact. */
+    if (av_channel_layout_copy(&copy, layout) < 0) {
+        swr_free(&next);
+        return AVERROR(ENOMEM);
+    }
+
+    /* Commit: nothing below can fail. */
+    swr_free(&s->swr);
+    s->swr = next;
+    av_channel_layout_uninit(&s->in_layout);
+    s->in_layout  = copy;          /* ownership of any map moves in */
+    s->in_fmt     = fmt;
+    s->in_rate    = rate;
+    s->configured = 1;
+    return 0;
+}
+
+/* Upper bound on what one call may emit for `in_samples` of input, in
+ * output samples per channel. Checked arithmetic only: an absurd request is
+ * a refusal, never a wrapped small number that then passes the limit test. */
+static int64_t ff_pcm_out_bound(FFPcmSession *s, int64_t in_samples)
+{
+    int64_t bound;
+
+    if (in_samples < 0)
+        return AVERROR(EINVAL);
+    bound = swr_get_out_samples(s->swr, (int)in_samples);
+    if (bound < 0)
+        return bound;
+    return bound;
+}
+
+/* Shared gate for convert and drain.
+ *
+ * Runs before any byte[] is pinned or any sample is handed to swr. Because
+ * swr_convert() takes all of its input in one call, this is the only point
+ * at which "refused, input untouched" can still be true. */
+static int ff_pcm_check_call(FFPcmSession *s, int64_t in_samples,
+                             int64_t out_count, int64_t out_capacity)
+{
+    int64_t bound, bytes;
+    int64_t delay;
+    int ret;
+
+    if (!s->swr || !s->configured)
+        return AVERROR(EINVAL);
+    if (out_count <= 0)
+        return AVERROR(EINVAL);
+    if (in_samples > s->limits.max_in_samples)
+        return FF_PCM_LIMIT_EXCEEDED;
+
+    /* Output block must fit the caller's array before we compute anything
+     * else: an under-sized array is a bug, not a budget condition. */
+    bytes = ff_jni_audio_bytes(out_count, s->out_fmt,
+                               s->out_layout.nb_channels);
+    if (bytes < 0)
+        return (int)bytes;
+    if (bytes > out_capacity)
+        return AVERROR(ENOMEM);
+
+    bound = ff_pcm_out_bound(s, in_samples);
+    if (bound < 0)
+        return (int)bound;
+    if (bound > s->limits.max_out_samples)
+        return FF_PCM_LIMIT_EXCEEDED;
+
+    /* What swr is already holding. Measured in output samples so it is
+     * comparable with the output block and with the limit the caller set. */
+    delay = swr_get_delay(s->swr, s->out_rate);
+    if (delay < 0)
+        return (int)delay;
+    if (delay > s->limits.max_delay_samples)
+        return FF_PCM_LIMIT_EXCEEDED;
+
+    return 0;
+}
+
+/* Convert one frame worth of samples. `in` may be NULL for drain.
+ *
+ * Returns a non-negative status (FF_PCM_*) with *produced set to the number
+ * of output samples written, or a negative AVERROR. On any negative return
+ * no input sample has been consumed. */
+static int ff_pcm_convert_internal(FFPcmSession *s, const uint8_t *const *in,
+                                   int in_samples, uint8_t *const *out,
+                                   int out_count, int *produced)
+{
+    int ret;
+
+    *produced = 0;
+    ret = swr_convert(s->swr, out, out_count, in, in_samples);
+    if (ret < 0)
+        return ret;
+    *produced = ret;
+    if (ret > 0)
+        return FF_PCM_OUTPUT_READY;
+    /* Nothing emitted. Distinguish "input accepted, still cooking" from
+     * "nothing left", because the caller's cursor advances in the first case
+     * and the stream ends in the second. */
+    if (in_samples > 0)
+        return FF_PCM_INPUT_CONSUMED;
+    return swr_get_delay(s->swr, s->out_rate) > 0 ? FF_PCM_NEED_DRAIN
+                                                  : FF_PCM_DRAINED;
+}
+
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_pcmSessionCreate(JNIEnv *env, jobject thiz,
+                                              jint outFmt, jint outRate,
+                                              jlong outLayoutMask,
+                                              jint maxOutSamples,
+                                              jint maxInSamples,
+                                              jint maxDelaySamples)
+{
+    FFPcmSession *s;
+    int ret;
+
+    if (outRate <= 0 || outLayoutMask == 0 ||
+        maxOutSamples <= 0 || maxInSamples <= 0 || maxDelaySamples < 0)
+        return 0;
+    if (av_get_bytes_per_sample((enum AVSampleFormat)outFmt) <= 0)
+        return 0;
+
+    s = av_mallocz(sizeof(*s));
+    if (!s)
+        return 0;
+
+    /* The output layout is owned by the session: copy it, never alias a
+     * caller-owned layout that may be freed first. */
+    ret = av_channel_layout_from_mask(&s->out_layout, (uint64_t)outLayoutMask);
+    if (ret < 0) {
+        av_free(s);
+        return 0;
+    }
+    s->out_fmt        = outFmt;
+    s->out_rate       = outRate;
+    s->limits.max_out_samples   = maxOutSamples;
+    s->limits.max_in_samples    = maxInSamples;
+    s->limits.max_delay_samples = maxDelaySamples;
+    return (jlong)(intptr_t)s;
+}
+
+/* Convert one input frame. The frame is read, never retained: a format
+ * change re-configures the session from the frame's own values, so the
+ * frame must outlive the call but nothing after it. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_pcmSessionConvert(JNIEnv *env, jobject thiz,
+                                               jlong handle, jlong frame,
+                                               jbyteArray out, jint outCount,
+                                               jintArray status)
+{
+    FFPcmSession *s = PTR(FFPcmSession *, handle);
+    AVFrame *f = PTR(AVFrame *, frame);
+    int produced = 0;
+    int check, ret, in_samples;
+    jint zero = 0;
+    jbyte *out_ptr;
+
+    if (!s || !f || !out || !status)
+        return AVERROR(EINVAL);
+    /* Publish "nothing produced" up front so every failure path leaves the
+     * caller's status slot defined instead of holding a stale value. */
+    if ((*env)->GetArrayLength(env, status) < 1)
+        return AVERROR(EINVAL);
+    (*env)->SetIntArrayRegion(env, status, 0, 1, &zero);
+
+    in_samples = f->nb_samples;
+    if (in_samples < 0 || f->sample_rate <= 0 || f->format < 0 ||
+        !av_channel_layout_check(&f->ch_layout))
+        return AVERROR(EINVAL);
+
+    /* The per-call input budget is decided *before* any configuration work:
+     * configuring allocates libswresample's tables, and a call that is going
+     * to be refused must not pay for them. This is the only check that can
+     * run before the format is even known to be different. */
+    if (in_samples > s->limits.max_in_samples)
+        return FF_PCM_LIMIT_EXCEEDED;
+
+    /* Format snapshot. A change is a transaction, not an in-place edit:
+     *
+     *   1. if the old context still buffers samples, refuse for now
+     *      (FF_PCM_FORMAT_CHANGE, input untouched) so the caller drains the
+     *      old tail through the old configuration;
+     *   2. once drained, build and validate a new context;
+     *   3. convert this same frame exactly once.
+     *
+     * Reconfiguring immediately would discard the old resampler's tail, and
+     * the caller would have no way to detect the gap. */
+    if (!ff_pcm_format_matches(s, f->format, f->sample_rate, &f->ch_layout)) {
+        if (s->configured && s->swr &&
+            swr_get_delay(s->swr, s->out_rate) > 0)
+            return FF_PCM_FORMAT_CHANGE;
+        check = ff_pcm_configure(s, f->format, f->sample_rate, &f->ch_layout);
+        if (check < 0)
+            return check;
+    }
+
+    /* Remaining limits (output bound, delay, array capacity). The input
+     * check is repeated here for the drain-free path but is now a no-op;
+     * keeping it in one place would mean configuring before checking. */
+    check = ff_pcm_check_call(s, in_samples, outCount,
+                              (*env)->GetArrayLength(env, out));
+    if (check < 0)
+        return check;
+
+    out_ptr = (*env)->GetByteArrayElements(env, out, NULL);
+    if (!out_ptr)
+        return AVERROR(ENOMEM);
+
+    {
+        uint8_t *dst[AV_NUM_DATA_POINTERS] = { (uint8_t *)out_ptr };
+        ret = ff_pcm_convert_internal(s, (const uint8_t *const *)f->data,
+                                      in_samples, dst, outCount, &produced);
+    }
+
+    (*env)->ReleaseByteArrayElements(env, out, out_ptr, 0);
+    if (ret < 0)
+        return ret;
+
+    (*env)->SetIntArrayRegion(env, status, 0, 1, &produced);
+    return ret;
+}
+
+/* Emit the buffered tail. Same limits as convert: a drain that could emit
+ * more than maxOutSamples is refused rather than silently truncated. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_pcmSessionDrain(JNIEnv *env, jobject thiz,
+                                             jlong handle, jbyteArray out,
+                                             jint outCount, jintArray status)
+{
+    FFPcmSession *s = PTR(FFPcmSession *, handle);
+    int produced = 0;
+    int check, ret;
+    jint zero = 0;
+    jbyte *out_ptr;
+
+    if (!s || !out || !status)
+        return AVERROR(EINVAL);
+    if ((*env)->GetArrayLength(env, status) < 1)
+        return AVERROR(EINVAL);
+    (*env)->SetIntArrayRegion(env, status, 0, 1, &zero);
+
+    /* in_samples == 0: only the delay budget and the output block apply. */
+    check = ff_pcm_check_call(s, 0, outCount,
+                              (*env)->GetArrayLength(env, out));
+    if (check < 0)
+        return check;
+
+    out_ptr = (*env)->GetByteArrayElements(env, out, NULL);
+    if (!out_ptr)
+        return AVERROR(ENOMEM);
+
+    {
+        uint8_t *dst[AV_NUM_DATA_POINTERS] = { (uint8_t *)out_ptr };
+        ret = ff_pcm_convert_internal(s, NULL, 0, dst, outCount, &produced);
+    }
+
+    (*env)->ReleaseByteArrayElements(env, out, out_ptr, 0);
+    if (ret < 0)
+        return ret;
+
+    (*env)->SetIntArrayRegion(env, status, 0, 1, &produced);
+    return ret;
+}
+
+/* Drop everything buffered, keeping the configured format. Used for a seek
+ * or a discontinuity: the old timeline must not bleed into the new one. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_pcmSessionReset(JNIEnv *env, jobject thiz,
+                                             jlong handle)
+{
+    FFPcmSession *s = PTR(FFPcmSession *, handle);
+    struct SwrContext *rebuilt = NULL;
+    int ret;
+
+    if (!s)
+        return AVERROR(EINVAL);
+    if (!s->configured || !s->swr)
+        return 0;              /* nothing buffered, nothing to drop */
+
+    /* Building a fresh context is the only way to be sure the delay really
+     * reached zero: re-initialising in place leaves the buffer contents to
+     * the implementation. The configured format is preserved, so the next
+     * convert() is not treated as a format change. */
+    ret = swr_alloc_set_opts2(&rebuilt, &s->out_layout,
+                              (enum AVSampleFormat)s->out_fmt, s->out_rate,
+                              &s->in_layout,
+                              (enum AVSampleFormat)s->in_fmt, s->in_rate,
+                              0, NULL);
+    if (ret < 0 || !rebuilt) {
+        swr_free(&rebuilt);
+        return ret < 0 ? ret : AVERROR(ENOMEM);
+    }
+    ret = swr_init(rebuilt);
+    if (ret < 0) {
+        swr_free(&rebuilt);
+        return ret;
+    }
+    swr_free(&s->swr);
+    s->swr = rebuilt;
+    return 0;
+}
+
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_pcmSessionFree(JNIEnv *env, jobject thiz, jlong handle)
+{
+    FFPcmSession *s = PTR(FFPcmSession *, handle);
+
+    if (!s)
+        return;
+    swr_free(&s->swr);
+    av_channel_layout_uninit(&s->in_layout);
+    av_channel_layout_uninit(&s->out_layout);
+    av_free(s);
 }
 
 /* ------------------------------------------------------------------ */

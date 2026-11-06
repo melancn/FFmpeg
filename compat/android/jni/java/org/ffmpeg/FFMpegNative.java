@@ -111,7 +111,7 @@ public final class FFMpegNative {
     public static final int BRIDGE_API_MAJOR = 1;
 
     /** Bridge contract minor version implemented by this JAR. */
-    public static final int BRIDGE_API_MINOR = 0;
+    public static final int BRIDGE_API_MINOR = 1;
 
     /** {@code major << 16 | minor}; first release is {@code 0x00010000}. */
     public static final int BRIDGE_API_VERSION = (BRIDGE_API_MAJOR << 16) | BRIDGE_API_MINOR;
@@ -132,6 +132,18 @@ public final class FFMpegNative {
      * anyway would throw {@link UnsatisfiedLinkError} instead of degrading.
      */
     public static final long CAP_FRAME_LAYOUT_NORMALIZE = 1L << 3;
+
+    /**
+     * {@code pcmSessionCreate/Convert/Drain/Reset/Free} are implemented, with
+     * all limits enforced before any allocation or input consumption.
+     *
+     * <p>Gate every bounded-resampling call on this bit. A library built
+     * before 1.1 answers 0 here; calling the session methods anyway throws
+     * {@link UnsatisfiedLinkError} rather than degrading.
+     *
+     * @see #pcmSessionCreate
+     */
+    public static final long CAP_BOUNDED_PCM_RESAMPLE = 1L << 4;
 
     /**
      * Number of elements {@link #packetGetBudgetInfo} requires in its output
@@ -1553,6 +1565,17 @@ public final class FFMpegNative {
      * {@code inCount * inChannels * bytesPerSample(inFmt)} bytes; {@code out}
      * must hold {@code outCount * outChannels * bytesPerSample(outFmt)}.
      *
+     * <p>{@code outCount} is a capacity, not a promise: the array's real
+     * length is checked against it before anything is converted. A request
+     * that does not fit returns {@code AVERROR(ENOMEM)} without touching the
+     * resampler. Pass {@code in == null} to drain buffered tail samples.
+     *
+     * <p>libswresample consumes every input sample it is handed in a single
+     * call, so an accepted call always consumes all {@code inCount} samples
+     * even when it produces fewer than {@code outCount} output samples.
+     * There is no partial-consumption result; size the output from
+     * {@link #swrGetOutSamples} when that distinction matters.
+     *
      * @return number of output samples produced, or negative AVERROR
      */
     public native int swrConvert(long ctx, byte[] out, int outCount,
@@ -1577,6 +1600,129 @@ public final class FFMpegNative {
      * @return 0 on success, negative AVERROR otherwise
      */
     public native int swrConvertFrame(long ctx, long outFrame, long inFrame);
+
+    /* ================================================================== */
+    /* Bounded PCM resampling session                                      */
+    /*                                                                     */
+    /* The swr* entry points above pass straight through to              */
+    /* libswresample: they cannot stop it from buffering whatever it      */
+    /* could not emit, so a "keep blocks small" policy on the Java side   */
+    /* only moves the backlog into native memory where nothing counts it. */
+    /*                                                                    */
+    /* A session owns the resampler together with explicit limits, and    */
+    /* enforces them before anything is allocated or consumed. All of it  */
+    /* is gated on CAP_BOUNDED_PCM_RESAMPLE.                              */
+    /* ================================================================== */
+
+    /** Output samples were written; the input frame has been consumed. */
+    public static final int PCM_OUTPUT_READY = 0;
+
+    /**
+     * All input was taken but nothing could be emitted yet (a filter that
+     * needs look-ahead). Advance your input cursor and feed the next frame.
+     */
+    public static final int PCM_INPUT_CONSUMED = 1;
+
+    /** Samples remain buffered inside the session; call {@link #pcmSessionDrain}. */
+    public static final int PCM_NEED_DRAIN = 2;
+
+    /** Nothing is buffered: the tail is complete for the current format. */
+    public static final int PCM_DRAINED = 3;
+
+    /**
+     * The frame's format differs from the configured one and the old
+     * resampler still holds a tail.
+     *
+     * <p>Nothing was consumed and nothing was reconfigured. Drain the old
+     * tail to {@link #PCM_DRAINED} first, then present the same frame again:
+     * the format change is committed at that point and the frame is converted
+     * exactly once. Switching immediately would silently drop the tail.
+     *
+     * @see #pcmSessionDrain
+     */
+    public static final int PCM_FORMAT_CHANGE = 4;
+
+    /**
+     * Create a bounded resampling session.
+     *
+     * <p>The output format is fixed for the life of the session (the player's
+     * AudioTrack does not change mid-stream). Input format is not specified
+     * here: it is taken from the first frame converted and re-committed only
+     * when a frame actually carries a different one.
+     *
+     * <p>Limits are in samples per channel:
+     * <ul>
+     *   <li>{@code maxOutSamples} bounds the output of any single convert or
+     *       drain call. A request whose {@code swr_get_out_samples()} upper
+     *       bound exceeds it is refused before conversion.</li>
+     *   <li>{@code maxInSamples} bounds the input of any single call.</li>
+     *   <li>{@code maxDelaySamples} bounds what the session may carry between
+     *       calls. This is the limit that stops a caller from feeding input
+     *       without ever draining it.</li>
+     * </ul>
+     *
+     * <p>These bound samples in flight and buffers handed out; they are
+     * <em>not</em> a hard cap on process memory. libswresample allocates its
+     * filter tables and delay line inside {@code swr_init()}, before any
+     * sample-count check can run. Budget the Java-side copies and the owner's
+     * copies separately.
+     *
+     * @param outFmt           {@code AV_SAMPLE_FMT_*} of the output
+     * @param outRate          output sample rate in Hz
+     * @param outLayoutMask    {@code AV_CH_LAYOUT_*} of the output
+     * @param maxOutSamples    per-call output limit, per channel
+     * @param maxInSamples     per-call input limit, per channel
+     * @param maxDelaySamples  internal backlog limit, in output samples
+     * @return session handle, or 0 on invalid arguments
+     */
+    public native long pcmSessionCreate(int outFmt, int outRate,
+                                        long outLayoutMask,
+                                        int maxOutSamples,
+                                        int maxInSamples,
+                                        int maxDelaySamples);
+
+    /**
+     * Convert one frame into {@code out}.
+     *
+     * <p>{@code outCount} is the output capacity in samples per channel;
+     * {@code out} must hold {@code outCount * outChannels *
+     * bytesPerSample(outFmt)} bytes, and that is checked before converting.
+     *
+     * <p>{@code status[0]} receives the number of output samples written (0
+     * on any failure, including a refusal). The return value says what
+     * happened, see the {@code PCM_*} constants.
+     *
+     * @return a {@code PCM_*} status, or a negative AVERROR (including
+     *         {@code AVERROR(ENOSPC)} for a limit refusal, where the input is
+     *         guaranteed unconsumed)
+     */
+    public native int pcmSessionConvert(long handle, long frame,
+                                        byte[] out, int outCount,
+                                        int[] status);
+
+    /**
+     * Emit the buffered tail into {@code out}.
+     *
+     * <p>Obeys the same limits as {@link #pcmSessionConvert}: a drain that
+     * could emit more than {@code maxOutSamples} is refused rather than
+     * truncated. Returns {@link #PCM_DRAINED} when the tail is complete.
+     */
+    public native int pcmSessionDrain(long handle, byte[] out, int outCount,
+                                      int[] status);
+
+    /**
+     * Drop everything buffered, keeping the configured format.
+     *
+     * <p>For a seek or a discontinuity. Do not use it to retry a format
+     * change: the old timeline must not bleed into the new one, and mixing
+     * the two would make a gap indistinguishable from a reset.
+     *
+     * @return 0, or negative AVERROR
+     */
+    public native int pcmSessionReset(long handle);
+
+    /** Release the session and its resampler. Safe on 0. */
+    public native void pcmSessionFree(long handle);
 
     /** @return next pts after conversion (used for A/V sync). */
     public native long swrNextPts(long ctx, long pts);

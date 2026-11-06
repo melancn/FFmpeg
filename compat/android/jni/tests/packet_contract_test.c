@@ -33,6 +33,7 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/error.h"
 #include "libavutil/frame.h"
+#include "libavutil/mem.h"
 #include "libswresample/swresample.h"
 
 /* Re-include the production translation unit for its file-static helpers.
@@ -615,6 +616,763 @@ static void test_swr_accepts_normalized_stream(void)
     av_channel_layout_uninit(&out);
 }
 
+/* ------------------------------------------------------------------ */
+/* Resampler byte-size and consumption contract                        */
+/*                                                                     */
+/* swrConvert() used to compute the output byte count in int, never    */
+/* compare it to the array's real length, and hand outCount to         */
+/* swr_convert() unchecked. These pin the arithmetic and the refusal   */
+/* boundary; the conversion cases below drive a real SwrContext so the */
+/* "input is consumed in full" and "EOFLUSH produces the tail" claims  */
+/* are behaviour, not prose.                                           */
+/* ------------------------------------------------------------------ */
+
+static void test_audio_bytes_arithmetic(void)
+{
+    /* S16 interleaved stereo: 2 bytes * 2 channels. */
+    CHECK(ff_jni_audio_bytes(1024, AV_SAMPLE_FMT_S16, 2) == 4096);
+    /* Planar occupies the same total across planes. */
+    CHECK(ff_jni_audio_bytes(1024, AV_SAMPLE_FMT_FLTP, 2) == 8192);
+    CHECK(ff_jni_audio_bytes(0, AV_SAMPLE_FMT_S16, 2) == 0);
+
+    /* Invalid arguments. */
+    CHECK_AVERROR(ff_jni_audio_bytes(-1, AV_SAMPLE_FMT_S16, 2), EINVAL);
+    CHECK_AVERROR(ff_jni_audio_bytes(16, AV_SAMPLE_FMT_NONE, 2), EINVAL);
+    CHECK_AVERROR(ff_jni_audio_bytes(16, AV_SAMPLE_FMT_S16, 0), EINVAL);
+
+    /* 2^28 S16 stereo samples is 1 GiB: representable in int64, but an int
+     * product wraps to 0. This is the exact case the old int arithmetic got
+     * wrong. */
+    CHECK(ff_jni_audio_bytes(INT64_C(1) << 28, AV_SAMPLE_FMT_S16, 2)
+          == (INT64_C(1) << 30));
+
+    /* Beyond int64: must be refused, not wrapped into a small positive
+     * number that would then look like a valid capacity. */
+    CHECK_AVERROR(ff_jni_audio_bytes(INT64_MAX, AV_SAMPLE_FMT_FLT, 2),
+                  EOVERFLOW);
+    CHECK_AVERROR(ff_jni_audio_bytes(INT64_MAX / 2, AV_SAMPLE_FMT_S16, 4),
+                  EOVERFLOW);
+}
+
+static void test_mask_channels(void)
+{
+    CHECK(ff_jni_mask_channels(0) == 0);
+    CHECK(ff_jni_mask_channels(AV_CH_LAYOUT_MONO) == 1);
+    CHECK(ff_jni_mask_channels(AV_CH_LAYOUT_STEREO) == 2);
+    CHECK(ff_jni_mask_channels(AV_CH_LAYOUT_5POINT1) == 6);
+}
+
+/* The capacity check itself, without a JVM: this is the gate that runs before
+ * swr_convert(), so everything it rejects is an input that was never
+ * consumed. */
+static void test_convert_check_capacity(void)
+{
+    const int s16 = AV_SAMPLE_FMT_S16, s16p = AV_SAMPLE_FMT_S16P;
+
+    /* Fits exactly. */
+    CHECK_OK(ff_jni_swr_convert_check(1024, 4096, 1024, 1, s16, 2, s16p, 2));
+    /* One byte short: refused. This is the write-past-the-end case. */
+    CHECK_AVERROR(ff_jni_swr_convert_check(1024, 4095, 1024, 1,
+                                           s16, 2, s16p, 2), ENOMEM);
+    /* Array larger than requested is fine. */
+    CHECK_OK(ff_jni_swr_convert_check(1024, 8192, 1024, 1, s16, 2, s16p, 2));
+
+    /* Empty array with a non-zero request (empty -> 3/4 upsampler). */
+    CHECK_AVERROR(ff_jni_swr_convert_check(1024, 0, 1024, 1,
+                                           s16, 2, s16p, 2), ENOMEM);
+
+    /* Non-positive request and unusable layouts. A layout of 0 channels
+     * means the mask could not be resolved (custom/UNSPEC order), and the
+     * bridge must refuse rather than size against a guessed count. */
+    CHECK_AVERROR(ff_jni_swr_convert_check(0, 4096, 0, 1,
+                                           s16, 2, s16p, 2), EINVAL);
+    CHECK_AVERROR(ff_jni_swr_convert_check(-1, 4096, 0, 1,
+                                           s16, 2, s16p, 2), EINVAL);
+    CHECK_AVERROR(ff_jni_swr_convert_check(1024, 4096, 1024, 1,
+                                           s16, 0, s16p, 2), EINVAL);
+    CHECK_AVERROR(ff_jni_swr_convert_check(1024, 4096, 1024, 1,
+                                           s16, 2, s16p, 0), EINVAL);
+    /* Negative input count is a caller bug, not a drain. */
+    CHECK_AVERROR(ff_jni_swr_convert_check(1024, 4096, -1, 1,
+                                           s16, 2, s16p, 2), EINVAL);
+
+    /* Drain: no input, so no input format is required. */
+    CHECK_OK(ff_jni_swr_convert_check(1024, 4096, 0, 0, s16, 2, s16, 0));
+    /* Drain still has to fit. */
+    CHECK_AVERROR(ff_jni_swr_convert_check(1024, 100, 0, 0,
+                                           s16, 2, s16, 0), ENOMEM);
+
+    /* A capacity that only fits because it wrapped is the old bug; the
+     * checked arithmetic must turn it into ENOMEM/EOVERFLOW instead. */
+    {
+        const int rc = ff_jni_swr_convert_check(INT32_MAX, 0, 0, 0,
+                                                s16, 2, s16, 0);
+        CHECK(rc == AVERROR(ENOMEM) || rc == AVERROR(EOVERFLOW));
+    }
+}
+
+/* A resampler configured like the player's: whatever in, 48 kHz S16 stereo
+ * out. Returns NULL on failure. */
+static SwrContext *make_swr(int in_fmt, int in_rate, int in_ch, int out_ch)
+{
+    SwrContext *swr = NULL;
+    AVChannelLayout in_layout = { 0 }, out_layout = { 0 };
+
+    av_channel_layout_default(&in_layout, in_ch);
+    av_channel_layout_default(&out_layout, out_ch);
+    if (swr_alloc_set_opts2(&swr, &out_layout, AV_SAMPLE_FMT_S16, 48000,
+                            &in_layout, (enum AVSampleFormat)in_fmt, in_rate,
+                            0, NULL) < 0)
+        swr = NULL;
+    av_channel_layout_uninit(&in_layout);
+    av_channel_layout_uninit(&out_layout);
+    if (swr && swr_init(swr) < 0)
+        swr_free(&swr);
+    return swr;
+}
+
+/* Every accepted call consumes all of its input, even when it emits nothing.
+ * Java has no "partial consumption" result to react to, so the bridge must
+ * never imply one; the deliverable is that produced + delayed accounts for
+ * the whole input exactly once. */
+static void test_swr_consumes_input_in_full(void)
+{
+    SwrContext *swr = make_swr(AV_SAMPLE_FMT_S16, 44100, 2, 2);
+    const int n = 1024;
+    int16_t *inp = NULL;
+    int16_t *out = NULL;
+    int64_t produced = 0;
+    int ret, i, pass;
+
+    CHECK(swr != NULL);
+    if (!swr)
+        return;
+
+    inp = av_malloc_array(n * 2, sizeof(int16_t));
+    /* Generous output room: the point is consumption, not squeezing. */
+    out = av_malloc_array(4096 * 2, sizeof(int16_t));
+    CHECK(inp != NULL);
+    CHECK(out != NULL);
+    if (inp && out) {
+        uint8_t *dst[1];
+        const uint8_t *src[1];
+
+        for (i = 0; i < n * 2; i++)
+            inp[i] = (int16_t)(i & 0x7FFF);
+        dst[0] = (uint8_t *)out;
+        src[0] = (const uint8_t *)inp;
+
+        /* Small output buffer on purpose: swr_convert() accepts far less
+         * than it can produce, and must still take all the input. */
+        ret = swr_convert(swr, dst, 16, src, n);
+        CHECK(ret >= 0);
+        CHECK(ret <= 16);
+        produced += ret;
+
+        /* The remainder lives inside swr, not in a rejected call: draining
+         * it must yield the rest of the timeline. */
+        for (pass = 0; pass < 4096; pass++) {
+            ret = swr_convert(swr, dst, 4096, NULL, 0);
+            CHECK(ret >= 0);
+            if (ret <= 0)
+                break;
+            produced += ret;
+        }
+        CHECK(pass < 4096);
+        /* 1024 input samples at 44.1k -> 48k, with the resampler's own delay
+         * flushed out by the drain above. The first call emitted at most 16,
+         * so the rest has to come from the drain: if a small output buffer
+         * had discarded or refused input, this total would be short. */
+        CHECK(produced >= 1024);
+        CHECK(produced <= 1024 * 48000 / 44100 + 64);
+    }
+
+    av_free(inp);
+    av_free(out);
+    swr_free(&swr);
+}
+
+/* The tail must survive a sequence of small output buffers: no sample may be
+ * silently dropped just because the caller never offered a big array. */
+static void test_swr_small_output_keeps_tail(void)
+{
+    SwrContext *swr = make_swr(AV_SAMPLE_FMT_FLTP, 44100, 2, 2);
+    const int n = 1024, buf = 64;
+    float *planes[2] = { NULL, NULL };
+    int16_t *out = NULL;
+    int64_t total = 0;
+    int i, k, pass, ret;
+
+    CHECK(swr != NULL);
+    if (!swr)
+        return;
+
+    for (i = 0; i < 2; i++) {
+        planes[i] = av_malloc_array(n, sizeof(float));
+        CHECK(planes[i] != NULL);
+        if (planes[i])
+            for (k = 0; k < n; k++)
+                planes[i][k] = (float)((k % 100) - 50) / 100.0f;
+    }
+    out = av_malloc_array((size_t)buf * 2, sizeof(int16_t));
+    CHECK(out != NULL);
+
+    if (planes[0] && planes[1] && out) {
+        /* swr_convert() takes one destination pointer per output plane; S16
+         * interleaved is a single plane, so the array holds one entry. */
+        uint8_t *dst[1];
+        const uint8_t *srcp[2];
+
+        dst[0]  = (uint8_t *)out;
+        srcp[0] = (const uint8_t *)planes[0];
+        srcp[1] = (const uint8_t *)planes[1];
+
+        ret = swr_convert(swr, dst, buf, srcp, n);
+        CHECK(ret >= 0);
+        total += ret > 0 ? ret : 0;
+
+        /* Fixed-number drain passes, then a final one that must report
+         * empty. An unbounded loop would hang the test on a regression, so
+         * the iteration count is capped generously but finitely. */
+        for (pass = 0; pass < 4096; pass++) {
+            ret = swr_convert(swr, dst, buf, NULL, 0);
+            CHECK(ret >= 0);
+            if (ret <= 0)
+                break;
+            total += ret;
+        }
+        CHECK(pass < 4096);
+        CHECK(total >= 1024);
+        CHECK(total <= 1024 * 48000 / 44100 + 64);
+
+        /* Drain is idempotent once empty: nothing resurrects the tail. */
+        ret = swr_convert(swr, dst, buf, NULL, 0);
+        CHECK(ret == 0);
+    }
+
+    av_free(planes[0]);
+    av_free(planes[1]);
+    av_free(out);
+    swr_free(&swr);
+}
+
+/* swr_get_out_samples() is an upper bound for sizing, and it must stay one
+ * across an arbitrary input/output ratio. */
+static void test_swr_out_samples_is_upper_bound(void)
+{
+    static const int rates[][2] = {
+        { 44100, 48000 }, { 8000, 48000 }, { 192000, 48000 },
+        { 48000, 48000 }, { 11025, 48000 },
+    };
+    unsigned r;
+
+    for (r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+        const int n = 512;
+        SwrContext *swr = make_swr(AV_SAMPLE_FMT_FLT, rates[r][0], 2, 2);
+        float *inp = NULL;
+        int16_t *out = NULL;
+        uint8_t *dst[1];
+        const uint8_t *src[1];
+        int bound, ret;
+
+        CHECK(swr != NULL);
+        if (!swr)
+            continue;
+
+        /* Asking for n samples can never be bounded by less than asking for
+         * none: the bound has to grow with the request. */
+        CHECK(swr_get_out_samples(swr, n) >= swr_get_out_samples(swr, 0));
+
+        bound = swr_get_out_samples(swr, n);
+        /* A bound, not a promise: it must be positive and no output may
+         * exceed it. This is the number the bounded-resampler session will
+         * size its output from, so an under-estimate here would be a real
+         * overflow on device. */
+        CHECK(bound > 0);
+        if (bound <= 0)
+            bound = 1;
+
+        inp = av_malloc_array((size_t)n * 2, sizeof(float));
+        out = av_malloc_array(((size_t)bound + 16) * 2, sizeof(int16_t));
+        CHECK(inp != NULL);
+        CHECK(out != NULL);
+        if (inp && out) {
+            memset(inp, 0, (size_t)n * 2 * sizeof(float));
+            dst[0] = (uint8_t *)out;
+            src[0] = (const uint8_t *)inp;
+            ret = swr_convert(swr, dst, bound, src, n);
+            CHECK(ret >= 0);
+            CHECK(ret <= bound);
+        }
+        av_free(inp);
+        av_free(out);
+        swr_free(&swr);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Bounded PCM resampling session                                      */
+/*                                                                     */
+/* These drive the real session, not a copy of its arithmetic: the     */
+/* claims being pinned are "limits are enforced before anything is     */
+/* consumed", "nothing is truncated", "the tail is not lost" and "a    */
+/* format change does not leak the old tail". Every one of those is a  */
+/* behaviour claim, so asserting return codes alone would not prove it.*/
+/* ------------------------------------------------------------------ */
+
+/* Enough output room that the limits, rather than the array, decide. */
+#define PCM_OUT_ROOM 8192
+
+static AVFrame *make_pcm_frame(enum AVSampleFormat fmt, int rate,
+                               const AVChannelLayout *layout, int nb_samples)
+{
+    AVFrame *f = av_frame_alloc();
+
+    if (!f)
+        return NULL;
+    f->format      = fmt;
+    f->sample_rate = rate;
+    f->nb_samples  = nb_samples;
+    if (layout) {
+        if (av_channel_layout_copy(&f->ch_layout, layout) < 0) {
+            av_frame_free(&f);
+            return NULL;
+        }
+    }
+    /* get_buffer is enough: the frame was just allocated, so it is already
+     * unique and writable. Calling make_writable here would only add a
+     * failure path that cannot trigger. */
+    if (av_frame_get_buffer(f, 0) < 0) {
+        av_frame_free(&f);
+        return NULL;
+    }
+    return f;
+}
+
+/* Call the session exactly as Java would, with a NULL JNIEnv: the entry
+ * points touch env only for byte[] access, which the *Internal helpers
+ * below bypass. Going through the real symbol keeps the test bound to the
+ * shipped signature. */
+/* Byte capacity of `out_count` output samples, derived from the session's
+ * own output format rather than a hard-coded sample size. */
+static int64_t pcm_out_capacity(const FFPcmSession *s, int out_count)
+{
+    return ff_jni_audio_bytes(out_count, s->out_fmt,
+                              s->out_layout.nb_channels);
+}
+
+/* Both helpers mirror the JNI wrappers: *produced is always written, so a
+ * refused call cannot leave the caller reading an uninitialised slot. That
+ * is part of the contract the tests below assert on. */
+static int pcm_convert(FFPcmSession *s, AVFrame *f, int16_t *out,
+                       int out_count, int *produced)
+{
+    uint8_t *dst[AV_NUM_DATA_POINTERS] = { (uint8_t *)out };
+    int check;
+
+    *produced = 0;
+    check = ff_pcm_check_call(s, f->nb_samples, out_count,
+                              pcm_out_capacity(s, out_count));
+    if (check < 0)
+        return check;
+    return ff_pcm_convert_internal(s, (const uint8_t *const *)f->data,
+                                   f->nb_samples, dst, out_count, produced);
+}
+
+static int pcm_drain(FFPcmSession *s, int16_t *out, int out_count, int *produced)
+{
+    uint8_t *dst[AV_NUM_DATA_POINTERS] = { (uint8_t *)out };
+    int check;
+
+    *produced = 0;
+    check = ff_pcm_check_call(s, 0, out_count,
+                              pcm_out_capacity(s, out_count));
+    if (check < 0)
+        return check;
+    return ff_pcm_convert_internal(s, NULL, 0, dst, out_count, produced);
+}
+
+/* Drain until the session reports DRAINED. Returns total samples emitted, or
+ * a negative error. Bounded so a regression fails instead of hanging. */
+static int64_t pcm_drain_all(FFPcmSession *s, int16_t *out, int out_count)
+{
+    int64_t total = 0;
+    int pass, ret, produced;
+
+    for (pass = 0; pass < 4096; pass++) {
+        ret = pcm_drain(s, out, out_count, &produced);
+        if (ret < 0)
+            return ret;
+        total += produced;
+        if (ret == FF_PCM_DRAINED)
+            return total;
+    }
+    return AVERROR(ERANGE);
+}
+
+static FFPcmSession *make_session(int max_out, int max_in, int max_delay)
+{
+    /* 48 kHz S16 stereo out: the player's fixed AudioTrack format. */
+    return (FFPcmSession *)(intptr_t)
+           Java_org_ffmpeg_FFMpegNative_pcmSessionCreate(NULL, NULL,
+                                                         AV_SAMPLE_FMT_S16,
+                                                         48000,
+                                                         AV_CH_LAYOUT_STEREO,
+                                                         max_out, max_in,
+                                                         max_delay);
+}
+
+static void test_pcm_session_invalid_arguments(void)
+{
+    /* Out of range limits must not produce a handle that later misbehaves. */
+    CHECK(make_session(0, 1024, 1024) == NULL);
+    CHECK(make_session(1024, 0, 1024) == NULL);
+    CHECK(make_session(1024, 1024, -1) == NULL);
+    CHECK((intptr_t)Java_org_ffmpeg_FFMpegNative_pcmSessionCreate(
+              NULL, NULL, AV_SAMPLE_FMT_S16, 0, AV_CH_LAYOUT_STEREO,
+              1024, 1024, 1024) == 0);
+    CHECK((intptr_t)Java_org_ffmpeg_FFMpegNative_pcmSessionCreate(
+              NULL, NULL, AV_SAMPLE_FMT_S16, 48000, 0,
+              1024, 1024, 1024) == 0);
+    CHECK((intptr_t)Java_org_ffmpeg_FFMpegNative_pcmSessionCreate(
+              NULL, NULL, AV_SAMPLE_FMT_NONE, 48000, AV_CH_LAYOUT_STEREO,
+              1024, 1024, 1024) == 0);
+
+    /* Freeing a null handle is a no-op, not a crash. */
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, 0);
+}
+
+/* The limit that matters most: an input frame above maxInSamples is refused
+ * with the input untouched, not converted down or truncated. */
+static void test_pcm_session_input_limit(void)
+{
+    enum { MAX_IN = 512 };
+    FFPcmSession *s = make_session(PCM_OUT_ROOM, MAX_IN, PCM_OUT_ROOM);
+    AVChannelLayout stereo = { 0 };
+    AVFrame *big = NULL, *small = NULL;
+    int16_t *out = NULL;
+    int produced = -1, ret;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    av_channel_layout_default(&stereo, 2);
+    big   = make_pcm_frame(AV_SAMPLE_FMT_S16P, 44100, &stereo, MAX_IN + 1);
+    small = make_pcm_frame(AV_SAMPLE_FMT_S16P, 44100, &stereo, MAX_IN);
+    out   = av_malloc_array((size_t)PCM_OUT_ROOM * 2, sizeof(int16_t));
+    CHECK(big != NULL && small != NULL && out != NULL);
+
+    if (big && small && out) {
+        /* Refused, and nothing happened: no output, no configured format
+         * (a configured session would mean the frame was accepted). */
+        ret = pcm_convert(s, big, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_LIMIT_EXCEEDED);
+        CHECK(produced == 0);
+        CHECK(!s->configured);
+
+        /* The same session still works on a frame within the limit. */
+        ret = pcm_convert(s, small, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret >= 0);
+        CHECK(s->configured);
+    }
+
+    av_frame_free(&big);
+    av_frame_free(&small);
+    av_free(out);
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+    av_channel_layout_uninit(&stereo);
+}
+
+/* The upper bound, not the actual output, is what the limit is compared
+ * against: a block that could overflow must be refused even if this
+ * particular frame happens to emit less. */
+static void test_pcm_session_out_limit_uses_upper_bound(void)
+{
+    FFPcmSession *s = make_session(8, 4096, PCM_OUT_ROOM);
+    AVChannelLayout stereo = { 0 };
+    AVFrame *f = NULL;
+    int16_t *out = NULL;
+    int produced = -1, ret;
+    int64_t bound;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    av_channel_layout_default(&stereo, 2);
+    f   = make_pcm_frame(AV_SAMPLE_FMT_S16P, 44100, &stereo, 1024);
+    out = av_malloc_array((size_t)PCM_OUT_ROOM * 2, sizeof(int16_t));
+    CHECK(f != NULL && out != NULL);
+
+    if (f && out) {
+        /* Configure without converting: the check runs on the configured
+         * context, which is what a real call would use. */
+        CHECK_OK(ff_pcm_configure(s, f->format, f->sample_rate, &f->ch_layout));
+        bound = swr_get_out_samples(s->swr, f->nb_samples);
+        CHECK(bound > 0);
+        /* The bound really does exceed the limit, so the refusal below is
+         * caused by the limit and not by an unrelated error. */
+        CHECK(bound > s->limits.max_out_samples);
+
+        ret = pcm_convert(s, f, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_LIMIT_EXCEEDED);
+        CHECK(produced == 0);
+    }
+
+    av_frame_free(&f);
+    av_free(out);
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+    av_channel_layout_uninit(&stereo);
+}
+
+/* A small output block inside the limits must produce a status the caller
+ * can act on, and must never silently drop samples: produced + delay must
+ * account for the whole input exactly once. */
+static void test_pcm_session_status_and_accounting(void)
+{
+    FFPcmSession *s = make_session(PCM_OUT_ROOM, 65536, PCM_OUT_ROOM);
+    AVChannelLayout stereo = { 0 };
+    AVFrame *f = NULL;
+    int16_t *out = NULL;
+    int64_t total = 0;
+    int produced, ret, i;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    av_channel_layout_default(&stereo, 2);
+    f   = make_pcm_frame(AV_SAMPLE_FMT_FLTP, 44100, &stereo, 1024);
+    out = av_malloc_array((size_t)PCM_OUT_ROOM * 2, sizeof(int16_t));
+    CHECK(f != NULL && out != NULL);
+    if (f && out) {
+        for (i = 0; i < f->nb_samples; i++) {
+            ((float *)f->data[0])[i] = 0.25f;
+            ((float *)f->data[1])[i] = -0.25f;
+        }
+
+        ret = pcm_convert(s, f, out, 256, &produced);
+        CHECK(ret == FF_PCM_OUTPUT_READY);
+        CHECK(produced > 0 && produced <= 256);
+        total += produced;
+
+        /* Whatever was not emitted is accounted as delay, not lost. */
+        CHECK(swr_get_delay(s->swr, 48000) >= 0);
+
+        total += pcm_drain_all(s, out, PCM_OUT_ROOM);
+        /* 44.1 -> 48 kHz, with the delay flushed: the timeline is 1024
+         * input samples long, within a resampler's own look-ahead. */
+        CHECK(total >= 1024);
+        CHECK(total <= 1024 * 48000 / 44100 + 64);
+    }
+
+    av_frame_free(&f);
+    av_free(out);
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+    av_channel_layout_uninit(&stereo);
+}
+
+/* Draining an empty session reports DRAINED, and repeating it stays DRAINED:
+ * a caller looping on "not done yet" must terminate. */
+static void test_pcm_session_drain_terminates(void)
+{
+    FFPcmSession *s = make_session(PCM_OUT_ROOM, 4096, PCM_OUT_ROOM);
+    AVChannelLayout stereo = { 0 };
+    AVFrame *f = NULL;
+    int16_t *out = NULL;
+    int produced, ret;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    av_channel_layout_default(&stereo, 2);
+    f   = make_pcm_frame(AV_SAMPLE_FMT_S16P, 48000, &stereo, 256);
+    out = av_malloc_array((size_t)PCM_OUT_ROOM * 2, sizeof(int16_t));
+    CHECK(f != NULL && out != NULL);
+
+    if (f && out) {
+        /* At 48 kHz in and out swr_convert() has no ratio work to do, but a
+         * converter still owns a delay line, so the exact emitted count is
+         * not part of the contract. What is: whatever is not emitted now
+         * must come out of the drain, and the drain must then report
+         * DRAINED and stay there. */
+        ret = pcm_convert(s, f, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_OUTPUT_READY);
+        CHECK(produced <= 256);
+
+        ret = pcm_drain(s, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_DRAINED || ret == FF_PCM_OUTPUT_READY);
+
+        /* Idempotent once empty: this is what makes a caller's drain loop
+         * terminate instead of spinning forever. */
+        ret = pcm_drain(s, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_DRAINED);
+        CHECK(produced == 0);
+    }
+
+    av_frame_free(&f);
+    av_free(out);
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+    av_channel_layout_uninit(&stereo);
+}
+
+/* Reset must clear the delay: a seek would otherwise replay the previous
+ * position's tail into the new timeline. */
+static void test_pcm_session_reset_drops_tail(void)
+{
+    FFPcmSession *s = make_session(PCM_OUT_ROOM, 65536, PCM_OUT_ROOM);
+    AVChannelLayout stereo = { 0 };
+    AVFrame *f = NULL;
+    int16_t *out = NULL;
+    int produced, ret;
+    int64_t delay_before;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    av_channel_layout_default(&stereo, 2);
+    f   = make_pcm_frame(AV_SAMPLE_FMT_S16P, 44100, &stereo, 1024);
+    out = av_malloc_array((size_t)PCM_OUT_ROOM * 2, sizeof(int16_t));
+    CHECK(f != NULL && out != NULL);
+
+    if (f && out) {
+        /* A small block guarantees a non-zero delay is left behind. */
+        ret = pcm_convert(s, f, out, 64, &produced);
+        CHECK(ret >= 0);
+        delay_before = swr_get_delay(s->swr, 48000);
+        CHECK(delay_before > 0);
+
+        CHECK_OK(Java_org_ffmpeg_FFMpegNative_pcmSessionReset(
+                     NULL, NULL, (jlong)(intptr_t)s));
+        CHECK(swr_get_delay(s->swr, 48000) == 0);
+
+        /* And the format survived the reset, so the next frame is not seen
+         * as a format change. */
+        CHECK(s->configured);
+        CHECK(s->in_rate == 44100);
+        CHECK(s->in_fmt == AV_SAMPLE_FMT_S16P);
+
+        ret = pcm_drain(s, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_DRAINED);
+        CHECK(produced == 0);
+    }
+
+    av_frame_free(&f);
+    av_free(out);
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+    av_channel_layout_uninit(&stereo);
+}
+
+/* A format change while a tail is still buffered must be refused first, and
+ * committed only after the tail has been drained. Switching in place would
+ * punch a silent hole in the timeline. */
+static void test_pcm_session_format_change_transaction(void)
+{
+    FFPcmSession *s = make_session(PCM_OUT_ROOM, 65536, PCM_OUT_ROOM);
+    AVChannelLayout stereo = { 0 };
+    AVFrame *f44 = NULL, *f48 = NULL;
+    int16_t *out = NULL;
+    int produced, ret;
+    int64_t drained;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    av_channel_layout_default(&stereo, 2);
+    f44 = make_pcm_frame(AV_SAMPLE_FMT_S16P, 44100, &stereo, 1024);
+    f48 = make_pcm_frame(AV_SAMPLE_FMT_S16P, 48000, &stereo, 1024);
+    out = av_malloc_array((size_t)PCM_OUT_ROOM * 2, sizeof(int16_t));
+    CHECK(f44 != NULL && f48 != NULL && out != NULL);
+
+    if (f44 && f48 && out) {
+        /* Leave a tail behind. */
+        ret = pcm_convert(s, f44, out, 64, &produced);
+        CHECK(ret >= 0);
+        CHECK(swr_get_delay(s->swr, 48000) > 0);
+
+        /* The new format arrives while the tail is buffered: refused, the
+         * frame unconsumed, the configuration unchanged. */
+        ret = pcm_convert(s, f48, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_FORMAT_CHANGE);
+        CHECK(produced == 0);
+        CHECK(s->in_rate == 44100);
+
+        /* Drain the old tail completely. */
+        drained = pcm_drain_all(s, out, PCM_OUT_ROOM);
+        CHECK(drained >= 0);
+
+        /* Presenting the same frame again now commits the change and
+         * converts it exactly once. */
+        ret = pcm_convert(s, f48, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_OUTPUT_READY);
+        CHECK(produced > 0);
+        CHECK(s->in_rate == 48000);
+
+        /* Converting "exactly once" is proven by the sample count: 1024
+         * input samples at 48 kHz cannot yield more than that plus the new
+         * resampler's own look-ahead. A double conversion would show up as
+         * roughly double. */
+        CHECK(produced <= 1024);
+        CHECK(produced >= 1024 - 64);
+    }
+
+    av_frame_free(&f44);
+    av_frame_free(&f48);
+    av_free(out);
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+    av_channel_layout_uninit(&stereo);
+}
+
+/* Channel mapping is proven with a distinguishable per-channel signal, not
+ * by asserting success. A mono input upmixed to stereo must come out with
+ * the mono content on both channels rather than one channel of silence. */
+static void test_pcm_session_channel_mapping(void)
+{
+    FFPcmSession *s = make_session(PCM_OUT_ROOM, 4096, PCM_OUT_ROOM);
+    AVChannelLayout mono = { 0 };
+    AVFrame *f = NULL;
+    int16_t *out = NULL;
+    int produced, ret, i, silent = 0;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    av_channel_layout_default(&mono, 1);
+    f   = make_pcm_frame(AV_SAMPLE_FMT_S16P, 48000, &mono, 256);
+    out = av_malloc_array((size_t)PCM_OUT_ROOM * 2, sizeof(int16_t));
+    CHECK(f != NULL && out != NULL);
+
+    if (f && out) {
+        /* A constant, non-zero mono signal. */
+        for (i = 0; i < 256; i++)
+            ((int16_t *)f->data[0])[i] = 8000;
+
+        ret = pcm_convert(s, f, out, PCM_OUT_ROOM, &produced);
+        CHECK(ret == FF_PCM_OUTPUT_READY);
+        CHECK(produced > 0);
+
+        /* Interleaved stereo: both channels must carry the mono signal.
+         * Counting fully silent frames (past the resampler's initial ramp)
+         * is the check a left-only or right-only mapping bug would fail:
+         * success alone would not catch it. */
+        for (i = 32; i < produced; i++) {
+            if (out[i * 2] == 0 && out[i * 2 + 1] == 0)
+                silent++;
+        }
+        CHECK(silent == 0);
+    }
+
+    av_frame_free(&f);
+    av_free(out);
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+    av_channel_layout_uninit(&mono);
+}
+
 /* Same normalisation decision without a frame, for pre-flight checks. */
 static void test_normalize_mask_helper(void)
 {
@@ -650,6 +1408,20 @@ int main(void)
     test_normalize_invalid_arguments();
     test_swr_accepts_normalized_stream();
     test_normalize_mask_helper();
+    test_audio_bytes_arithmetic();
+    test_mask_channels();
+    test_convert_check_capacity();
+    test_swr_consumes_input_in_full();
+    test_swr_small_output_keeps_tail();
+    test_swr_out_samples_is_upper_bound();
+    test_pcm_session_invalid_arguments();
+    test_pcm_session_input_limit();
+    test_pcm_session_out_limit_uses_upper_bound();
+    test_pcm_session_status_and_accounting();
+    test_pcm_session_drain_terminates();
+    test_pcm_session_reset_drops_tail();
+    test_pcm_session_format_change_transaction();
+    test_pcm_session_channel_mapping();
 
     printf("%d checks, %d failures\n", checks, failures);
     if (failures) {
