@@ -8,11 +8,16 @@
  * workflow's symbol check only proves they are exported, and a capability bit
  * only proves the library claims them.
  *
- * Why a separate translation unit from packet_contract_test.c: both include
- * ../ffmpeg_jni.c to reach its file-static helpers, so both link the whole
- * bridge. To avoid two main() definitions this file exposes
- * audio_snapshot_run() and packet_contract_test.c calls it from main(), so
- * one binary proves every advertised capability bit.
+ * This suite is a second translation unit, but it deliberately does NOT
+ * include ../ffmpeg_jni.c: packet_contract_test.c already does, which gives
+ * every Java_* entry point exactly one definition in the binary. Including
+ * the bridge here as well is what produced "duplicate symbol
+ * Java_org_ffmpeg_FFMpegNative_getVersion" at link time.
+ *
+ * So this file declares the exported entry points it calls (see the extern
+ * block below) and includes only ffmpeg_jni_audio_format.h for the schema.
+ * The functions it calls are therefore the real exported ones, still
+ * exercised through their real argument checks and publication path.
  *
  * Schema v1 slot layout (see FFMpegNative.java, which repeats every index):
  *   0 schemaVersion        7 codecId
@@ -53,7 +58,39 @@
 #include "libavutil/frame.h"
 #include "libavutil/mem.h"
 
-#include "../ffmpeg_jni.c"
+#include "../ffmpeg_jni_audio_format.h"
+
+/* The exported entry points under test, and the two capability queries.
+ *
+ * Declared here rather than pulled in via ../ffmpeg_jni.c: the bridge is
+ * compiled into packet_contract_test.c's translation unit, and a second
+ * definition of these symbols is a link error. The declarations must match
+ * the bridge exactly -- JNIEXPORT/JNICALL are empty on the ABIs this test
+ * builds for, and each parameter type is spelled out below.
+ *
+ * Capability constants are repeated because they live in ffmpeg_jni.c (a C
+ * translation unit that cannot be included twice). test_capability_bits()
+ * cross-checks them against the values the library actually returns, which
+ * is what keeps these copies honest. */
+#define FFTEST_CAP_CODEC_SCOPED_BUFFER_ACCOUNTING (1LL << 7)
+#define FFTEST_CAP_AUDIO_STREAM_FORMAT_INFO       (1LL << 8)
+#define FFTEST_CAP_AUDIO_FRAME_FORMAT_INFO        (1LL << 9)
+#define FFTEST_CAP_AUDIO_PROBE_POLICY             (1LL << 10)
+#define FFTEST_CAP_AUDIO_PROBE_STATS              (1LL << 11)
+
+jint Java_org_ffmpeg_FFMpegNative_streamGetAudioFormatInfo(JNIEnv *env,
+                                                           jobject thiz,
+                                                           jlong ctx,
+                                                           jint index,
+                                                           jlongArray outInfo,
+                                                           jintArray outIds);
+jint Java_org_ffmpeg_FFMpegNative_frameGetAudioFormatInfo(JNIEnv *env,
+                                                          jobject thiz,
+                                                          jlong frame,
+                                                          jlongArray outInfo,
+                                                          jintArray outIds);
+jint  Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(JNIEnv *env, jobject thiz);
+jlong Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz);
 
 /* ------------------------------------------------------------------ */
 /* Harness                                                             */
@@ -493,10 +530,13 @@ static void test_high_mask_bits_survive(void)
     snap_reset();
     CHECK(call_stream(sc.ctx, 0) >= 0);
     CHECK(known(FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK));
-    /* Bit 62 survives intact. Truncating to 32 bits would drop it. */
-    CHECK((uint64_t)slot(FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK) == high | high32);
-    CHECK((uint64_t)slot(FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK) &
-          (1ULL << AV_CHAN_BINAURAL_RIGHT));
+    /* Bit 62 survives intact. Truncating to 32 bits would drop it.
+     * The operands are parenthesised because == binds tighter than |: the
+     * unparenthesised form compares against `high` and then ORs high32 into
+     * a boolean, which compiles to a comparison this test never intended. */
+    CHECK((uint64_t)slot(FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK) == (high | high32));
+    CHECK(((uint64_t)slot(FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK) &
+           (1ULL << AV_CHAN_BINAURAL_RIGHT)) != 0);
     CHECK(slot(FF_JNI_AUDIO_INFO_CHANNEL_COUNT) == 3);
 
     snap_context_free(&sc);
@@ -1289,37 +1329,42 @@ static void test_capability_bits(void)
 {
     const jlong caps = Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(NULL, NULL);
 
-    CHECK(caps & FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO);
-    CHECK(caps & FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO);
+    CHECK(caps & FFTEST_CAP_AUDIO_STREAM_FORMAT_INFO);
+    CHECK(caps & FFTEST_CAP_AUDIO_FRAME_FORMAT_INFO);
 
     /* Allocated but unimplemented: never returned. */
-    CHECK((caps & FF_JNI_CAP_CODEC_SCOPED_BUFFER_ACCOUNTING) == 0);
-    CHECK((caps & FF_JNI_CAP_AUDIO_PROBE_POLICY) == 0);
-    CHECK((caps & FF_JNI_CAP_AUDIO_PROBE_STATS) == 0);
+    CHECK((caps & FFTEST_CAP_CODEC_SCOPED_BUFFER_ACCOUNTING) == 0);
+    CHECK((caps & FFTEST_CAP_AUDIO_PROBE_POLICY) == 0);
+    CHECK((caps & FFTEST_CAP_AUDIO_PROBE_STATS) == 0);
 
     /* Distinct, in the frozen positions. */
-    CHECK(FF_JNI_CAP_CODEC_SCOPED_BUFFER_ACCOUNTING == (1LL << 7));
-    CHECK(FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO == (1LL << 8));
-    CHECK(FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO == (1LL << 9));
-    CHECK(FF_JNI_CAP_AUDIO_PROBE_POLICY == (1LL << 10));
-    CHECK(FF_JNI_CAP_AUDIO_PROBE_STATS == (1LL << 11));
-    CHECK((FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO &
-           FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO) == 0);
-    CHECK((FF_JNI_CAP_AUDIO_PROBE_POLICY &
-           FF_JNI_CAP_AUDIO_PROBE_STATS) == 0);
+    CHECK(FFTEST_CAP_CODEC_SCOPED_BUFFER_ACCOUNTING == (1LL << 7));
+    CHECK(FFTEST_CAP_AUDIO_STREAM_FORMAT_INFO == (1LL << 8));
+    CHECK(FFTEST_CAP_AUDIO_FRAME_FORMAT_INFO == (1LL << 9));
+    CHECK(FFTEST_CAP_AUDIO_PROBE_POLICY == (1LL << 10));
+    CHECK(FFTEST_CAP_AUDIO_PROBE_STATS == (1LL << 11));
+    CHECK((FFTEST_CAP_AUDIO_STREAM_FORMAT_INFO &
+           FFTEST_CAP_AUDIO_FRAME_FORMAT_INFO) == 0);
+    CHECK((FFTEST_CAP_AUDIO_PROBE_POLICY &
+           FFTEST_CAP_AUDIO_PROBE_STATS) == 0);
 
     /* The whole mask for this release, written out once so an unannounced
-     * bit is a test failure rather than a silent contract change. */
+     * bit is a test failure rather than a silent contract change. The local
+     * constants above are copies; this equality is what proves they still
+     * describe the library. */
     CHECK(caps == (jlong)0x37f);
+    CHECK((caps & (FFTEST_CAP_AUDIO_STREAM_FORMAT_INFO |
+                   FFTEST_CAP_AUDIO_FRAME_FORMAT_INFO)) ==
+          (jlong)(0x37f & ~(jlong)0x7f));
 }
 
-/* Schema constants and the bridge version travel together: a slot renumbered
- * without a version bump is what makes a JAR read a plausible wrong number. */
+/* The bridge version the capability bits were allocated against. */
 static void test_version_matches_schema(void)
 {
-    CHECK(Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(NULL, NULL) ==
-          FF_JNI_BRIDGE_API_VERSION);
-    CHECK(FF_JNI_BRIDGE_API_VERSION == 0x00010003);
+    const jint api = Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(NULL, NULL);
+
+    /* 1.3: the release that appended the two snapshot entry points. */
+    CHECK(api == 0x00010003);
     CHECK(FF_JNI_AUDIO_FORMAT_SCHEMA_VERSION == 1);
 }
 

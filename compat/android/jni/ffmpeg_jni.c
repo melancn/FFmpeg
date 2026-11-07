@@ -243,69 +243,14 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
 /*                                                                     */
 /* Slots are long so a full 64-bit AVChannelLayout mask survives        */
 /* without the sign bit turning it into a negative or a 0.             */
+/*                                                                     */
+/* The slot indices, known bits and order codes live in                */
+/* ffmpeg_jni_audio_format.h so the test suite can share them without   */
+/* including this translation unit a second time (which would give      */
+/* every JNI entry point a duplicate definition at link time).          */
 /* ------------------------------------------------------------------ */
 
-#define FF_JNI_AUDIO_FORMAT_SCHEMA_VERSION  1
-#define FF_JNI_AUDIO_FORMAT_INFO_SLOTS     13
-/* Ceiling of this bridge's bounded policy, not a claim about FFmpeg: a
- * layout with more channels is refused with E2BIG rather than clamped,
- * because a clamped layout silently mis-maps every channel past the cut. */
-#define FF_JNI_AUDIO_FORMAT_MAX_CHANNELS   64
-
-/* Placeholder written into a slot whose known bit is clear. 0 is a legal
- * value for several slots (mask, bit depths, id count), so it cannot mark
- * an unknown on its own; the known bit is the only authority. */
-#define FF_JNI_AUDIO_FORMAT_UNKNOWN_VALUE  0
-
-/* Indices into outInfo. */
-#define FF_JNI_AUDIO_INFO_SCHEMA_VERSION          0
-#define FF_JNI_AUDIO_INFO_KNOWN_FIELDS            1
-#define FF_JNI_AUDIO_INFO_SAMPLE_FORMAT           2
-#define FF_JNI_AUDIO_INFO_SAMPLE_RATE             3
-#define FF_JNI_AUDIO_INFO_CHANNEL_COUNT           4
-#define FF_JNI_AUDIO_INFO_CHANNEL_LAYOUT_ORDER    5
-#define FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK     6
-#define FF_JNI_AUDIO_INFO_CODEC_ID                7
-#define FF_JNI_AUDIO_INFO_PROFILE                 8
-#define FF_JNI_AUDIO_INFO_BITS_PER_CODED_SAMPLE   9
-#define FF_JNI_AUDIO_INFO_BITS_PER_RAW_SAMPLE    10
-#define FF_JNI_AUDIO_INFO_SAMPLES_PER_CHANNEL    11
-#define FF_JNI_AUDIO_INFO_CHANNEL_IDS_COUNT      12
-
-/* Bits of KNOWN_FIELDS, one per slot. Slots 0 and 1 describe the snapshot
- * itself and are always defined. */
-#define FF_JNI_AUDIO_KL_SCHEMA_VERSION        (1LL << FF_JNI_AUDIO_INFO_SCHEMA_VERSION)
-#define FF_JNI_AUDIO_KL_KNOWN_FIELDS          (1LL << FF_JNI_AUDIO_INFO_KNOWN_FIELDS)
-#define FF_JNI_AUDIO_KL_SAMPLE_FORMAT         (1LL << FF_JNI_AUDIO_INFO_SAMPLE_FORMAT)
-#define FF_JNI_AUDIO_KL_SAMPLE_RATE           (1LL << FF_JNI_AUDIO_INFO_SAMPLE_RATE)
-#define FF_JNI_AUDIO_KL_CHANNEL_COUNT         (1LL << FF_JNI_AUDIO_INFO_CHANNEL_COUNT)
-#define FF_JNI_AUDIO_KL_CHANNEL_LAYOUT_ORDER  (1LL << FF_JNI_AUDIO_INFO_CHANNEL_LAYOUT_ORDER)
-#define FF_JNI_AUDIO_KL_NATIVE_CHANNEL_MASK   (1LL << FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK)
-#define FF_JNI_AUDIO_KL_CODEC_ID              (1LL << FF_JNI_AUDIO_INFO_CODEC_ID)
-#define FF_JNI_AUDIO_KL_PROFILE               (1LL << FF_JNI_AUDIO_INFO_PROFILE)
-#define FF_JNI_AUDIO_KL_BITS_PER_CODED_SAMPLE (1LL << FF_JNI_AUDIO_INFO_BITS_PER_CODED_SAMPLE)
-#define FF_JNI_AUDIO_KL_BITS_PER_RAW_SAMPLE   (1LL << FF_JNI_AUDIO_INFO_BITS_PER_RAW_SAMPLE)
-#define FF_JNI_AUDIO_KL_SAMPLES_PER_CHANNEL   (1LL << FF_JNI_AUDIO_INFO_SAMPLES_PER_CHANNEL)
-#define FF_JNI_AUDIO_KL_CHANNEL_IDS_COUNT     (1LL << FF_JNI_AUDIO_INFO_CHANNEL_IDS_COUNT)
-
-/* Channel order codes. These are FFmpeg's AVChannelOrder values reported
- * unchanged: mapping to an Android channel mask is the caller's job, and
- * doing it here would erase the difference between NATIVE and CUSTOM.
- *
- * UNSPEC is itself a defined answer -- "the layout type is not specified" --
- * not a synonym for stereo and not an unknown. */
-#define FF_JNI_AUDIO_ORDER_UNSPEC    0
-#define FF_JNI_AUDIO_ORDER_NATIVE    1
-#define FF_JNI_AUDIO_ORDER_CUSTOM    2
-#define FF_JNI_AUDIO_ORDER_AMBISONIC 3
-
-/* The slots defined for every successful snapshot, regardless of carrier.
- * Everything else is added only when the value was actually read, which is
- * what makes an over-eager set bit a test failure. */
-#define FF_JNI_AUDIO_KL_COMMON                                            \
-    (FF_JNI_AUDIO_KL_SCHEMA_VERSION | FF_JNI_AUDIO_KL_KNOWN_FIELDS |      \
-     FF_JNI_AUDIO_KL_CHANNEL_COUNT | FF_JNI_AUDIO_KL_CHANNEL_LAYOUT_ORDER | \
-     FF_JNI_AUDIO_KL_CHANNEL_IDS_COUNT)
+#include "ffmpeg_jni_audio_format.h"
 
 /* Collects the channel ids of a layout in stream order. Read-only: the
  * layout is neither copied nor normalised, and a CUSTOM map is walked in
