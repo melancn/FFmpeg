@@ -119,8 +119,13 @@ public final class FFMpegNative {
      * {@link #CAP_RENDERER_SAFE_CLOSE}. One safety narrowing is worth
      * repeating here: {@link #pcmSessionCreate} now refuses a planar output
      * sample format instead of writing it as if it were interleaved.
+     *
+     * <p>1.3 only appends the two read-only audio format snapshot entry
+     * points and their schema. A 1.2 caller is unaffected; a 1.3 caller
+     * should detect {@link #CAP_AUDIO_STREAM_FORMAT_INFO} /
+     * {@link #CAP_AUDIO_FRAME_FORMAT_INFO} rather than comparing versions.
      */
-    public static final int BRIDGE_API_MINOR = 2;
+    public static final int BRIDGE_API_MINOR = 3;
 
     /** {@code major << 16 | minor}; first release is {@code 0x00010000}. */
     public static final int BRIDGE_API_VERSION = (BRIDGE_API_MAJOR << 16) | BRIDGE_API_MINOR;
@@ -194,6 +199,198 @@ public final class FFMpegNative {
      * count as proof that every underlying reference is gone.
      */
     public static final long CAP_CODEC_SCOPED_BUFFER_ACCOUNTING = 1L << 7;
+
+    /**
+     * {@link #streamGetAudioFormatInfo} is implemented and fills the schema v1
+     * layout described by {@code AUDIO_INFO_*}.
+     */
+    public static final long CAP_AUDIO_STREAM_FORMAT_INFO = 1L << 8;
+
+    /**
+     * {@link #frameGetAudioFormatInfo} is implemented and fills the same
+     * schema v1 layout, with {@code AUDIO_SOURCE_FRAME} as the source kind.
+     */
+    public static final long CAP_AUDIO_FRAME_FORMAT_INFO = 1L << 9;
+
+    /**
+     * Reserved for a probe that refuses to open an audio decoder. The bit
+     * position is allocated so it can never be reused for something else, but
+     * this build never returns it: there is no entry point behind it yet.
+     *
+     * <p>Do not branch on it. A library that answers 0 must be treated as
+     * having no such capability at all, never as "fall back to ordinary
+     * probing".
+     */
+    public static final long CAP_AUDIO_PROBE_POLICY = 1L << 10;
+
+    /**
+     * Reserved for per-session probe statistics. Allocated, never returned by
+     * this build, for the same reason as {@link #CAP_AUDIO_PROBE_POLICY}.
+     */
+    public static final long CAP_AUDIO_PROBE_STATS = 1L << 11;
+
+    /* ================================================================== */
+    /* Audio format snapshot (schema v1)                                   */
+    /*                                                                     */
+    /* streamGetAudioFormatInfo() and frameGetAudioFormatInfo() fill the    */
+    /* same 13-slot long[] so one decoder serves both. A slot either holds  */
+    /* a value read verbatim from FFmpeg or has its knownFields bit clear.  */
+    /* knownFields means "this slot is defined" -- never "the value is 0"   */
+    /* and never "a decoder or sink can handle it".                         */
+    /*                                                                     */
+    /* Slots are long so a full 64-bit AVChannelLayout mask survives        */
+    /* intact: the sign bit must not turn it into a negative or a 0.       */
+    /* ================================================================== */
+
+    /** Value of {@link #AUDIO_INFO_SCHEMA_VERSION} that this JAR understands. */
+    public static final int AUDIO_FORMAT_SCHEMA_VERSION = 1;
+
+    /** Elements required in {@code outInfo}. */
+    public static final int AUDIO_FORMAT_INFO_SLOTS = 13;
+
+    /**
+     * Ceiling of this bridge's bounded policy -- not a statement about
+     * FFmpeg. A layout with more channels is refused with {@code E2BIG},
+     * never clamped to 64 or to stereo.
+     */
+    public static final int AUDIO_FORMAT_MAX_CHANNELS = 64;
+
+    /**
+     * Value written into a slot whose known bit is clear. It is a
+     * placeholder, not a signal: 0 is a legal value for the mask, both bit
+     * depths and the id count, so only the known bit may be used to decide
+     * whether a slot is defined.
+     */
+    public static final long AUDIO_FORMAT_UNKNOWN_VALUE = 0L;
+
+    /* Fixed indices into the snapshot array. */
+    /** Always 1 for this schema. */
+    public static final int AUDIO_INFO_SCHEMA_VERSION        = 0;
+    /** Bit N set iff slot N is defined (see {@code AUDIO_KL_*}). */
+    public static final int AUDIO_INFO_KNOWN_FIELDS          = 1;
+    /** {@code AVSampleFormat}; NONE/unknown is not filled in as S16. */
+    public static final int AUDIO_INFO_SAMPLE_FORMAT         = 2;
+    /** Hz; never filled in as 48000. */
+    public static final int AUDIO_INFO_SAMPLE_RATE           = 3;
+    /** Declared/frame channel count; never filled in as stereo. */
+    public static final int AUDIO_INFO_CHANNEL_COUNT         = 4;
+    /**
+     * One of the {@code AUDIO_ORDER_*} codes, reported verbatim. UNSPEC is
+     * a defined answer ("layout type not specified") -- not stereo, and not
+     * an unknown.
+     */
+    public static final int AUDIO_INFO_CHANNEL_LAYOUT_ORDER  = 5;
+    /**
+     * FFmpeg {@code AVChannelLayout} mask, NOT an Android channel mask.
+     * Defined only for a NATIVE order (or AMBISONIC with a non-diegetic
+     * mask); for UNSPEC and CUSTOM the union holds something else, so the
+     * known bit is clear. Never map this to {@code AudioFormat} directly.
+     */
+    public static final int AUDIO_INFO_NATIVE_CHANNEL_MASK   = 6;
+    /** {@code AVCodecParameters.codec_id}. Stream only. */
+    public static final int AUDIO_INFO_CODEC_ID              = 7;
+    /** {@code AVCodecParameters.profile}; unknown stays unknown. Stream only. */
+    public static final int AUDIO_INFO_PROFILE               = 8;
+    /**
+     * {@code bits_per_coded_sample} as declared. Not a generic PCM storage
+     * width. Stream only.
+     */
+    public static final int AUDIO_INFO_BITS_PER_CODED_SAMPLE = 9;
+    /**
+     * {@code bits_per_raw_sample} as declared: source metadata evidence,
+     * not proof that the decoder's output keeps that precision. Stream only.
+     * S32 with 24 raw bits is a real combination.
+     */
+    public static final int AUDIO_INFO_BITS_PER_RAW_SAMPLE   = 10;
+    /**
+     * {@code AVFrame.nb_samples}. Frame only. A 0-sample frame is a defined
+     * answer, distinguished from unknown by its known bit.
+     */
+    public static final int AUDIO_INFO_SAMPLES_PER_CHANNEL   = 11;
+    /**
+     * Number of valid elements written to {@code outChannelIds}; elements
+     * past this count are not part of the snapshot. 0 for UNSPEC.
+     */
+    public static final int AUDIO_INFO_CHANNEL_IDS_COUNT     = 12;
+
+    /** Only a channel count is specified; no order, no ids. */
+    public static final int AUDIO_ORDER_UNSPEC    = 0;
+    /** Channels in ascending {@code AVChannel} order; a mask is defined. */
+    public static final int AUDIO_ORDER_NATIVE    = 1;
+    /** An explicit per-channel map; ids are in stream order, never sorted. */
+    public static final int AUDIO_ORDER_CUSTOM    = 2;
+    /** ACN components, ordered by index. */
+    public static final int AUDIO_ORDER_AMBISONIC = 3;
+
+    /* knownFields bits, one per slot. */
+    public static final long AUDIO_KL_SCHEMA_VERSION        = 1L << 0;
+    public static final long AUDIO_KL_KNOWN_FIELDS          = 1L << 1;
+    public static final long AUDIO_KL_SAMPLE_FORMAT         = 1L << 2;
+    public static final long AUDIO_KL_SAMPLE_RATE           = 1L << 3;
+    public static final long AUDIO_KL_CHANNEL_COUNT         = 1L << 4;
+    public static final long AUDIO_KL_CHANNEL_LAYOUT_ORDER  = 1L << 5;
+    public static final long AUDIO_KL_NATIVE_CHANNEL_MASK   = 1L << 6;
+    public static final long AUDIO_KL_CODEC_ID              = 1L << 7;
+    public static final long AUDIO_KL_PROFILE               = 1L << 8;
+    public static final long AUDIO_KL_BITS_PER_CODED_SAMPLE = 1L << 9;
+    public static final long AUDIO_KL_BITS_PER_RAW_SAMPLE   = 1L << 10;
+    public static final long AUDIO_KL_SAMPLES_PER_CHANNEL   = 1L << 11;
+    public static final long AUDIO_KL_CHANNEL_IDS_COUNT     = 1L << 12;
+
+    /**
+     * Read the complete audio format of a stream's declared parameters.
+     *
+     * <p>Reads {@code codecpar} only: no decoder is opened, no packet is
+     * read, nothing is resampled and no layout normaliser is called. An
+     * UNSPEC stream therefore reports UNSPEC, not a plausible-looking stereo
+     * default.
+     *
+     * <p>Gate on {@link #CAP_AUDIO_STREAM_FORMAT_INFO}. A library that
+     * answers 0 there has no such capability: the feature must be refused,
+     * never re-implemented from {@link #streamGetParChannelLayout} (whose 0
+     * for non-NATIVE layouts cannot be told apart from "no layout").
+     *
+     * @param formatCtx   format context handle
+     * @param streamIndex audio stream to describe
+     * @param outInfo     at least {@link #AUDIO_FORMAT_INFO_SLOTS} elements;
+     *                    unknown slots are written as
+     *                    {@link #AUDIO_FORMAT_UNKNOWN_VALUE}
+     * @param outChannelIds at least {@link #AUDIO_FORMAT_MAX_CHANNELS}
+     *                    elements; the first
+     *                    {@link #AUDIO_INFO_CHANNEL_IDS_COUNT} are part of
+     *                    the snapshot
+     * @return 0 on success, or a negative {@code AVERROR}:
+     *         {@code EINVAL} (null handle, bad index, non-audio stream, short
+     *         {@code outInfo}), {@code ENOSPC} (short {@code outChannelIds}),
+     *         {@code E2BIG} (channel count above the bridge ceiling). On
+     *         failure neither array is written.
+     */
+    public native int streamGetAudioFormatInfo(long formatCtx, int streamIndex,
+                                               long[] outInfo, int[] outChannelIds);
+
+    /**
+     * Read the audio format of a decoded frame.
+     *
+     * <p>Reports what was actually decoded, which may differ from what the
+     * stream declared. {@code CODEC_ID}, {@code PROFILE} and both bit-depth
+     * slots are always Unknown here: {@code AVFrame} does not carry them,
+     * and copying the stream's values would present a belief as an
+     * observation. An S32 frame is not read as "32 valid bits" either.
+     * Associate a frame with its source stream using the app's own config
+     * epoch.
+     *
+     * <p>The frame is not modified. Gate on
+     * {@link #CAP_AUDIO_FRAME_FORMAT_INFO}.
+     *
+     * @param frame     decoded frame handle
+     * @param outInfo   at least {@link #AUDIO_FORMAT_INFO_SLOTS} elements
+     * @param outChannelIds at least {@link #AUDIO_FORMAT_MAX_CHANNELS}
+     * @return 0 on success, or a negative {@code AVERROR} as for
+     *         {@link #streamGetAudioFormatInfo}; nothing is written on
+     *         failure
+     */
+    public native int frameGetAudioFormatInfo(long frame,
+                                              long[] outInfo, int[] outChannelIds);
 
     /**
      * Number of elements {@link #packetGetBudgetInfo} requires in its output

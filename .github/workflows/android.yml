@@ -691,6 +691,8 @@ jobs:
                      Java_org_ffmpeg_FFMpegNative_setContextPktTimebase \
                      Java_org_ffmpeg_FFMpegNative_streamGetParProfile \
                      Java_org_ffmpeg_FFMpegNative_streamGetParChannelLayout \
+                     Java_org_ffmpeg_FFMpegNative_streamGetAudioFormatInfo \
+                     Java_org_ffmpeg_FFMpegNative_frameGetAudioFormatInfo \
                      Java_org_ffmpeg_FFMpegNative_frameNormalizeChannelLayout \
                      Java_org_ffmpeg_FFMpegNative_channelLayoutNormalizeMask \
                      Java_org_ffmpeg_FFMpegNative_windowRendererCreate \
@@ -860,11 +862,21 @@ jobs:
           # Compile as C (the production translation unit is C, and clang++
           # would reject parts of it as C++), then link with the C++ driver
           # because the static libass archive needs libc++.
+          #
+          # Two test translation units, one binary: the audio format snapshot
+          # suite lives in its own file but is driven from
+          # packet_contract_test.c's main(), so a single build has to satisfy
+          # both. It must be linked here rather than left out: a capability bit
+          # is only advertised because that suite runs.
           "$CC" "${COMMON_CFLAGS[@]}" -c \
             "$PWD/compat/android/jni/tests/packet_contract_test.c" \
             -o "$OUT/packet_contract_test.o"
 
-          "$CXX" "$OUT/packet_contract_test.o" \
+          "$CC" "${COMMON_CFLAGS[@]}" -c \
+            "$PWD/compat/android/jni/tests/audio_format_snapshot_test.c" \
+            -o "$OUT/audio_format_snapshot_test.o"
+
+          "$CXX" "$OUT/packet_contract_test.o" "$OUT/audio_format_snapshot_test.o" \
             -L"$PREFIX/lib" -L"$MBEDTLS_PREFIX/lib" -L"$DEPS_PREFIX/lib" \
             -Wl,--start-group \
             -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \

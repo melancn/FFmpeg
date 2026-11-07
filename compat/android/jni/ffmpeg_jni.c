@@ -174,8 +174,13 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  * 1.2 fixes error paths only -- no signature, parameter width, return type
  * or AVERROR convention changes -- plus one safety narrowing: a planar
  * output sample format is now refused by pcmSessionCreate() instead of being
- * written as if it were interleaved. */
-#define FF_JNI_BRIDGE_API_MINOR 2
+ * written as if it were interleaved.
+ *
+ * 1.3 appends two read-only entry points, streamGetAudioFormatInfo() and
+ * frameGetAudioFormatInfo(), with schema v1 (see the snapshot block below).
+ * Nothing existing changes, so a 1.2 caller keeps working; a 1.3 caller
+ * detects the capability bits instead of guessing from the version. */
+#define FF_JNI_BRIDGE_API_MINOR 3
 #define FF_JNI_BRIDGE_API_VERSION \
     ((FF_JNI_BRIDGE_API_MAJOR << 16) | FF_JNI_BRIDGE_API_MINOR)
 
@@ -208,9 +213,213 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  * not evidence about one output session. */
 #define FF_JNI_CAP_CODEC_SCOPED_BUFFER_ACCOUNTING (1LL << 7)
 
+/* streamGetAudioFormatInfo()/frameGetAudioFormatInfo() are implemented with
+ * the schema v1 slot layout below, and tests/audio_format_snapshot_test.c
+ * drives both against real AVCodecParameters/AVFrame carriers. */
+#define FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO (1LL << 8)
+#define FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO  (1LL << 9)
+/* NOT set: reserved for the strict probe policy and its statistics. The bits
+ * are allocated here so their positions are frozen, but a caller must not
+ * branch on them until the entry points exist and are tested. */
+#define FF_JNI_CAP_AUDIO_PROBE_POLICY       (1LL << 10)
+#define FF_JNI_CAP_AUDIO_PROBE_STATS        (1LL << 11)
+
 /* Bumped whenever the packet budget accounting rules change, so a stored
  * charge value can be attributed to the policy that produced it. */
 #define FF_JNI_PACKET_BUDGET_POLICY_VERSION 1
+
+/* ------------------------------------------------------------------ */
+/* Audio format snapshot (schema v1)                                   */
+/*                                                                     */
+/* Both snapshot entry points fill the same 13-slot long[] so a caller  */
+/* has one decoder for "what audio format is this". The layout is part  */
+/* of the bridge contract: FFMpegNative.java repeats every slot index,  */
+/* and tests/audio_format_snapshot_test.c pins them.                    */
+/*                                                                     */
+/* The contract in one sentence: a slot either carries a value read     */
+/* verbatim from FFmpeg, or its KNOWN_FIELDS bit is clear. knownFields  */
+/* means "this slot is defined", never "the value happens to be 0", and */
+/* never "a decoder or sink can handle it".                            */
+/*                                                                     */
+/* Slots are long so a full 64-bit AVChannelLayout mask survives        */
+/* without the sign bit turning it into a negative or a 0.             */
+/* ------------------------------------------------------------------ */
+
+#define FF_JNI_AUDIO_FORMAT_SCHEMA_VERSION  1
+#define FF_JNI_AUDIO_FORMAT_INFO_SLOTS     13
+/* Ceiling of this bridge's bounded policy, not a claim about FFmpeg: a
+ * layout with more channels is refused with E2BIG rather than clamped,
+ * because a clamped layout silently mis-maps every channel past the cut. */
+#define FF_JNI_AUDIO_FORMAT_MAX_CHANNELS   64
+
+/* Placeholder written into a slot whose known bit is clear. 0 is a legal
+ * value for several slots (mask, bit depths, id count), so it cannot mark
+ * an unknown on its own; the known bit is the only authority. */
+#define FF_JNI_AUDIO_FORMAT_UNKNOWN_VALUE  0
+
+/* Indices into outInfo. */
+#define FF_JNI_AUDIO_INFO_SCHEMA_VERSION          0
+#define FF_JNI_AUDIO_INFO_KNOWN_FIELDS            1
+#define FF_JNI_AUDIO_INFO_SAMPLE_FORMAT           2
+#define FF_JNI_AUDIO_INFO_SAMPLE_RATE             3
+#define FF_JNI_AUDIO_INFO_CHANNEL_COUNT           4
+#define FF_JNI_AUDIO_INFO_CHANNEL_LAYOUT_ORDER    5
+#define FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK     6
+#define FF_JNI_AUDIO_INFO_CODEC_ID                7
+#define FF_JNI_AUDIO_INFO_PROFILE                 8
+#define FF_JNI_AUDIO_INFO_BITS_PER_CODED_SAMPLE   9
+#define FF_JNI_AUDIO_INFO_BITS_PER_RAW_SAMPLE    10
+#define FF_JNI_AUDIO_INFO_SAMPLES_PER_CHANNEL    11
+#define FF_JNI_AUDIO_INFO_CHANNEL_IDS_COUNT      12
+
+/* Bits of KNOWN_FIELDS, one per slot. Slots 0 and 1 describe the snapshot
+ * itself and are always defined. */
+#define FF_JNI_AUDIO_KL_SCHEMA_VERSION        (1LL << FF_JNI_AUDIO_INFO_SCHEMA_VERSION)
+#define FF_JNI_AUDIO_KL_KNOWN_FIELDS          (1LL << FF_JNI_AUDIO_INFO_KNOWN_FIELDS)
+#define FF_JNI_AUDIO_KL_SAMPLE_FORMAT         (1LL << FF_JNI_AUDIO_INFO_SAMPLE_FORMAT)
+#define FF_JNI_AUDIO_KL_SAMPLE_RATE           (1LL << FF_JNI_AUDIO_INFO_SAMPLE_RATE)
+#define FF_JNI_AUDIO_KL_CHANNEL_COUNT         (1LL << FF_JNI_AUDIO_INFO_CHANNEL_COUNT)
+#define FF_JNI_AUDIO_KL_CHANNEL_LAYOUT_ORDER  (1LL << FF_JNI_AUDIO_INFO_CHANNEL_LAYOUT_ORDER)
+#define FF_JNI_AUDIO_KL_NATIVE_CHANNEL_MASK   (1LL << FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK)
+#define FF_JNI_AUDIO_KL_CODEC_ID              (1LL << FF_JNI_AUDIO_INFO_CODEC_ID)
+#define FF_JNI_AUDIO_KL_PROFILE               (1LL << FF_JNI_AUDIO_INFO_PROFILE)
+#define FF_JNI_AUDIO_KL_BITS_PER_CODED_SAMPLE (1LL << FF_JNI_AUDIO_INFO_BITS_PER_CODED_SAMPLE)
+#define FF_JNI_AUDIO_KL_BITS_PER_RAW_SAMPLE   (1LL << FF_JNI_AUDIO_INFO_BITS_PER_RAW_SAMPLE)
+#define FF_JNI_AUDIO_KL_SAMPLES_PER_CHANNEL   (1LL << FF_JNI_AUDIO_INFO_SAMPLES_PER_CHANNEL)
+#define FF_JNI_AUDIO_KL_CHANNEL_IDS_COUNT     (1LL << FF_JNI_AUDIO_INFO_CHANNEL_IDS_COUNT)
+
+/* Channel order codes. These are FFmpeg's AVChannelOrder values reported
+ * unchanged: mapping to an Android channel mask is the caller's job, and
+ * doing it here would erase the difference between NATIVE and CUSTOM.
+ *
+ * UNSPEC is itself a defined answer -- "the layout type is not specified" --
+ * not a synonym for stereo and not an unknown. */
+#define FF_JNI_AUDIO_ORDER_UNSPEC    0
+#define FF_JNI_AUDIO_ORDER_NATIVE    1
+#define FF_JNI_AUDIO_ORDER_CUSTOM    2
+#define FF_JNI_AUDIO_ORDER_AMBISONIC 3
+
+/* The slots defined for every successful snapshot, regardless of carrier.
+ * Everything else is added only when the value was actually read, which is
+ * what makes an over-eager set bit a test failure. */
+#define FF_JNI_AUDIO_KL_COMMON                                            \
+    (FF_JNI_AUDIO_KL_SCHEMA_VERSION | FF_JNI_AUDIO_KL_KNOWN_FIELDS |      \
+     FF_JNI_AUDIO_KL_CHANNEL_COUNT | FF_JNI_AUDIO_KL_CHANNEL_LAYOUT_ORDER | \
+     FF_JNI_AUDIO_KL_CHANNEL_IDS_COUNT)
+
+/* Collects the channel ids of a layout in stream order. Read-only: the
+ * layout is neither copied nor normalised, and a CUSTOM map is walked in
+ * place. Returns the number of ids written, or a negative AVERROR.
+ *
+ * The ids come from av_channel_layout_channel_from_index() so that every
+ * order uses the same definition of "channel i". Nothing is sorted: CUSTOM
+ * order is the map order, and re-sorting it would silently re-map every
+ * sample.
+ *
+ * UNSPEC legitimately yields 0 ids: it carries only a count, and inventing
+ * a default order is exactly what this API refuses to do. */
+static int ff_audio_layout_ids(const AVChannelLayout *l, int32_t *ids,
+                               int max_ids, int64_t *mask_out, int *mask_known)
+{
+    int i;
+
+    *mask_out   = 0;
+    *mask_known = 0;
+
+    if (!l || l->nb_channels < 0)
+        return AVERROR(EINVAL);
+    if (l->nb_channels > max_ids)
+        return AVERROR(E2BIG);
+
+    switch (l->order) {
+    case AV_CHANNEL_ORDER_UNSPEC:
+        /* Only the count is specified. */
+        return 0;
+
+    case AV_CHANNEL_ORDER_NATIVE:
+        /* The mask is meaningful only for NATIVE; the union holds a map
+         * pointer for CUSTOM, and reading it as a mask would be garbage. */
+        *mask_out   = (int64_t)l->u.mask;
+        *mask_known = 1;
+        break;
+
+    case AV_CHANNEL_ORDER_CUSTOM:
+        if (!l->u.map)
+            return AVERROR(EINVAL);
+        break;
+
+    case AV_CHANNEL_ORDER_AMBISONIC:
+        /* ACN position is implicit, but the channel type is still asked for
+         * through the same accessor. A non-diegetic mask, when present, is
+         * reported; its absence is not an error. */
+        if (l->u.mask) {
+            *mask_out   = (int64_t)l->u.mask;
+            *mask_known = 1;
+        }
+        break;
+
+    default:
+        return AVERROR(EINVAL);
+    }
+
+    /* id >= 0 means "a known channel"; anything else (AV_CHAN_UNKNOWN,
+     * AV_CHAN_UNUSED, AV_CHAN_NONE) is carried through verbatim. The
+     * snapshot does not translate those into a role or a position: a
+     * caller that cannot use the raw value must refuse the layout, not
+     * guess at it. */
+    for (i = 0; i < l->nb_channels; i++) {
+        const enum AVChannel id = av_channel_layout_channel_from_index(
+                                      l, (unsigned)i);
+        ids[i] = (int32_t)id;
+    }
+    return l->nb_channels;
+}
+
+/* Publishes one complete snapshot. Every capacity and validity decision is
+ * made before the first array write, so a refusal leaves both arrays as the
+ * caller had them.
+ *
+ * Errors, none of which is a disguised success:
+ *   EINVAL  null handle, bad index, non-audio stream, or an outInfo too
+ *           short (a snapshot with missing slots is not a snapshot)
+ *   ENOSPC  outChannelIds too small for this layout
+ *   E2BIG   layout exceeds the bridge's channel ceiling
+ *   EXTERNAL the VM threw during publication
+ *
+ * The full 64-entry outChannelIds is required even when the current layout
+ * enumerates fewer: a stream that is UNSPEC today may become 5.1 after a
+ * format change, and a caller sized for today's count would be refused only
+ * later, mid-playback. */
+static jint ff_publish_audio_format(JNIEnv *env, jlongArray out_info,
+                                    jintArray out_ids, const int64_t *info,
+                                    const int32_t *ids, int n_ids)
+{
+    jsize info_len;
+    jsize ids_len;
+
+    if (!env || !out_info || !out_ids)
+        return AVERROR(EINVAL);
+
+    info_len = (*env)->GetArrayLength(env, (jarray)out_info);
+    ids_len  = (*env)->GetArrayLength(env, (jarray)out_ids);
+
+    if (info_len < FF_JNI_AUDIO_FORMAT_INFO_SLOTS)
+        return AVERROR(EINVAL);
+    if (ids_len < n_ids)
+        return AVERROR(ENOSPC);
+
+    (*env)->SetLongArrayRegion(env, out_info, 0,
+                               FF_JNI_AUDIO_FORMAT_INFO_SLOTS, (const jlong *)info);
+    if ((*env)->ExceptionCheck(env))
+        return AVERROR_EXTERNAL;
+
+    if (n_ids > 0) {
+        (*env)->SetIntArrayRegion(env, out_ids, 0, (jsize)n_ids, (const jint *)ids);
+        if ((*env)->ExceptionCheck(env))
+            return AVERROR_EXTERNAL;
+    }
+    return 0;
+}
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(JNIEnv *env, jobject thiz)
@@ -230,7 +439,9 @@ Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
                    FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE |
                    FF_JNI_CAP_BOUNDED_PCM_RESAMPLE |
                    FF_JNI_CAP_PCM_SESSION_SAFE_V2 |
-                   FF_JNI_CAP_RENDERER_SAFE_CLOSE);
+                   FF_JNI_CAP_RENDERER_SAFE_CLOSE |
+                   FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO |
+                   FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO);
 }
 
 /* ABI string for the compiled object, not the device ABI: it identifies
@@ -4559,6 +4770,210 @@ Java_org_ffmpeg_FFMpegNative_streamGetParChannelLayout(JNIEnv *env, jobject thiz
     if (p->ch_layout.order != AV_CHANNEL_ORDER_NATIVE)
         return 0;
     return (jlong)p->ch_layout.u.mask;
+}
+
+/* Complete audio format snapshot of a stream's declared parameters.
+ *
+ * Why this exists next to streamGetParSampleRate() and friends: those answer
+ * one question each and streamGetParChannelLayout() deliberately answers 0
+ * for any layout that is not NATIVE, which makes "no layout declared" and
+ * "a custom order we cannot express" indistinguishable. This call reports the
+ * order itself, enumerates the ids in stream order, and keeps coded/raw bit
+ * depth apart from the sample format (S32 holding 24 valid bits is real).
+ *
+ * Reads codecpar only: no decoder is opened, no packet is read and no
+ * resampling happens. The layout is never normalised, so a value that is
+ * absent here is absent in the stream too.
+ *
+ * @param formatCtx  AVFormatContext handle
+ * @param streamIndex stream whose codecpar is read
+ * @param outInfo    at least FF_JNI_AUDIO_FORMAT_INFO_SLOTS elements
+ * @param outIds     at least as many elements as the layout enumerates; a
+ *                   short array is refused with ENOSPC, never truncated
+ * @return 0 on success, or a negative AVERROR (EINVAL / ENOSPC / E2BIG /
+ *         EXTERNAL). Nothing is published on failure.
+ *
+ * Negative results are the bridge's normal errno convention; none of them is
+ * a success in disguise.
+ */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_streamGetAudioFormatInfo(JNIEnv *env, jobject thiz,
+                                                      jlong ctx, jint index,
+                                                      jlongArray outInfo,
+                                                      jintArray outIds)
+{
+    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    AVCodecParameters *p;
+    int64_t info[FF_JNI_AUDIO_FORMAT_INFO_SLOTS];
+    int32_t ids[FF_JNI_AUDIO_FORMAT_MAX_CHANNELS];
+    int64_t known_fields = FF_JNI_AUDIO_KL_COMMON;
+    int64_t mask = 0;
+    int mask_known = 0;
+    int n_ids;
+    int i;
+
+    if (!c || index < 0 || index >= (jint)c->nb_streams)
+        return AVERROR(EINVAL);
+    p = c->streams[index]->codecpar;
+    if (!p || p->codec_type != AVMEDIA_TYPE_AUDIO)
+        return AVERROR(EINVAL);
+    /* A ceiling breach is a bounds error, not a bad argument: the caller did
+     * nothing wrong, the layout is simply outside this bridge's policy. */
+    if (p->ch_layout.nb_channels > FF_JNI_AUDIO_FORMAT_MAX_CHANNELS)
+        return AVERROR(E2BIG);
+
+    if (!env || !outInfo || !outIds)
+        return AVERROR(EINVAL);
+    if ((*env)->GetArrayLength(env, (jarray)outInfo) <
+            FF_JNI_AUDIO_FORMAT_INFO_SLOTS)
+        return AVERROR(EINVAL);
+
+    n_ids = ff_audio_layout_ids(&p->ch_layout, ids,
+                                FF_JNI_AUDIO_FORMAT_MAX_CHANNELS,
+                                &mask, &mask_known);
+    if (n_ids < 0)
+        return (jint)n_ids;
+
+    /* Every slot is written, unknown ones with the declared placeholder, so
+     * a reused array cannot show the previous call's values. */
+    for (i = 0; i < FF_JNI_AUDIO_FORMAT_INFO_SLOTS; i++)
+        info[i] = FF_JNI_AUDIO_FORMAT_UNKNOWN_VALUE;
+
+    /* A value the container did not state is Unknown, not a zero the caller
+     * must interpret: sample format -1 and raw bit depth 0 both land here. */
+    info[FF_JNI_AUDIO_INFO_SCHEMA_VERSION] = FF_JNI_AUDIO_FORMAT_SCHEMA_VERSION;
+    info[FF_JNI_AUDIO_INFO_CHANNEL_COUNT]  = (int64_t)p->ch_layout.nb_channels;
+    info[FF_JNI_AUDIO_INFO_CHANNEL_LAYOUT_ORDER] = (int64_t)p->ch_layout.order;
+    info[FF_JNI_AUDIO_INFO_CHANNEL_IDS_COUNT] = (int64_t)n_ids;
+
+    if (p->format >= 0) {
+        info[FF_JNI_AUDIO_INFO_SAMPLE_FORMAT] = (int64_t)p->format;
+        known_fields |= FF_JNI_AUDIO_KL_SAMPLE_FORMAT;
+    }
+    if (p->sample_rate > 0) {
+        info[FF_JNI_AUDIO_INFO_SAMPLE_RATE] = (int64_t)p->sample_rate;
+        known_fields |= FF_JNI_AUDIO_KL_SAMPLE_RATE;
+    }
+    /* Mask order is a fact only for NATIVE (and for an AMBISONIC layout that
+     * states a non-diegetic mask). For UNSPEC and CUSTOM the union holds
+     * something else entirely, so the slot stays Unknown. */
+    if (mask_known) {
+        info[FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK] = mask;
+        known_fields |= FF_JNI_AUDIO_KL_NATIVE_CHANNEL_MASK;
+    }
+
+    /* Stream-only slots. */
+    info[FF_JNI_AUDIO_INFO_CODEC_ID] = (int64_t)p->codec_id;
+    known_fields |= FF_JNI_AUDIO_KL_CODEC_ID;
+    /* AV_PROFILE_UNKNOWN (-99) is "the stream does not state a profile", so
+     * the slot is Unknown rather than a value the caller might print. */
+    if (p->profile != AV_PROFILE_UNKNOWN) {
+        info[FF_JNI_AUDIO_INFO_PROFILE] = (int64_t)p->profile;
+        known_fields |= FF_JNI_AUDIO_KL_PROFILE;
+    }
+    /* Not a generic PCM storage width: this is what the container declared. */
+    if (p->bits_per_coded_sample > 0) {
+        info[FF_JNI_AUDIO_INFO_BITS_PER_CODED_SAMPLE] = (int64_t)p->bits_per_coded_sample;
+        known_fields |= FF_JNI_AUDIO_KL_BITS_PER_CODED_SAMPLE;
+    }
+    /* Source metadata only: it says what the source claims, not what the
+     * decoder will actually output. */
+    if (p->bits_per_raw_sample > 0) {
+        info[FF_JNI_AUDIO_INFO_BITS_PER_RAW_SAMPLE] = (int64_t)p->bits_per_raw_sample;
+        known_fields |= FF_JNI_AUDIO_KL_BITS_PER_RAW_SAMPLE;
+    }
+
+    info[FF_JNI_AUDIO_INFO_KNOWN_FIELDS] = known_fields;
+
+    return ff_publish_audio_format(env, outInfo, outIds, info, ids, n_ids);
+}
+
+/* Audio format snapshot of a decoded frame, read from the frame itself
+ * rather than from the stream that produced it: a decoder may negotiate a
+ * different rate or layout than the container declared, and the caller must
+ * convert for what actually arrived.
+ *
+ * The four slots AVFrame cannot answer -- codecId, profile and the two bit
+ * depths -- stay Unknown, always. In particular S32 is NOT read as "32
+ * valid bits": the frame carries no valid-precision field, and guessing one
+ * would silently promote 24-bit material to 32-bit. Association with a
+ * source stream is the application's job, keyed on its own config epoch;
+ * the bridge does not remember the last stream it was asked about.
+ *
+ * samplesPerChannel is frame-only. A frame with 0 samples is a defined
+ * answer (an empty frame), not an unknown one.
+ *
+ * The frame is not modified: the layout is not normalised, so an UNSPEC
+ * frame still reports UNSPEC.
+ */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_frameGetAudioFormatInfo(JNIEnv *env, jobject thiz,
+                                                     jlong frame,
+                                                     jlongArray outInfo,
+                                                     jintArray outIds)
+{
+    AVFrame *f = PTR(AVFrame *, frame);
+    int64_t info[FF_JNI_AUDIO_FORMAT_INFO_SLOTS];
+    int32_t ids[FF_JNI_AUDIO_FORMAT_MAX_CHANNELS];
+    int64_t known_fields = FF_JNI_AUDIO_KL_COMMON;
+    int64_t mask = 0;
+    int mask_known = 0;
+    int n_ids;
+    int i;
+
+    if (!f)
+        return AVERROR(EINVAL);
+    if (f->ch_layout.nb_channels > FF_JNI_AUDIO_FORMAT_MAX_CHANNELS)
+        return AVERROR(E2BIG);
+
+    if (!env || !outInfo || !outIds)
+        return AVERROR(EINVAL);
+    if ((*env)->GetArrayLength(env, (jarray)outInfo) <
+            FF_JNI_AUDIO_FORMAT_INFO_SLOTS)
+        return AVERROR(EINVAL);
+
+    n_ids = ff_audio_layout_ids(&f->ch_layout, ids,
+                                FF_JNI_AUDIO_FORMAT_MAX_CHANNELS,
+                                &mask, &mask_known);
+    if (n_ids < 0)
+        return (jint)n_ids;
+
+    for (i = 0; i < FF_JNI_AUDIO_FORMAT_INFO_SLOTS; i++)
+        info[i] = FF_JNI_AUDIO_FORMAT_UNKNOWN_VALUE;
+
+    info[FF_JNI_AUDIO_INFO_SCHEMA_VERSION]       = FF_JNI_AUDIO_FORMAT_SCHEMA_VERSION;
+    info[FF_JNI_AUDIO_INFO_CHANNEL_COUNT]        = (int64_t)f->ch_layout.nb_channels;
+    info[FF_JNI_AUDIO_INFO_CHANNEL_LAYOUT_ORDER] = (int64_t)f->ch_layout.order;
+    info[FF_JNI_AUDIO_INFO_CHANNEL_IDS_COUNT]    = (int64_t)n_ids;
+
+    if (f->format >= 0) {
+        info[FF_JNI_AUDIO_INFO_SAMPLE_FORMAT] = (int64_t)f->format;
+        known_fields |= FF_JNI_AUDIO_KL_SAMPLE_FORMAT;
+    }
+    if (f->sample_rate > 0) {
+        info[FF_JNI_AUDIO_INFO_SAMPLE_RATE] = (int64_t)f->sample_rate;
+        known_fields |= FF_JNI_AUDIO_KL_SAMPLE_RATE;
+    }
+    if (mask_known) {
+        info[FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK] = mask;
+        known_fields |= FF_JNI_AUDIO_KL_NATIVE_CHANNEL_MASK;
+    }
+
+    /* Frame-only slot. A 0-sample frame is a defined answer, so the slot is
+     * always known; only a negative count would be meaningless, and libavutil
+     * never produces one. */
+    if (f->nb_samples >= 0) {
+        info[FF_JNI_AUDIO_INFO_SAMPLES_PER_CHANNEL] = (int64_t)f->nb_samples;
+        known_fields |= FF_JNI_AUDIO_KL_SAMPLES_PER_CHANNEL;
+    }
+
+    /* CODEC_ID, PROFILE and both bit-depth slots are deliberately left with
+     * their known bits clear: an AVFrame does not carry them, and copying the
+     * stream's values would present a belief as an observation. */
+
+    info[FF_JNI_AUDIO_INFO_KNOWN_FIELDS] = known_fields;
+
+    return ff_publish_audio_format(env, outInfo, outIds, info, ids, n_ids);
 }
 
 JNIEXPORT jint JNICALL

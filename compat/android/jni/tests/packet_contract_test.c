@@ -75,6 +75,30 @@ _Static_assert(FF_JNI_PACKET_BUDGET_SLOTS == 6,
     }                                                                       \
 } while (0)
 
+/* The audio format snapshot suite (tests/audio_format_snapshot_test.c)
+ * exposes this so both suites share one binary, one link and one pass/fail
+ * line. It reports into the same counters through these two helpers. */
+extern void audio_snapshot_run(void);
+int fftest_check_total(void);
+int fftest_check_failures(void);
+void fftest_add_checks(int n, int f);
+
+int fftest_check_total(void)
+{
+    return checks;
+}
+
+int fftest_check_failures(void)
+{
+    return failures;
+}
+
+void fftest_add_checks(int n, int f)
+{
+    checks   += n;
+    failures += f;
+}
+
 #define CHECK_OK(expr)     CHECK((expr) == 0)
 #define CHECK_AVERROR(expr, err) CHECK((expr) == AVERROR(err))
 
@@ -2251,7 +2275,7 @@ static void test_release_capabilities(void)
     CHECK(Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(NULL, NULL) ==
           FF_JNI_BRIDGE_API_VERSION);
     CHECK(FF_JNI_BRIDGE_API_MAJOR == 1);
-    CHECK(FF_JNI_BRIDGE_API_MINOR == 2);
+    CHECK(FF_JNI_BRIDGE_API_MINOR == 3);
 
     /* Promised by this release, each with a test set behind it. */
     CHECK(caps & FF_JNI_CAP_PCM_SESSION_SAFE_V2);
@@ -2261,11 +2285,25 @@ static void test_release_capabilities(void)
     CHECK(caps & FF_JNI_CAP_BRIDGE_BUILD_INFO);
     CHECK(caps & FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE);
     CHECK(caps & FF_JNI_CAP_BOUNDED_PCM_RESAMPLE);
+    /* Both snapshot entry points exist and are driven for real by
+     * tests/audio_format_snapshot_test.c; the capability is claimed only
+     * because that suite runs in the same binary. */
+    CHECK(caps & FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO);
+    CHECK(caps & FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO);
 
     /* NOT promised: batch B is deferred. This is the assertion that must
      * fail first if a later change starts advertising scoped accounting
      * without the wiring and the tests behind it. */
     CHECK((caps & FF_JNI_CAP_CODEC_SCOPED_BUFFER_ACCOUNTING) == 0);
+
+    /* NOT promised either: the bit positions are allocated so they can never
+     * be reused, but there is no probe policy or probe statistics entry point
+     * behind them yet. Advertising them would invite a caller to rely on a
+     * strict probe that does not exist and would silently decode in software.
+     * These assertions must fail first if a later change sets the bit without
+     * implementing and testing the entry point. */
+    CHECK((caps & FF_JNI_CAP_AUDIO_PROBE_POLICY) == 0);
+    CHECK((caps & FF_JNI_CAP_AUDIO_PROBE_STATS) == 0);
 
     /* No bit outside the registered set may appear: a stray bit is either
      * an unregistered feature or a shifted constant, and a consumer cannot
@@ -2277,7 +2315,9 @@ static void test_release_capabilities(void)
                             FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE |
                             FF_JNI_CAP_BOUNDED_PCM_RESAMPLE |
                             FF_JNI_CAP_PCM_SESSION_SAFE_V2 |
-                            FF_JNI_CAP_RENDERER_SAFE_CLOSE;
+                            FF_JNI_CAP_RENDERER_SAFE_CLOSE |
+                            FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO |
+                            FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO;
 
         CHECK((caps & ~known) == 0);
     }
@@ -2287,6 +2327,14 @@ static void test_release_capabilities(void)
     CHECK(FF_JNI_CAP_CODEC_SCOPED_BUFFER_ACCOUNTING == (1LL << 7));
     CHECK(FF_JNI_CAP_RENDERER_SAFE_CLOSE == (1LL << 6));
     CHECK(FF_JNI_CAP_PCM_SESSION_SAFE_V2 == (1LL << 5));
+    CHECK(FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO == (1LL << 8));
+    CHECK(FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO == (1LL << 9));
+    CHECK(FF_JNI_CAP_AUDIO_PROBE_POLICY == (1LL << 10));
+    CHECK(FF_JNI_CAP_AUDIO_PROBE_STATS == (1LL << 11));
+
+    /* The whole mask for this release, written out once so an unannounced
+     * bit is a test failure rather than a silent contract change. */
+    CHECK(caps == (jlong)0x37f);
 }
 
 /* BuildInfo must be well-formed JSON with every field present, and any field
@@ -3268,6 +3316,11 @@ int main(void)
     test_output_handle_registry();
     test_output_handle_generation_blocks_reuse();
     test_window_renderer_free_retains_while_busy();
+
+    /* The audio format snapshot suite lives in its own translation unit (it
+     * needs fixture builders that would only add noise here) but shares this
+     * binary so that one build proves every capability bit that is set. */
+    audio_snapshot_run();
 
     printf("%d checks, %d failures\n", checks, failures);
     if (failures) {
