@@ -7,20 +7,12 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      # The contract test is opt-in only because the emulator stage cannot run
-      # on GitHub-hosted x86_64 runners (see the probe-arm64-runner comment).
-      # Once a runner that can execute the ARM binaries exists, flip this to a
-      # skip-style input so the test runs by default.
+      # The contract test is opt-in because no GitHub-hosted runner can execute
+      # it: see the contract-test job comment for the two options that were
+      # ruled out. Keep this false until a runner with /dev/kvm and an ARM
+      # capable emulator exists.
       run_native_contract_test:
         description: 'Boot an ARM emulator and run the native contract test'
-        type: boolean
-        default: false
-
-      # Runs a diagnostic-only job on ubuntu-24.04-arm to find out whether the
-      # ARM64 hosted runner can host an Android emulator at all. It asserts
-      # nothing and never fails the build; read its log for the answer.
-      probe_arm64_runner:
-        description: 'Probe ubuntu-24.04-arm for Android SDK/KVM/emulator support (diagnostic)'
         type: boolean
         default: false
 
@@ -944,268 +936,30 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # Feasibility probe for running the ARM contract test on a hosted runner.
-  #
-  # WHY THIS EXISTS
-  #
-  # The contract test binaries are arm64-v8a / armeabi-v7a Android ELF files
-  # that need bionic's /system/bin/linker, so they cannot run directly on a
-  # Linux host. The x86_64 hosted runner cannot emulate them either
-  # ("QEMU2 emulator does not support arm64 CPU architecture"). GitHub now
-  # offers native ARM64 runners (ubuntu-24.04-arm), which would remove the
-  # architecture mismatch -- but several links in that chain are unverified:
-  #
-  #   1. the ARM64 image ships no Android SDK (checked: not in its manifest),
-  #   2. platform-tools and emulator need native aarch64 builds,
-  #   3. the emulator needs /dev/kvm, and KVM on ARM64 hosted runners is not
-  #      documented either way.
-  #
-  # Rather than guess (and rather than make the release gate red for an
-  # environmental reason), this probe reports what is actually true on the
-  # runner. It asserts nothing and gates nothing; its value is the log.
-  #
-  # Run it with: workflow_dispatch, input probe_arm64_runner = true.
-  probe-arm64-runner:
-    name: Probe ARM64 runner for emulator support
-    runs-on: ubuntu-24.04-arm
-    if: github.event_name == 'workflow_dispatch' && inputs.probe_arm64_runner
-    steps:
-      # None of the probe steps set -e or -u: a diagnostic must report what it
-      # found, and aborting on the first unexpected condition defeats that.
-      # (An earlier version used `set -uo pipefail` and died with exit 1 while
-      # printing nothing inside its groups.)
-      - name: Host facts
-        run: |
-          echo "::group::host"
-          uname -a
-          uname -m
-          lsb_release -a 2>/dev/null || cat /etc/os-release
-          echo "nproc=$(nproc)"
-          free -m || true
-          df -h /
-          echo "::endgroup::"
-
-      - name: KVM availability
-        run: |
-          echo "::group::kvm"
-          if [ -e /dev/kvm ]; then
-            echo "PRESENT: /dev/kvm"
-            ls -l /dev/kvm
-            if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-              echo "ACCESS: readable and writable"
-            else
-              echo "ACCESS: present but NOT rw for this user (group: $(stat -c %G /dev/kvm))"
-            fi
-          else
-            echo "ABSENT: /dev/kvm does not exist -- hardware acceleration unavailable"
-          fi
-          echo "--- cpu virtualization flags ---"
-          grep -m1 -o -E 'flags\s*:.*' /proc/cpuinfo | grep -o -E '\b(vmx|svm|virt)\b' | sort -u || echo "none of vmx/svm/virt found"
-          echo "--- kvm module ---"
-          lsmod 2>/dev/null | grep -i kvm || echo "no kvm module loaded/visible"
-          echo "::endgroup::"
-
-      - name: Android SDK / adb / emulator presence
-        run: |
-          echo "::group::android tools"
-          for t in adb sdkmanager avdmanager emulator; do
-            if command -v "$t" >/dev/null 2>&1; then
-              echo "FOUND: $t -> $(command -v "$t")"
-            else
-              echo "MISSING: $t"
-            fi
-          done
-          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
-          echo "::endgroup::"
-
-      - name: Install Android SDK for arm64
-        id: sdk
-        # continue-on-error: the point of the probe is to record whether this
-        # works on arm64, so a failure must be reported, not turned into a red
-        # build that looks like a code defect.
-        continue-on-error: true
-        uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools emulator'
-
-      - name: Record whether the SDK install succeeded
-        run: |
-          # outcome is success/failure/cancelled/skipped. 'success' here means
-          # the action itself did not error -- it does not mean the packages
-          # landed where this shell can see them, which is why the next step
-          # searches the disk.
-          echo "setup-android outcome: ${{ steps.sdk.outcome }}"
-          echo "setup-android conclusion: ${{ steps.sdk.conclusion }}"
-
-      - name: Verify what the SDK install actually produced
-        # Diagnostic only: this step must never fail the build. `set -e` is
-        # deliberately absent and every command is guarded. An earlier version
-        # used `set -uo pipefail`, and the step died with exit code 1 while
-        # printing nothing inside the groups -- a diagnostic that fails before
-        # it reports anything is worse than no diagnostic.
-        run: |
-          echo "::group::after setup-android"
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT-<unset>}"
-          echo "ANDROID_HOME=${ANDROID_HOME-<unset>}"
-          echo "HOME=${HOME-<unset>}"
-          echo "PATH=${PATH-<unset>}"
-          for t in adb sdkmanager avdmanager emulator; do
-            p=$(command -v "$t" 2>/dev/null || true)
-            if [ -n "$p" ]; then
-              echo "FOUND: $t -> $p"
-            else
-              echo "MISSING: $t"
-            fi
-          done
-          echo "::endgroup::"
-
-          echo "::group::look for an SDK on disk"
-          for root in "${ANDROID_SDK_ROOT-}" "${ANDROID_HOME-}" \
-                      "${HOME-}/.android/sdk" "${HOME-}/Android/Sdk" \
-                      /usr/local/lib/android/sdk /opt/android-sdk; do
-            [ -n "$root" ] || continue
-            if [ -d "$root" ]; then
-              echo "EXISTS: $root"
-              ls -1 "$root" 2>/dev/null | sed -n '1,20p' || true
-            else
-              echo "absent: $root"
-            fi
-          done
-          echo "::endgroup::"
-
-          echo "::group::find adb/emulator/sdkmanager on disk"
-          for name in adb emulator sdkmanager; do
-            # caches, proc and sys are skipped: walking them is slow and they
-            # never hold an SDK.
-            hits=$(find / -maxdepth 6 \
-                     -path /proc -prune -o -path /sys -prune -o \
-                     -type f -name "$name" -print 2>/dev/null | sed -n '1,5p' || true)
-            if [ -n "$hits" ]; then
-              echo "$name:"
-              printf '%s\n' "$hits"
-            else
-              echo "$name: not found on disk"
-            fi
-          done
-          echo "::endgroup::"
-
-          echo "::group::binary architecture (if any)"
-          found=$(find / -maxdepth 6 \
-                    -path /proc -prune -o -path /sys -prune -o \
-                    -type f \( -name adb -o -name emulator \) -print 2>/dev/null \
-                  | sed -n '1,5p' || true)
-          if [ -z "$found" ]; then
-            echo "no adb/emulator binaries to inspect"
-          else
-            printf '%s\n' "$found" | while read -r f; do
-              echo "--- $f"
-              file "$f" 2>/dev/null || echo "  (file failed)"
-            done
-          fi
-          echo "::endgroup::"
-
-          # Explicit success: a probe that reports has done its job.
-          exit 0
-
-      - name: Can the emulator package be installed at all
-        run: |
-          # The decisive question: does Google publish packages for
-          # linux-aarch64 in the API 24 default image set? If this fails, the
-          # ARM64 emulator route is closed regardless of KVM.
-          #
-          # Output is written to a file and then truncated with sed, not piped
-          # into head: a pipe would make sdkmanager die on SIGPIPE and be
-          # reported as a spurious failure (the same "Broken pipe" noise the
-          # symbol checks emit).
-          if ! command -v sdkmanager >/dev/null 2>&1; then
-            echo "sdkmanager not available; skipping"
-            exit 0
-          fi
-          sdkmanager --list > sdkmanager-list.txt 2>&1 || true
-          echo "::group::sdkmanager --list (first 80 lines)"
-          sed -n '1,80p' sdkmanager-list.txt
-          echo "::endgroup::"
-          echo "::group::android-24 system images"
-          grep -E 'system-images;android-24' sdkmanager-list.txt || \
-            echo "no android-24 system image listed"
-          echo "::endgroup::"
-          echo "::group::arm64 marker"
-          grep -iE 'arm64|aarch64' sdkmanager-list.txt | sed -n '1,20p' || \
-            echo "no arm64/aarch64 entry in the package list"
-          echo "::endgroup::"
-
-      - name: Can an arm64 system image be installed
-        run: |
-          if ! command -v sdkmanager >/dev/null 2>&1; then
-            echo "sdkmanager not available; skipping"
-            exit 0
-          fi
-          echo "::group::install attempt"
-          # No pipe: the exit status of sdkmanager itself is the signal, and a
-          # pipe would report tail's status instead.
-          sdkmanager --install 'system-images;android-24;default;arm64-v8a' \
-            > sdkmanager-install.txt 2>&1
-          rc=$?
-          sed -n '1,200p' sdkmanager-install.txt
-          echo "install exit code: $rc"
-          if [ "$rc" -eq 0 ]; then
-            echo "RESULT: arm64-v8a system image INSTALLED"
-          else
-            echo "RESULT: arm64-v8a system image NOT installable (see above)"
-          fi
-          echo "::endgroup::"
-          # Informational only: this probe never fails the build.
-          exit 0
-
-      - name: Probe summary
-        if: always()
-        run: |
-          SDK="${ANDROID_SDK_ROOT-${ANDROID_HOME-}}"
-          EMU=""
-          if [ -n "$SDK" ]; then
-            EMU="$SDK/emulator/emulator"
-          fi
-          KVM_RW=no
-          if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-            KVM_RW=yes
-          fi
-          {
-            echo "=== ARM64 runner probe ==="
-            echo "arch=$(uname -m)"
-            echo "kvm_device=$([ -e /dev/kvm ] && echo present || echo absent)"
-            echo "kvm_read_write=$KVM_RW"
-            echo "sdk_root=${SDK:-<unset>}"
-            echo "adb=$(command -v adb || echo missing)"
-            if [ -n "$EMU" ] && [ -f "$EMU" ]; then
-              echo "emulator=$EMU"
-            else
-              echo "emulator=missing"
-            fi
-            echo ""
-            echo "Interpretation: the test binary needs bionic's linker, so it"
-            echo "cannot run on this host directly. Running it needs an emulator,"
-            echo "which needs both an arm64 system image and working KVM."
-          } | tee probe-arm64-summary.txt
 
   contract-test:
     name: Run native contract test (${{ matrix.abi }})
     needs: build
-    # Native arm64 runner. An x86_64 hosted runner cannot host these
-    # binaries at all -- the emulator there reports
+    # NOT RUNNABLE ON GITHUB-HOSTED RUNNERS. Left in place, skipped by default,
+    # as documentation of what would have to be provided for this gate to run.
     #
-    #   FATAL | QEMU2 emulator does not support arm64 CPU architecture
+    # Two hosted options were measured or documented, and both fail:
     #
-    # so the emulator must run on a host of the same architecture as the
-    # guest. ubuntu-24.04-arm is free for public repositories (4 vCPU /
-    # 16 GB / 14 GB SSD), but it ships no Android SDK, so setup-android
-    # installs platform-tools and emulator explicitly.
+    #   x86_64 (ubuntu-latest): the emulator refuses the guest outright
+    #     FATAL | QEMU2 emulator does not support arm64 CPU architecture
     #
-    # Still opt-in, and honestly so: whether this runner exposes /dev/kvm and
-    # whether Google publishes an arm64 system image for API 24 are not
-    # documented. probe-arm64-runner answers both without gating anything.
-    # Until it does, this job is treated as NOT RUN, never as passed.
-    runs-on: ubuntu-24.04-arm
+    #   arm64 (ubuntu-24.04-arm): probed, and the probe reported
+    #     arch=aarch64  kvm_device=absent  sdk_root=<unset>
+    #     adb=missing   emulator=missing
+    #   No /dev/kvm means no hardware acceleration for an arm64 guest, and the
+    #   image ships no Android SDK.
+    #
+    # Running this needs a self-hosted ARM host with /dev/kvm, or a physical
+    # device attached to a runner. Until one exists the job stays opt-in, and
+    # it is recorded as NOT RUN rather than as passed: the capability bits it
+    # is meant to justify are advertised on the strength of the compile and
+    # symbol checks alone, not of an execution.
+    runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && inputs.run_native_contract_test
     strategy:
       fail-fast: false
@@ -1250,60 +1004,12 @@ jobs:
           readelf -d "$BIN" | grep NEEDED || true
           echo "::endgroup::"
 
-      # The ARM64 image ships no Android SDK, so platform-tools (adb) and the
-      # emulator have to be installed. setup-android resolves the arch itself.
-      - name: Install Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools emulator'
-
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-
-      # Runs AFTER Enable KVM so the udev rule has had a chance to grant
-      # access; a preflight ordered the other way round would report a
-      # permission problem that the previous step fixes.
-      #
-      # ubuntu-24.04-arm exposes no Android SDK and its KVM support is
-      # undocumented. Rather than let the emulator fail with an obscure QEMU
-      # error, say plainly what is missing: the message names the environment,
-      # so a red job is not mistaken for a code defect.
-      - name: Preflight (adb, emulator, KVM)
-        run: |
-          set -euo pipefail
-          echo "arch=$(uname -m)"
-          command -v adb
-          adb version
-          # Both variables are optional, so both need a default: under `set -u`
-          # a bare $ANDROID_HOME aborts the step before it can report why.
-          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          if [ -z "$SDK" ]; then
-            echo "::error::neither ANDROID_SDK_ROOT nor ANDROID_HOME is set: setup-android did not export an SDK path"
-            exit 1
-          fi
-          if command -v adb >/dev/null 2>&1; then
-            :
-          else
-            echo "::error::adb is not on PATH (SDK=$SDK)"
-            exit 1
-          fi
-          EMU="$SDK/emulator/emulator"
-          test -x "$EMU" || { echo "::error::emulator binary missing at $EMU"; exit 1; }
-          "$EMU" -version || true
-          if [ ! -e /dev/kvm ]; then
-            echo "::error::/dev/kvm is absent on this runner: the ARM emulator cannot be hardware-accelerated here"
-            exit 1
-          fi
-          ls -l /dev/kvm
-          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-            echo "::error::/dev/kvm exists but is not readable+writable by this user (group $(stat -c %G /dev/kvm))"
-            exit 1
-          fi
-          echo "preflight ok: adb, emulator and KVM are usable"
 
       - name: Run contract test on emulator
         uses: reactivecircus/android-emulator-runner@v2
