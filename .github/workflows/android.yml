@@ -970,9 +970,12 @@ jobs:
     runs-on: ubuntu-24.04-arm
     if: github.event_name == 'workflow_dispatch' && inputs.probe_arm64_runner
     steps:
+      # None of the probe steps set -e or -u: a diagnostic must report what it
+      # found, and aborting on the first unexpected condition defeats that.
+      # (An earlier version used `set -uo pipefail` and died with exit 1 while
+      # printing nothing inside its groups.)
       - name: Host facts
         run: |
-          set -uo pipefail
           echo "::group::host"
           uname -a
           uname -m
@@ -984,7 +987,6 @@ jobs:
 
       - name: KVM availability
         run: |
-          set -uo pipefail
           echo "::group::kvm"
           if [ -e /dev/kvm ]; then
             echo "PRESENT: /dev/kvm"
@@ -1005,7 +1007,6 @@ jobs:
 
       - name: Android SDK / adb / emulator presence
         run: |
-          set -uo pipefail
           echo "::group::android tools"
           for t in adb sdkmanager avdmanager emulator; do
             if command -v "$t" >/dev/null 2>&1; then
@@ -1030,7 +1031,6 @@ jobs:
 
       - name: Record whether the SDK install succeeded
         run: |
-          set -uo pipefail
           # outcome is success/failure/cancelled/skipped. 'success' here means
           # the action itself did not error -- it does not mean the packages
           # landed where this shell can see them, which is why the next step
@@ -1039,45 +1039,48 @@ jobs:
           echo "setup-android conclusion: ${{ steps.sdk.conclusion }}"
 
       - name: Verify what the SDK install actually produced
+        # Diagnostic only: this step must never fail the build. `set -e` is
+        # deliberately absent and every command is guarded. An earlier version
+        # used `set -uo pipefail`, and the step died with exit code 1 while
+        # printing nothing inside the groups -- a diagnostic that fails before
+        # it reports anything is worse than no diagnostic.
         run: |
-          set -uo pipefail
-          # `set -u` is on, so every unset variable must be given a default:
-          # an earlier version dereferenced $ANDROID_HOME bare and the step
-          # died with "ANDROID_HOME: unbound variable" before printing
-          # anything. Nothing below may assume a variable exists.
           echo "::group::after setup-android"
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
-          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
-          echo "PATH=$PATH"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT-<unset>}"
+          echo "ANDROID_HOME=${ANDROID_HOME-<unset>}"
+          echo "HOME=${HOME-<unset>}"
+          echo "PATH=${PATH-<unset>}"
           for t in adb sdkmanager avdmanager emulator; do
-            if command -v "$t" >/dev/null 2>&1; then
-              echo "FOUND: $t -> $(command -v "$t")"
+            p=$(command -v "$t" 2>/dev/null || true)
+            if [ -n "$p" ]; then
+              echo "FOUND: $t -> $p"
             else
               echo "MISSING: $t"
             fi
           done
           echo "::endgroup::"
 
-          # A MISSING in PATH does not prove the package was not installed:
-          # setup-android may have written the SDK somewhere it did not add to
-          # PATH. Look for the files too, then report what is on disk.
           echo "::group::look for an SDK on disk"
-          for root in "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" \
-                      "$HOME/.android/sdk" "$HOME/Android/Sdk" \
+          for root in "${ANDROID_SDK_ROOT-}" "${ANDROID_HOME-}" \
+                      "${HOME-}/.android/sdk" "${HOME-}/Android/Sdk" \
                       /usr/local/lib/android/sdk /opt/android-sdk; do
             [ -n "$root" ] || continue
             if [ -d "$root" ]; then
               echo "EXISTS: $root"
-              ls -1 "$root" 2>/dev/null | sed -n '1,20p'
+              ls -1 "$root" 2>/dev/null | sed -n '1,20p' || true
             else
               echo "absent: $root"
             fi
           done
           echo "::endgroup::"
 
-          echo "::group::find adb/emulator anywhere"
+          echo "::group::find adb/emulator/sdkmanager on disk"
           for name in adb emulator sdkmanager; do
-            hits=$(find / -maxdepth 6 -type f -name "$name" 2>/dev/null | sed -n '1,5p')
+            # caches, proc and sys are skipped: walking them is slow and they
+            # never hold an SDK.
+            hits=$(find / -maxdepth 6 \
+                     -path /proc -prune -o -path /sys -prune -o \
+                     -type f -name "$name" -print 2>/dev/null | sed -n '1,5p' || true)
             if [ -n "$hits" ]; then
               echo "$name:"
               printf '%s\n' "$hits"
@@ -1088,15 +1091,25 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::binary architecture (if any)"
-          for f in $(find / -maxdepth 6 -type f \( -name adb -o -name emulator \) 2>/dev/null | sed -n '1,5p'); do
-            echo "--- $f"
-            file "$f" || true
-          done
+          found=$(find / -maxdepth 6 \
+                    -path /proc -prune -o -path /sys -prune -o \
+                    -type f \( -name adb -o -name emulator \) -print 2>/dev/null \
+                  | sed -n '1,5p' || true)
+          if [ -z "$found" ]; then
+            echo "no adb/emulator binaries to inspect"
+          else
+            printf '%s\n' "$found" | while read -r f; do
+              echo "--- $f"
+              file "$f" 2>/dev/null || echo "  (file failed)"
+            done
+          fi
           echo "::endgroup::"
+
+          # Explicit success: a probe that reports has done its job.
+          exit 0
 
       - name: Can the emulator package be installed at all
         run: |
-          set -uo pipefail
           # The decisive question: does Google publish packages for
           # linux-aarch64 in the API 24 default image set? If this fails, the
           # ARM64 emulator route is closed regardless of KVM.
@@ -1124,7 +1137,6 @@ jobs:
 
       - name: Can an arm64 system image be installed
         run: |
-          set -uo pipefail
           if ! command -v sdkmanager >/dev/null 2>&1; then
             echo "sdkmanager not available; skipping"
             exit 0
@@ -1149,8 +1161,7 @@ jobs:
       - name: Probe summary
         if: always()
         run: |
-          set -uo pipefail
-          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          SDK="${ANDROID_SDK_ROOT-${ANDROID_HOME-}}"
           EMU=""
           if [ -n "$SDK" ]; then
             EMU="$SDK/emulator/emulator"
