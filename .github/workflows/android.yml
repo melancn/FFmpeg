@@ -867,11 +867,13 @@ jobs:
           # would reject parts of it as C++), then link with the C++ driver
           # because the static libass archive needs libc++.
           #
-          # Two test translation units, one binary: the audio format snapshot
-          # suite lives in its own file but is driven from
+          # Three test translation units, one binary: the audio format snapshot
+          # and codec id suites live in their own files but are driven from
           # packet_contract_test.c's main(), so a single build has to satisfy
-          # both. It must be linked here rather than left out: a capability bit
-          # is only advertised because that suite runs.
+          # all of them. They must be linked here rather than left out: a
+          # capability bit is only advertised because the snapshot suite runs,
+          # and the JAR's codec id literals are only pinned because the codec
+          # id suite does.
           "$CC" "${COMMON_CFLAGS[@]}" -c \
             "$PWD/compat/android/jni/tests/packet_contract_test.c" \
             -o "$OUT/packet_contract_test.o"
@@ -880,7 +882,15 @@ jobs:
             "$PWD/compat/android/jni/tests/audio_format_snapshot_test.c" \
             -o "$OUT/audio_format_snapshot_test.o"
 
+          # Pins the AVCodecID literals FFMpegNative.java repeats to the real
+          # enum. It is the only translation unit that can see both sides, so
+          # without it a mistranscribed codec id reaches the JAR silently.
+          "$CC" "${COMMON_CFLAGS[@]}" -c \
+            "$PWD/compat/android/jni/tests/codec_id_bridge_test.c" \
+            -o "$OUT/codec_id_bridge_test.o"
+
           "$CXX" "$OUT/packet_contract_test.o" "$OUT/audio_format_snapshot_test.o" \
+            "$OUT/codec_id_bridge_test.o" \
             -L"$PREFIX/lib" -L"$MBEDTLS_PREFIX/lib" -L"$DEPS_PREFIX/lib" \
             -Wl,--start-group \
             -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \

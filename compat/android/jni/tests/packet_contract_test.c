@@ -79,6 +79,12 @@ _Static_assert(FF_JNI_PACKET_BUDGET_SLOTS == 6,
  * exposes this so both suites share one binary, one link and one pass/fail
  * line. It reports into the same counters through these two helpers. */
 extern void audio_snapshot_run(void);
+
+/* The codec id suite (tests/codec_id_bridge_test.c) pins the AVCodecID
+ * literals FFMpegNative.java repeats to the real enum. It needs libavcodec's
+ * codec_id.h and nothing from the bridge, so it is its own translation unit
+ * for the same reason: no second copy of the implementation. */
+extern void codec_id_bridge_run(void);
 int fftest_check_total(void);
 int fftest_check_failures(void);
 void fftest_add_checks(int n, int f);
@@ -3339,6 +3345,10 @@ int main(void)
      * needs fixture builders that would only add noise here) but shares this
      * binary so that one build proves every capability bit that is set. */
     audio_snapshot_run();
+
+    /* The codec id suite pins the AVCodecID values FFMpegNative.java repeats
+     * against the real enum, in a translation unit that can see both. */
+    codec_id_bridge_run();
 
     printf("%d checks, %d failures\n", checks, failures);
     if (failures) {

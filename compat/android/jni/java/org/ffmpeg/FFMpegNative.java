@@ -3108,8 +3108,8 @@ public final class FFMpegNative {
     public static final int AV_CODEC_ID_VORBIS     = 0x15005; // = 86021
     public static final int AV_CODEC_ID_FLAC       = 0x1500c; // = 86028
     public static final int AV_CODEC_ID_ALAC       = 0x15010; // = 86032
-    public static final int AV_CODEC_ID_EAC3       = 0x15038; // = 86056
-    public static final int AV_CODEC_ID_OPUS       = 0x1504c; // = 86076
+    public static final int AV_CODEC_ID_EAC3       = 0x15028; // = 86056
+    public static final int AV_CODEC_ID_OPUS       = 0x1503C; // = 86076
 
     /** @deprecated alias kept for parity with {@code AV_CODEC_ID_H265}. */
     public static final int AV_CODEC_ID_H265 = AV_CODEC_ID_HEVC;
