@@ -1008,9 +1008,15 @@ static AVFrame *make_pcm_frame(enum AVSampleFormat fmt, int rate,
  * its layout differs between API levels and whether it is even visible is
  * not something a bridge test should depend on. The wrappers only ever see
  * these as opaque jbyteArray/jintArray values, which is exactly how a real
- * VM hands them over. */
+ * VM hands them over.
+ *
+ * The byte storage lives here rather than in a single shared buffer so that
+ * a short array really is short: an oversized array must be refused on its
+ * own length, not saved by the harness refusing to write. */
 typedef struct FFTestJniArray {
-    jsize length;
+    jsize  length;      /* element count, as GetArrayLength reports */
+    size_t capacity;    /* bytes actually available in data[]       */
+    jbyte  data[1];     /* variable-size tail, allocated to fit      */
 } FFTestJniArray;
 
 /* One stub per test process; the wrappers are only ever entered from the
@@ -1023,6 +1029,20 @@ typedef struct FFTestJniState {
     int   calls;                          /* completed Set*Region calls    */
     int   fail_publish;                   /* inject: Set*Region raises    */
 } FFTestJniState;
+
+/* Allocates a stub array holding `nelem` elements of `elem_size` bytes.
+ * length is the element count, capacity is what fits in data[]. */
+static FFTestJniArray *fftest_array_alloc(jsize nelem, size_t elem_size)
+{
+    const size_t bytes = (size_t)nelem * elem_size;
+    FFTestJniArray *a = av_mallocz(sizeof(*a) + bytes);
+
+    if (!a)
+        return NULL;
+    a->length   = nelem;
+    a->capacity = bytes;
+    return a;
+}
 
 static FFTestJniState g_fftest_jni;
 
@@ -1078,14 +1098,16 @@ static jint fftest_throw_new(JNIEnv *env, jclass c, const char *msg)
 static void fftest_set_byte_region(JNIEnv *env, jbyteArray a, jsize start,
                                    jsize len, const jbyte *buf)
 {
-    const FFTestJniArray *arr = (const FFTestJniArray *)(const void *)a;
+    FFTestJniArray *arr = (FFTestJniArray *)(void *)a;
 
     (void)env;
     CHECK(arr != NULL && start >= 0 && len >= 0);
     /* A write past the array is the bug this stub exists to catch: a real
-     * VM would have thrown, so record it and stop copying. */
-    if (!arr || start < 0 || len < 0 || start + len > arr->length ||
-        start + len > FFTEST_OUT_CAP_MAX) {
+     * VM would have thrown, so record it and stop copying. The check is
+     * against the array's own length, so a short array is refused by the
+     * bridge's capacity check before this is ever reached. */
+    if (!arr || start < 0 || len < 0 ||
+        (size_t)len > arr->capacity || (size_t)start > arr->capacity - (size_t)len) {
         g_fftest_jni.fail_publish = 1;
         fftest_raise_exception(env);
         return;
@@ -1094,8 +1116,12 @@ static void fftest_set_byte_region(JNIEnv *env, jbyteArray a, jsize start,
         fftest_raise_exception(env);
         return;
     }
-    if (len > 0)
-        memcpy(g_fftest_jni.last_byte, buf, (size_t)len);
+    if (len > 0) {
+        memcpy(arr->data + start, buf, (size_t)len);
+        memcpy(g_fftest_jni.last_byte, buf,
+               (size_t)len < sizeof(g_fftest_jni.last_byte)
+                   ? (size_t)len : sizeof(g_fftest_jni.last_byte));
+    }
     g_fftest_jni.last_byte_len = len;
     g_fftest_jni.calls++;
 }
@@ -1103,10 +1129,12 @@ static void fftest_set_byte_region(JNIEnv *env, jbyteArray a, jsize start,
 static void fftest_set_int_region(JNIEnv *env, jintArray a, jsize start,
                                   jsize len, const jint *buf)
 {
-    const FFTestJniArray *arr = (const FFTestJniArray *)(const void *)a;
+    FFTestJniArray *arr = (FFTestJniArray *)(void *)a;
 
     (void)env;
-    if (!arr || start < 0 || len < 0 || start + len > arr->length) {
+    if (!arr || start < 0 || len < 0 ||
+        (size_t)len * sizeof(jint) > arr->capacity ||
+        (size_t)start * sizeof(jint) > arr->capacity - (size_t)len * sizeof(jint)) {
         fftest_raise_exception(env);
         return;
     }
@@ -1121,22 +1149,12 @@ static void fftest_set_int_region(JNIEnv *env, jintArray a, jsize start,
 
 static jbyteArray fftest_new_byte_array(jsize len)
 {
-    FFTestJniArray *a = av_mallocz(sizeof(*a));
-
-    if (!a)
-        return NULL;
-    a->length = len;
-    return (jbyteArray)(void *)a;
+    return (jbyteArray)(void *)fftest_array_alloc(len, sizeof(jbyte));
 }
 
 static jintArray fftest_new_int_array(jsize len)
 {
-    FFTestJniArray *a = av_mallocz(sizeof(*a));
-
-    if (!a)
-        return NULL;
-    a->length = len;
-    return (jintArray)(void *)a;
+    return (jintArray)(void *)fftest_array_alloc(len, sizeof(jint));
 }
 
 static jthrowable fftest_exception_occurred(JNIEnv *env)

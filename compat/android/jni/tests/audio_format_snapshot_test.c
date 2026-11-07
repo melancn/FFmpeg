@@ -178,8 +178,10 @@ static SnapshotArray *snap_array_new(jsize len)
     a->length = len;
     a->allow_publish = 1;
     if (len > 0) {
-        a->longs = av_mallocz_array((size_t)len, sizeof(*a->longs));
-        a->ints  = av_mallocz_array((size_t)len, sizeof(*a->ints));
+        /* av_calloc, not av_mallocz_array: the latter is a lavu-internal
+         * name and is not declared in libavutil/mem.h. */
+        a->longs = av_calloc((size_t)len, sizeof(*a->longs));
+        a->ints  = av_calloc((size_t)len, sizeof(*a->ints));
         if (!a->longs || !a->ints) {
             av_free(a->longs);
             av_free(a->ints);
@@ -217,9 +219,21 @@ static void snap_reset(void)
 /* unchanged, and the fixture never opens a decoder to produce one.      */
 /* ------------------------------------------------------------------ */
 
+/* A format context plus a convenience accessor for its streams.
+ *
+ * There is deliberately no separate stream array: the bridge reads
+ * c->streams[i]->codecpar, so the fixtures do the same through
+ * snap_stream(). Keeping a parallel array was how an earlier build ended up
+ * with a struct member that did not exist. */
 typedef struct SnapContext {
     AVFormatContext *ctx;
 } SnapContext;
+
+/* Stream i of the context. Only valid for indices the fixtures created. */
+static AVStream *snap_stream(SnapContext *sc, int i)
+{
+    return sc->ctx->streams[i];
+}
 
 /* n streams, all audio, at index 0..n-1. */
 static int snap_context_init(SnapContext *sc, int n)
@@ -395,7 +409,7 @@ static void check_native_case(const char *what, uint64_t mask,
         snap_context_free(&sc);
         return;
     }
-    p = sc.streams[0]->codecpar;
+    p = snap_stream(&sc, 0)->codecpar;
     p->codec_id    = AV_CODEC_ID_AAC;
     p->profile     = AV_PROFILE_AAC_LOW;
     p->format      = AV_SAMPLE_FMT_FLTP;
@@ -452,8 +466,9 @@ static void test_native_mono_stereo_5_1_7_1(void)
     }
 }
 
-/* The sign bit of the long must not swallow bit 63 of the mask. */
-static void test_mask_bit_63_survives(void)
+/* A mask bit above 31 must survive the round trip: truncating to int would
+ * silently report a stereo-only layout for a 3-channel one. */
+static void test_high_mask_bits_survive(void)
 {
     SnapContext sc;
     AVCodecParameters *p;
@@ -463,21 +478,26 @@ static void test_mask_bit_63_survives(void)
         snap_context_free(&sc);
         return;
     }
-    p = sc.streams[0]->codecpar;
+    /* The highest channel bit reachable from a legal layout. enum AVChannel
+     * stops at AV_CHAN_BINAURAL_RIGHT (62); bit 63 has no channel value, so a
+     * layout cannot set it and asserting on it would be asserting on a state
+     * that does not exist. Bits above 31 are what an int mask would lose. */
+    const uint64_t high = AV_CH_FRONT_LEFT | AV_CH_BINAURAL_RIGHT;
+    const uint64_t high32 = AV_CH_TOP_SURROUND_RIGHT;   /* id 38, above bit 31 */
+
+    p = snap_stream(&sc, 0)->codecpar;
     p->codec_id = AV_CODEC_ID_PCM_S16LE;
     p->format   = AV_SAMPLE_FMT_S16;
-    CHECK(av_channel_layout_from_mask(&p->ch_layout,
-                                      AV_CH_FRONT_LEFT | AV_CH_TOP_SURROUND_RIGHT) == 0);
+    CHECK(av_channel_layout_from_mask(&p->ch_layout, high | high32) == 0);
 
     snap_reset();
     CHECK(call_stream(sc.ctx, 0) >= 0);
     CHECK(known(FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK));
-    /* Bit 63 stays bit 63: the value is negative as a signed long, which is
-     * exactly why the slot is a 64-bit long and not an int. */
-    CHECK(slot(FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK) ==
-          (int64_t)(AV_CH_FRONT_LEFT | AV_CH_TOP_SURROUND_RIGHT));
-    CHECK((uint64_t)slot(FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK) ==
-          (AV_CH_FRONT_LEFT | AV_CH_TOP_SURROUND_RIGHT));
+    /* Bit 62 survives intact. Truncating to 32 bits would drop it. */
+    CHECK((uint64_t)slot(FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK) == high | high32);
+    CHECK((uint64_t)slot(FF_JNI_AUDIO_INFO_NATIVE_CHANNEL_MASK) &
+          (1ULL << AV_CHAN_BINAURAL_RIGHT));
+    CHECK(slot(FF_JNI_AUDIO_INFO_CHANNEL_COUNT) == 3);
 
     snap_context_free(&sc);
 }
@@ -503,13 +523,13 @@ static void test_unspec_vs_custom(void)
         return;
     }
 
-    p = sc.streams[0]->codecpar;
+    p = snap_stream(&sc, 0)->codecpar;
     p->codec_id = AV_CODEC_ID_AAC;
     memset(&p->ch_layout, 0, sizeof(p->ch_layout));
     p->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
     p->ch_layout.nb_channels = 6;
 
-    p = sc.streams[1]->codecpar;
+    p = snap_stream(&sc, 1)->codecpar;
     p->codec_id = AV_CODEC_ID_AAC;
     CHECK(snap_layout_custom(&p->ch_layout, custom_ids, 6) == 0);
 
@@ -553,7 +573,7 @@ static void test_custom_unlocatable_channels(void)
         snap_context_free(&sc);
         return;
     }
-    p = sc.streams[0]->codecpar;
+    p = snap_stream(&sc, 0)->codecpar;
     p->codec_id = AV_CODEC_ID_AAC;
     CHECK(snap_layout_custom(&p->ch_layout, ids, 3) == 0);
 
@@ -584,10 +604,19 @@ static void test_ambisonic(void)
         snap_context_free(&sc);
         return;
     }
-    p = sc.streams[0]->codecpar;
+    p = snap_stream(&sc, 0)->codecpar;
     p->codec_id = AV_CODEC_ID_PCM_F32LE;
     p->format   = AV_SAMPLE_FMT_FLT;
-    CHECK(av_channel_layout_ambisonic_init(&p->ch_layout, 1) == 0);
+    /* There is no av_channel_layout_ambisonic_init() in this tree; first
+     * order ambisonic is a designated initializer (4 ACN channels, no
+     * non-diegetic mask). */
+    {
+        const AVChannelLayout ambi = AV_CHANNEL_LAYOUT_AMBISONIC_FIRST_ORDER;
+
+        CHECK(av_channel_layout_copy(&p->ch_layout, &ambi) == 0);
+    }
+    CHECK(p->ch_layout.order == AV_CHANNEL_ORDER_AMBISONIC);
+    CHECK(p->ch_layout.nb_channels == 4);
 
     snap_reset();
     CHECK(call_stream(sc.ctx, 0) >= 0);
@@ -615,7 +644,7 @@ static void test_s32_with_24_raw_bits(void)
         snap_context_free(&sc);
         return;
     }
-    p = sc.streams[0]->codecpar;
+    p = snap_stream(&sc, 0)->codecpar;
     p->codec_id              = AV_CODEC_ID_TRUEHD;
     p->profile               = AV_PROFILE_UNKNOWN;
     p->format                = AV_SAMPLE_FMT_S32;
@@ -663,7 +692,7 @@ static void test_missing_fields_stay_unknown(void)
         snap_context_free(&sc);
         return;
     }
-    p = sc.streams[0]->codecpar;
+    p = snap_stream(&sc, 0)->codecpar;
     p->codec_id              = AV_CODEC_ID_TRUEHD;
     p->format                = AV_SAMPLE_FMT_NONE;   /* -1 */
     p->sample_rate           = 0;
@@ -788,7 +817,7 @@ static void test_frame_does_not_inherit_from_previous_stream_query(void)
         snap_context_free(&sc);
         return;
     }
-    p = sc.streams[0]->codecpar;
+    p = snap_stream(&sc, 0)->codecpar;
     p->codec_id            = AV_CODEC_ID_TRUEHD;
     p->profile             = AV_PROFILE_TRUEHD_ATMOS;
     p->format              = AV_SAMPLE_FMT_S32;
@@ -871,7 +900,7 @@ static void test_query_does_not_modify_source(void)
         snap_context_free(&sc);
         return;
     }
-    p = sc.streams[0]->codecpar;
+    p = snap_stream(&sc, 0)->codecpar;
     p->codec_id = AV_CODEC_ID_AAC;
     CHECK(snap_layout_custom(&p->ch_layout, ids, 4) == 0);
     map_before = p->ch_layout.u.map;
@@ -908,11 +937,11 @@ static void test_no_state_between_sources(void)
         return;
     }
 
-    p = a.streams[0]->codecpar;
+    p = snap_stream(&a, 0)->codecpar;
     p->codec_id = AV_CODEC_ID_AAC;
     CHECK(av_channel_layout_from_mask(&p->ch_layout, AV_CH_LAYOUT_7POINT1) == 0);
 
-    p = b.streams[0]->codecpar;
+    p = snap_stream(&b, 0)->codecpar;
     p->codec_id = AV_CODEC_ID_MP3;
     CHECK(av_channel_layout_from_mask(&p->ch_layout, AV_CH_LAYOUT_STEREO) == 0);
 
@@ -952,7 +981,7 @@ static void test_success_overwrites_every_slot(void)
         snap_context_free(&sc);
         return;
     }
-    p = sc.streams[0]->codecpar;
+    p = snap_stream(&sc, 0)->codecpar;
     p->codec_id = AV_CODEC_ID_AAC;
     CHECK(av_channel_layout_from_mask(&p->ch_layout, AV_CH_LAYOUT_STEREO) == 0);
 
@@ -1003,8 +1032,8 @@ static void test_short_info_is_einval(void)
         snap_context_free(&sc);
         return;
     }
-    sc.streams[0]->codecpar->codec_id = AV_CODEC_ID_AAC;
-    CHECK(av_channel_layout_from_mask(&sc.streams[0]->codecpar->ch_layout,
+    snap_stream(&sc, 0)->codecpar->codec_id = AV_CODEC_ID_AAC;
+    CHECK(av_channel_layout_from_mask(&snap_stream(&sc, 0)->codecpar->ch_layout,
                                       AV_CH_LAYOUT_STEREO) == 0);
 
     env  = snap_env();
@@ -1053,8 +1082,8 @@ static void test_short_ids_is_enospc(void)
         snap_context_free(&sc);
         return;
     }
-    sc.streams[0]->codecpar->codec_id = AV_CODEC_ID_AAC;
-    CHECK(av_channel_layout_from_mask(&sc.streams[0]->codecpar->ch_layout,
+    snap_stream(&sc, 0)->codecpar->codec_id = AV_CODEC_ID_AAC;
+    CHECK(av_channel_layout_from_mask(&snap_stream(&sc, 0)->codecpar->ch_layout,
                                       AV_CH_LAYOUT_5POINT1) == 0);
 
     env  = snap_env();
@@ -1108,7 +1137,7 @@ static void test_channel_count_ceiling(void)
         snap_context_free(&sc);
         return;
     }
-    ids = av_mallocz_array(65, sizeof(*ids));
+    ids = av_calloc(65, sizeof(*ids));
     CHECK(ids != NULL);
     if (!ids) {
         snap_context_free(&sc);
@@ -1117,7 +1146,7 @@ static void test_channel_count_ceiling(void)
     for (i = 0; i < 65; i++)
         ids[i] = AV_CHAN_UNKNOWN;
 
-    p = sc.streams[0]->codecpar;
+    p = snap_stream(&sc, 0)->codecpar;
     p->codec_id = AV_CODEC_ID_PCM_S16LE;
     p->format   = AV_SAMPLE_FMT_S16;
     CHECK(snap_layout_custom(&p->ch_layout, ids, 64) == 0);
@@ -1128,7 +1157,7 @@ static void test_channel_count_ceiling(void)
     CHECK(g_ids_written == 64);
 
     /* 65 is refused outright: not clamped to 64, not to stereo. */
-    p = sc.streams[1]->codecpar;
+    p = snap_stream(&sc, 1)->codecpar;
     p->codec_id = AV_CODEC_ID_PCM_S16LE;
     CHECK(snap_layout_custom(&p->ch_layout, ids, 65) == 0);
     snap_reset();
@@ -1227,8 +1256,8 @@ static void test_publish_exception_is_reported(void)
         snap_context_free(&sc);
         return;
     }
-    sc.streams[0]->codecpar->codec_id = AV_CODEC_ID_AAC;
-    CHECK(av_channel_layout_from_mask(&sc.streams[0]->codecpar->ch_layout,
+    snap_stream(&sc, 0)->codecpar->codec_id = AV_CODEC_ID_AAC;
+    CHECK(av_channel_layout_from_mask(&snap_stream(&sc, 0)->codecpar->ch_layout,
                                       AV_CH_LAYOUT_STEREO) == 0);
 
     env  = snap_env();
@@ -1298,7 +1327,7 @@ void audio_snapshot_run(void)
 {
     test_schema_constants();
     test_native_mono_stereo_5_1_7_1();
-    test_mask_bit_63_survives();
+    test_high_mask_bits_survive();
     test_unspec_vs_custom();
     test_custom_unlocatable_channels();
     test_ambisonic();
