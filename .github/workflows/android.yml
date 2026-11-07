@@ -1031,13 +1031,24 @@ jobs:
       - name: Record whether the SDK install succeeded
         run: |
           set -uo pipefail
+          # outcome is success/failure/cancelled/skipped. 'success' here means
+          # the action itself did not error -- it does not mean the packages
+          # landed where this shell can see them, which is why the next step
+          # searches the disk.
           echo "setup-android outcome: ${{ steps.sdk.outcome }}"
+          echo "setup-android conclusion: ${{ steps.sdk.conclusion }}"
 
       - name: Verify what the SDK install actually produced
         run: |
           set -uo pipefail
+          # `set -u` is on, so every unset variable must be given a default:
+          # an earlier version dereferenced $ANDROID_HOME bare and the step
+          # died with "ANDROID_HOME: unbound variable" before printing
+          # anything. Nothing below may assume a variable exists.
           echo "::group::after setup-android"
           echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
+          echo "PATH=$PATH"
           for t in adb sdkmanager avdmanager emulator; do
             if command -v "$t" >/dev/null 2>&1; then
               echo "FOUND: $t -> $(command -v "$t")"
@@ -1045,17 +1056,42 @@ jobs:
               echo "MISSING: $t"
             fi
           done
-          echo "--- adb binary architecture ---"
-          if command -v adb >/dev/null 2>&1; then
-            file "$(command -v adb)"
-          fi
-          echo "--- emulator binary architecture ---"
-          EMU="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/emulator/emulator"
-          if [ -f "$EMU" ]; then
-            file "$EMU"
-          else
-            echo "MISSING: $EMU"
-          fi
+          echo "::endgroup::"
+
+          # A MISSING in PATH does not prove the package was not installed:
+          # setup-android may have written the SDK somewhere it did not add to
+          # PATH. Look for the files too, then report what is on disk.
+          echo "::group::look for an SDK on disk"
+          for root in "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" \
+                      "$HOME/.android/sdk" "$HOME/Android/Sdk" \
+                      /usr/local/lib/android/sdk /opt/android-sdk; do
+            [ -n "$root" ] || continue
+            if [ -d "$root" ]; then
+              echo "EXISTS: $root"
+              ls -1 "$root" 2>/dev/null | sed -n '1,20p'
+            else
+              echo "absent: $root"
+            fi
+          done
+          echo "::endgroup::"
+
+          echo "::group::find adb/emulator anywhere"
+          for name in adb emulator sdkmanager; do
+            hits=$(find / -maxdepth 6 -type f -name "$name" 2>/dev/null | sed -n '1,5p')
+            if [ -n "$hits" ]; then
+              echo "$name:"
+              printf '%s\n' "$hits"
+            else
+              echo "$name: not found on disk"
+            fi
+          done
+          echo "::endgroup::"
+
+          echo "::group::binary architecture (if any)"
+          for f in $(find / -maxdepth 6 -type f \( -name adb -o -name emulator \) 2>/dev/null | sed -n '1,5p'); do
+            echo "--- $f"
+            file "$f" || true
+          done
           echo "::endgroup::"
 
       - name: Can the emulator package be installed at all
@@ -1231,7 +1267,20 @@ jobs:
           echo "arch=$(uname -m)"
           command -v adb
           adb version
-          EMU="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/emulator/emulator"
+          # Both variables are optional, so both need a default: under `set -u`
+          # a bare $ANDROID_HOME aborts the step before it can report why.
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK" ]; then
+            echo "::error::neither ANDROID_SDK_ROOT nor ANDROID_HOME is set: setup-android did not export an SDK path"
+            exit 1
+          fi
+          if command -v adb >/dev/null 2>&1; then
+            :
+          else
+            echo "::error::adb is not on PATH (SDK=$SDK)"
+            exit 1
+          fi
+          EMU="$SDK/emulator/emulator"
           test -x "$EMU" || { echo "::error::emulator binary missing at $EMU"; exit 1; }
           "$EMU" -version || true
           if [ ! -e /dev/kvm ]; then
