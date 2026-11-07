@@ -1858,6 +1858,11 @@ blocks, where N is the number of concurrent processes using the same cache
 file. Note also that the underlying file system may reserve more space than
 written, if the underlying allocation granularity is larger than the block
 size.
+
+@item offset
+Initial byte offset to start reading from. This option is not passed on to the
+underlying protocol; it instead gets a regular seek on the first cache miss.
+Defaults to 0.
 @end table
 
 URL Syntax is
@@ -2314,6 +2319,12 @@ as trusted. If the linked TLS library contains a default this might not
 need to be specified for verification to work, but not all libraries and
 setups have defaults built in.
 The file must be in OpenSSL PEM format.
+When no file is given, Windows builds using OpenSSL 3.2 or later with
+Windows certificate store support also use certificates from the system
+ROOT store. OpenSSL applies its usual certificate checks. Additional
+trust restrictions stored as Windows certificate properties, rather than
+encoded in the certificates themselves, are not enforced by its Windows
+certificate store loader.
 
 @item tls_verify, verify=@var{1|0}
 If enabled, try to verify the peer that we are communicating with.
@@ -2387,6 +2398,12 @@ as trusted. If the linked TLS library contains a default this might not
 need to be specified for verification to work, but not all libraries and
 setups have defaults built in.
 The file must be in OpenSSL PEM format.
+When no file is given, Windows builds using OpenSSL 3.2 or later with
+Windows certificate store support also use certificates from the system
+ROOT store. OpenSSL applies its usual certificate checks. Additional
+trust restrictions stored as Windows certificate properties, rather than
+encoded in the certificates themselves, are not enforced by its Windows
+certificate store loader.
 
 @item tls_verify, verify=@var{1|0}
 If enabled, try to verify the peer that we are communicating with.

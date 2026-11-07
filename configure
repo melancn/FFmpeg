@@ -2659,6 +2659,7 @@ HAVE_LIST="
     ioctl_posix
     iokit
     libdrm_getfb2
+    libplacebo_scene
     libvmaf_picture_convert
     libvmaf_picture_wrap
     makeinfo_html
@@ -3070,8 +3071,8 @@ aac_encoder_select="audio_frame_queue lpc sinewin"
 aac_latm_decoder_select="aac_decoder aac_latm_parser"
 ac3_decoder_select="ac3_parser ac3dsp bswapdsp"
 ac3_fixed_decoder_select="ac3_parser ac3dsp bswapdsp"
-ac3_encoder_select="ac3dsp audiodsp me_cmp"
-ac3_fixed_encoder_select="ac3dsp audiodsp me_cmp"
+ac3_encoder_select="ac3dsp audio_frame_queue audiodsp me_cmp"
+ac3_fixed_encoder_select="ac3dsp audio_frame_queue audiodsp me_cmp"
 acelp_kelvin_decoder_select="audiodsp celp_math"
 adpcm_circus_decoder_deps="lgpl_gpl"
 adpcm_g722_decoder_select="g722dsp"
@@ -3354,7 +3355,7 @@ vulkan_deps="threads"
 vulkan_deps_any="libdl LoadLibrary"
 spirv_headers_spirv_h_deps="vulkan"
 spirv_unified1_spirv_h_deps="vulkan"
-swscale_vulkan_deps="vulkan"
+swscale_vulkan_deps="vulkan unstable"
 swscale_vulkan_if_any="spirv_headers_spirv_h spirv_unified1_spirv_h"
 
 apv_vulkan_hwaccel_deps="vulkan spirv_compiler"
@@ -4192,6 +4193,7 @@ ladspa_filter_deps="ladspa libdl"
 lcevc_filter_deps="liblcevc_dec"
 lensfun_filter_deps="liblensfun version3"
 libplacebo_filter_deps="libplacebo vulkan"
+libplacebo_scene_filter_deps="libplacebo libplacebo_scene vulkan"
 lv2_filter_deps="lv2"
 mcdeint_filter_deps="avcodec gpl"
 metadata_filter_deps="avformat"
@@ -4303,7 +4305,7 @@ xstack_qsv_filter_deps="libmfx"
 xstack_qsv_filter_select="qsvvpp"
 pad_vaapi_filter_deps="vaapi_1"
 drawbox_vaapi_filter_deps="vaapi_1"
-whisper_filter_deps="whisper"
+whisper_filter_deps="avformat whisper"
 
 # examples
 avio_http_serve_files_deps="avformat avutil fork"
@@ -6677,29 +6679,31 @@ elif enabled ppc; then
     check_inline_asm xform_asm '"lwzx %1, %y0" :: "Z"(*(int*)0), "r"(0)'
 
     if enabled altivec; then
-        check_allcflags -maltivec -mabi=altivec
+        test_cflags -maltivec -mabi=altivec && append ALTIVECFLAGS -maltivec -mabi=altivec
 
         # check if our compiler supports Motorola AltiVec C API
         check_cc altivec altivec.h "vector signed int v1 = (vector signed int) { 0 };
                                     vector signed int v2 = (vector signed int) { 1 };
-                                    v1 = vec_add(v1, v2);"
+                                    v1 = vec_add(v1, v2);" $ALTIVECFLAGS
 
         enabled altivec || warn "Altivec disabled, possibly missing --cpu flag"
     fi
 
     if enabled vsx; then
-        check_allcflags -mvsx
+        append VSXFLAGS $ALTIVECFLAGS
+        test_cflags $VSXFLAGS -mvsx && append VSXFLAGS -mvsx
         check_cc vsx altivec.h "int v[4] = { 0 };
-                                vector signed int v1 = vec_vsx_ld(0, v);"
+                                vector signed int v1 = vec_vsx_ld(0, v);" $VSXFLAGS
+        enabled vsx && ALTIVECFLAGS=$VSXFLAGS
     fi
 
     if enabled power8; then
-        check_cpp_condition power8 "altivec.h" "defined(_ARCH_PWR8)"
+        check_cpp_condition power8 "altivec.h" "defined(_ARCH_PWR8)" $ALTIVECFLAGS
     fi
 
     if enabled altivec; then
         check_cc vec_xl altivec.h "const unsigned char *y1i = { 0 };
-                                   vector unsigned char y0 = vec_xl(0, y1i);"
+                                   vector unsigned char y0 = vec_xl(0, y1i);" $ALTIVECFLAGS
     fi
 
 elif enabled riscv; then
@@ -7340,6 +7344,7 @@ enabled libopus           && {
     }
 }
 enabled libplacebo        && require_pkg_config libplacebo "libplacebo >= 7.351.0" libplacebo/vulkan.h pl_vulkan_create
+enabled libplacebo        && check_pkg_config libplacebo_scene "libplacebo >= 7.386.0" libplacebo/compositor.h pl_queue_set_status
 enabled libpulse          && require_pkg_config libpulse libpulse pulse/pulseaudio.h pa_context_new
 enabled libqrencode       && require_pkg_config libqrencode libqrencode qrencode.h QRcode_encodeString
 enabled libquirc          && require libquirc quirc.h quirc_decode -lquirc
@@ -8006,21 +8011,30 @@ if enabled icc; then
             disable aligned_stack
     fi
 elif enabled gcc; then
-    gcc_version=$($cc -dumpversion)
+    gcc_version=$($cc -dumpfullversion -dumpversion)
     major_version=${gcc_version%%[!0-9]*}
+    minor_version=${gcc_version#$major_version}
+    minor_version=${minor_version#.}
+    minor_version=${minor_version%%[!0-9]*}
     if [ $major_version -lt 13 ]; then
         # Disable tree-vectorize for GCC <13 - it has historically been buggy.
         check_optflags -fno-tree-vectorize
     else
         case $arch in
-        x86|arm|aarch64)
-            # Allow the default of having tree-vectorize enabled on well tested
-            # architectures.
+        x86|arm|aarch64|ppc|riscv|mips)
+            # Allow the default of having tree-vectorize enabled on
+            # architectures covered by CI and FATE.
+            ;;
+        loongarch)
+            # GCC 14.0-14.3 and 15.0-15.1 miscompile vector permutations,
+            # see https://gcc.gnu.org/PR121064. Fixed in 14.4, 15.2 and newer.
+            case $major_version.${minor_version:-0} in
+            14.[0-3]|15.[01]) check_optflags -fno-tree-vectorize ;;
+            esac
             ;;
         *)
             # Disable tree-vectorize on potentially less tested
-            # architectures. Known issues:
-            # - https://gcc.gnu.org/PR121064 on Loongarch
+            # architectures.
             check_optflags -fno-tree-vectorize
             ;;
         esac
@@ -8223,6 +8237,7 @@ done
 enabled zlib && add_cppflags -DZLIB_CONST
 
 # conditional library dependencies, in any order
+enabled ametadata_filter    && prepend avfilter_deps "avformat"
 enabled amovie_filter       && prepend avfilter_deps "avformat avcodec"
 enabled aresample_filter    && prepend avfilter_deps "swresample"
 enabled cover_rect_filter   && prepend avfilter_deps "avformat avcodec"
@@ -8231,6 +8246,7 @@ enabled elbg_filter         && prepend avfilter_deps "avcodec"
 enabled find_rect_filter    && prepend avfilter_deps "avformat avcodec"
 enabled fsync_filter        && prepend avfilter_deps "avformat"
 enabled mcdeint_filter      && prepend avfilter_deps "avcodec"
+enabled metadata_filter     && prepend avfilter_deps "avformat"
 enabled movie_filter        && prepend avfilter_deps "avformat avcodec"
 enabled pan_filter          && prepend avfilter_deps "swresample"
 enabled qrencode_filter     && prepend avfilter_deps "swscale"
@@ -8238,6 +8254,7 @@ enabled qrencodesrc_filter  && prepend avfilter_deps "swscale"
 enabled removelogo_filter   && prepend avfilter_deps "avformat avcodec swscale"
 enabled sab_filter          && prepend avfilter_deps "swscale"
 enabled scale_filter        && prepend avfilter_deps "swscale"
+enabled scale_vulkan_filter && prepend avfilter_deps "swscale"
 enabled scale2ref_filter    && prepend avfilter_deps "swscale"
 enabled showcqt_filter      && prepend avfilter_deps "avformat swscale"
 enabled signature_filter    && prepend avfilter_deps "avcodec"
@@ -8246,6 +8263,7 @@ enabled spp_filter          && prepend avfilter_deps "avcodec"
 enabled sr_filter           && prepend avfilter_deps "avformat swscale"
 enabled subtitles_filter    && prepend avfilter_deps "avformat avcodec"
 enabled uspp_filter         && prepend avfilter_deps "avcodec"
+enabled whisper_filter      && prepend avfilter_deps "avformat"
 enabled zoompan_filter      && prepend avfilter_deps "swscale"
 
 enabled lavfi_indev         && prepend avdevice_deps "avfilter"
@@ -8543,6 +8561,8 @@ MSAFLAGS=$MSAFLAGS
 MMIFLAGS=$MMIFLAGS
 LSXFLAGS=$LSXFLAGS
 LASXFLAGS=$LASXFLAGS
+ALTIVECFLAGS=$ALTIVECFLAGS
+VSXFLAGS=$VSXFLAGS
 BUILDSUF=$build_suffix
 PROGSSUF=$progs_suffix
 FULLNAME=$FULLNAME

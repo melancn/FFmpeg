@@ -653,7 +653,7 @@ av_cold void ff_sws_init_range_convert(SwsInternal *c)
 {
     c->lumConvertRange = NULL;
     c->chrConvertRange = NULL;
-    if (c->opts.src_range != c->opts.dst_range && !isAnyRGB(c->opts.dst_format) && c->dstBpc < 32) {
+    if (c->opts.src_range != c->opts.dst_range && !isAnyRGB(c->opts.dst_format)) {
         init_range_convert_constants(c);
         if (c->dstBpc <= 14) {
             if (c->opts.src_range) {
@@ -1580,7 +1580,7 @@ int sws_frame_setup(SwsContext *ctx, const AVFrame *dst, const AVFrame *src)
         if (dev_ctx->type != AV_HWDEVICE_TYPE_VULKAN)
             return AVERROR(ENOTSUP);
 
-#if CONFIG_UNSTABLE && CONFIG_SWSCALE_VULKAN
+#if CONFIG_SWSCALE_VULKAN
         ret = ff_sws_vk_init(ctx, src_hwfc->device_ref);
         if (ret < 0)
             return ret;
