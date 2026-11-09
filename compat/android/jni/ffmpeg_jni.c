@@ -202,7 +202,13 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  * The stub is not a VM: it does not model direct array elements or a VM that
  * throws from SetByteArrayRegion. The bit is about the bridge's own ordering,
  * which is testable this way; ART behaviour behind the same calls is covered
- * by the device stage, not by this bit. */
+ * by the device stage, not by this bit.
+ *
+ * It also covers ownership: a SwrContext committed by a format change belongs
+ * to the session from then on, and the conversion helper must not free it.
+ * That is asserted the same way (the same context survives a second convert
+ * and a reset), so a regression cannot silently reintroduce the use-after-free
+ * behind this bit. */
 #define FF_JNI_CAP_PCM_SESSION_SAFE_V2   (1LL << 5)
 /* 1.2: Free() retains the whole renderer while an operation is admitted,
  * handles are registry-checked with a generation, and Finish() releases the
@@ -2641,7 +2647,7 @@ static int ff_pcm_convert_jni(JNIEnv *env, FFPcmSession *s, AVFrame *f,
                               jbyteArray out, jint outCount, jint *status_slot)
 {
     AVChannelLayout pending = { 0 };
-    AVChannelLayout candidate = { 0 }, pending_keep = { 0 };
+    AVChannelLayout candidate = { 0 };
     struct SwrContext *built = NULL;
     struct SwrContext *active = NULL;      /* context this call converts with */
     int rebuilt = 0;
@@ -2736,9 +2742,8 @@ static int ff_pcm_convert_jni(JNIEnv *env, FFPcmSession *s, AVFrame *f,
          * correct its arguments and present the same frame again. The
          * candidate runs this one call as a second resampler, and only a
          * successful conversion makes it the session's. */
-        active       = built;
-        pending_keep = candidate;
-        rebuilt      = 1;
+        active  = built;
+        rebuilt = 1;
     }
 
     /* No current context means a fresh or reset session; the candidate (if
@@ -2775,9 +2780,15 @@ static int ff_pcm_convert_jni(JNIEnv *env, FFPcmSession *s, AVFrame *f,
     }
     if (ret >= 0 && rebuilt) {
         /* The frame was converted by the candidate, so that is the
-         * configuration the stream continues on. */
-        ff_pcm_commit(s, active, &pending_keep, f->format, f->sample_rate);
+         * configuration the stream continues on. ff_pcm_commit() takes
+         * ownership of the context and zeroes `candidate`, so neither may be
+         * released again below: clearing only `active` here used to leave
+         * `built` pointing at the committed context, and the cleanup below
+         * freed the session's live SwrContext (use-after-free on the next
+         * convert, double free in pcmSessionFree()). */
+        ff_pcm_commit(s, active, &candidate, f->format, f->sample_rate);
         active  = NULL;
+        built   = NULL;
         rebuilt = 0;
     }
     if (ret >= 0 && produced > 0) {
@@ -2809,10 +2820,11 @@ static int ff_pcm_convert_jni(JNIEnv *env, FFPcmSession *s, AVFrame *f,
 done:
     pthread_mutex_unlock(&s->lock);
     av_channel_layout_uninit(&pending);
+    /* ff_pcm_commit() zeroes `candidate` on success, so this only releases a
+     * candidate that was never committed. */
     av_channel_layout_uninit(&candidate);
-    av_channel_layout_uninit(&pending_keep);
-    /* An uncommitted candidate is dropped here; on success it was moved into
-     * the session and this is NULL. */
+    /* An uncommitted candidate is dropped here; on success ff_pcm_commit()
+     * took it and `built` was cleared, so an owned context is never freed. */
     if (built)
         swr_free(&built);
     return ret;

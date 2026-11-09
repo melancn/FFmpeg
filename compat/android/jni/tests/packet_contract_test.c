@@ -1918,6 +1918,63 @@ static void test_pcm_session_custom_layout(void)
     av_channel_layout_uninit(&custom);
 }
 
+/* Ownership rule for a committed format: the candidate SwrContext becomes the
+ * session's, and the conversion helper must not also release it. Before this
+ * was pinned, ff_pcm_convert_jni() cleared `active` but not `built`, so its
+ * cleanup freed the context the session had just adopted: the next convert ran
+ * on freed memory (swr_is_initialized() reads a zeroed in_buffer.ch_count and
+ * reports EINVAL, logged as "Context has not been initialized") and
+ * pcmSessionFree() freed the same pointer a second time.
+ *
+ * A live, unchanged context across calls is the observable contract, and the
+ * session must still be convertible after a commit and after a reset. */
+static void test_pcm_session_committed_context_survives(void)
+{
+    FFPcmSession *s = make_session(PCM_OUT_ROOM, 65536, PCM_OUT_ROOM);
+    AVChannelLayout stereo = { 0 };
+    AVFrame *f = NULL;
+    struct SwrContext *owned = NULL;
+    int produced, ret;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    av_channel_layout_default(&stereo, 2);
+    f = make_pcm_frame(AV_SAMPLE_FMT_S16P, 44100, &stereo, 512);
+    CHECK(f != NULL);
+
+    if (f) {
+        /* The first convert on a fresh session always commits. */
+        ret = pcm_convert(s, f, NULL, PCM_OUT_ROOM, 0, &produced);
+        CHECK(ret >= 0);
+        CHECK(s->swr != NULL);
+        CHECK(s->phase == FF_PCM_PHASE_ACTIVE);
+        owned = s->swr;
+
+        /* A second frame of the same format reuses that context. A freed one
+         * would answer -EINVAL here. */
+        ret = pcm_convert(s, f, NULL, PCM_OUT_ROOM, 0, &produced);
+        CHECK(ret >= 0);
+        CHECK(s->swr == owned);
+        CHECK(s->phase == FF_PCM_PHASE_ACTIVE);
+
+        /* Reset rebuilds and releases the old context exactly once. */
+        CHECK_OK(Java_org_ffmpeg_FFMpegNative_pcmSessionReset(
+                     NULL, NULL, (jlong)(intptr_t)s));
+        CHECK(s->swr != NULL);
+        ret = pcm_convert(s, f, NULL, PCM_OUT_ROOM, 0, &produced);
+        CHECK(ret >= 0);
+        CHECK(s->phase == FF_PCM_PHASE_ACTIVE);
+    }
+
+    av_frame_free(&f);
+    av_channel_layout_uninit(&stereo);
+    /* No abort here is part of the contract: the committed context is owned
+     * by the session and is released once, by pcmSessionFree(). */
+    Java_org_ffmpeg_FFMpegNative_pcmSessionFree(NULL, NULL, (jlong)(intptr_t)s);
+}
+
 /* The seam itself: the samples either side of a format change must be
  * continuous. A distinguishable constant per stream lets the test prove the
  * old content came out before the new content started, in order. */
@@ -3314,6 +3371,7 @@ int main(void)
     test_pcm_session_same_count_different_layout();
     test_pcm_session_packed_planar_switch();
     test_pcm_session_custom_layout();
+    test_pcm_session_committed_context_survives();
     test_pcm_session_seam_is_continuous();
     test_pcm_session_planar_extended_data();
     test_pcm_session_zero_sample_frame_is_not_eof();
