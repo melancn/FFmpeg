@@ -2991,25 +2991,159 @@ public final class FFMpegNative {
     public static final int AV_SAMPLE_FMT_FLTP    = 8;
     public static final int AV_SAMPLE_FMT_DBLP    = 9;
 
-    /** Channel-layout constants mirroring {@code AV_CH_LAYOUT_*}. */
-    public static final long AV_CH_LAYOUT_MONO          = 4L;      /* FRONT_CENTER */
-    public static final long AV_CH_LAYOUT_STEREO        = 3L;      /* FL|FR */
-    public static final long AV_CH_LAYOUT_2POINT1        = 11L;     /* STEREO|LFE */
-    public static final long AV_CH_LAYOUT_SURROUND        = 7L;      /* STEREO|FC */
-    public static final long AV_CH_LAYOUT_3POINT1        = 15L;     /* SURROUND|LFE */
-    public static final long AV_CH_LAYOUT_2_1             = 259L;    /* STEREO|BACK_CENTER */
-    public static final long AV_CH_LAYOUT_4POINT0         = 263L;    /* SURROUND|BACK_CENTER */
-    public static final long AV_CH_LAYOUT_4POINT1         = 271L;    /* 4POINT0|LFE */
-    public static final long AV_CH_LAYOUT_2_2             = 1539L;   /* STEREO|SL|SR */
-    public static final long AV_CH_LAYOUT_QUAD            = 51L;     /* STEREO|BL|BR */
-    public static final long AV_CH_LAYOUT_5POINT0         = 1543L;   /* SURROUND|SL|SR */
-    public static final long AV_CH_LAYOUT_5POINT1         = 1551L;   /* 5POINT0|LFE */
-    public static final long AV_CH_LAYOUT_5POINT0_BACK    = 55L;     /* SURROUND|BL|BR */
-    public static final long AV_CH_LAYOUT_5POINT1_BACK    = 63L;     /* 5POINT0_BACK|LFE */
-    public static final long AV_CH_LAYOUT_6POINT0         = 1799L;   /* 5POINT0|BACK_CENTER */
-    public static final long AV_CH_LAYOUT_6POINT1         = 1807L;   /* 5POINT1|BACK_CENTER */
-    public static final long AV_CH_LAYOUT_7POINT0         = 1591L;   /* 5POINT0|BL|BR */
-    public static final long AV_CH_LAYOUT_7POINT1         = 1599L;   /* 5POINT1|BL|BR */
+    /**
+     * Channel constants mirrored from {@code libavutil/channel_layout.h}.
+     * Values match the native enums/macros exactly. The {@code AV_CH_LAYOUT_*}
+     * and {@code AV_CH_*} masks are 64-bit bitfields and are declared as
+     * {@code long}; the channel indices and orders are {@code int}.
+     */
+
+    /** Channel indices, {@code enum AVChannel}. */
+    public static final int AV_CHAN_NONE                   = -1;
+    public static final int AV_CHAN_FRONT_LEFT             = 0;
+    public static final int AV_CHAN_FRONT_RIGHT            = 1;
+    public static final int AV_CHAN_FRONT_CENTER           = 2;
+    public static final int AV_CHAN_LOW_FREQUENCY          = 3;
+    public static final int AV_CHAN_BACK_LEFT              = 4;
+    public static final int AV_CHAN_BACK_RIGHT             = 5;
+    public static final int AV_CHAN_FRONT_LEFT_OF_CENTER   = 6;
+    public static final int AV_CHAN_FRONT_RIGHT_OF_CENTER  = 7;
+    public static final int AV_CHAN_BACK_CENTER            = 8;
+    public static final int AV_CHAN_SIDE_LEFT              = 9;
+    public static final int AV_CHAN_SIDE_RIGHT             = 10;
+    public static final int AV_CHAN_TOP_CENTER             = 11;
+    public static final int AV_CHAN_TOP_FRONT_LEFT         = 12;
+    public static final int AV_CHAN_TOP_FRONT_CENTER       = 13;
+    public static final int AV_CHAN_TOP_FRONT_RIGHT        = 14;
+    public static final int AV_CHAN_TOP_BACK_LEFT          = 15;
+    public static final int AV_CHAN_TOP_BACK_CENTER        = 16;
+    public static final int AV_CHAN_TOP_BACK_RIGHT         = 17;
+    public static final int AV_CHAN_STEREO_LEFT            = 29;
+    public static final int AV_CHAN_STEREO_RIGHT           = 30;
+    public static final int AV_CHAN_WIDE_LEFT              = 31;
+    public static final int AV_CHAN_WIDE_RIGHT             = 32;
+    public static final int AV_CHAN_SURROUND_DIRECT_LEFT   = 33;
+    public static final int AV_CHAN_SURROUND_DIRECT_RIGHT  = 34;
+    public static final int AV_CHAN_LOW_FREQUENCY_2        = 35;
+    public static final int AV_CHAN_TOP_SIDE_LEFT          = 36;
+    public static final int AV_CHAN_TOP_SIDE_RIGHT         = 37;
+    public static final int AV_CHAN_BOTTOM_FRONT_CENTER    = 38;
+    public static final int AV_CHAN_BOTTOM_FRONT_LEFT      = 39;
+    public static final int AV_CHAN_BOTTOM_FRONT_RIGHT     = 40;
+    public static final int AV_CHAN_SIDE_SURROUND_LEFT     = 41;
+    public static final int AV_CHAN_SIDE_SURROUND_RIGHT    = 42;
+    public static final int AV_CHAN_TOP_SURROUND_LEFT      = 43;
+    public static final int AV_CHAN_TOP_SURROUND_RIGHT     = 44;
+    public static final int AV_CHAN_BINAURAL_LEFT          = 61;
+    public static final int AV_CHAN_BINAURAL_RIGHT         = 62;
+    public static final int AV_CHAN_UNUSED                 = 512;   // 0x200
+    public static final int AV_CHAN_UNKNOWN                = 768;   // 0x300
+    public static final int AV_CHAN_AMBISONIC_BASE         = 1024;  // 0x400
+    public static final int AV_CHAN_AMBISONIC_END          = 2047;  // 0x7ff
+
+    /** Per-channel bit masks, {@code AV_CH_*} = {@code 1ULL << AV_CHAN_*}. 64-bit. */
+    public static final long AV_CH_FRONT_LEFT             = 1L;
+    public static final long AV_CH_FRONT_RIGHT            = 2L;
+    public static final long AV_CH_FRONT_CENTER           = 4L;
+    public static final long AV_CH_LOW_FREQUENCY          = 8L;
+    public static final long AV_CH_BACK_LEFT              = 16L;
+    public static final long AV_CH_BACK_RIGHT             = 32L;
+    public static final long AV_CH_FRONT_LEFT_OF_CENTER   = 64L;
+    public static final long AV_CH_FRONT_RIGHT_OF_CENTER  = 128L;
+    public static final long AV_CH_BACK_CENTER            = 256L;
+    public static final long AV_CH_SIDE_LEFT              = 512L;
+    public static final long AV_CH_SIDE_RIGHT             = 1024L;
+    public static final long AV_CH_TOP_CENTER             = 2048L;
+    public static final long AV_CH_TOP_FRONT_LEFT         = 4096L;
+    public static final long AV_CH_TOP_FRONT_CENTER       = 8192L;
+    public static final long AV_CH_TOP_FRONT_RIGHT        = 16384L;
+    public static final long AV_CH_TOP_BACK_LEFT          = 32768L;
+    public static final long AV_CH_TOP_BACK_CENTER        = 65536L;
+    public static final long AV_CH_TOP_BACK_RIGHT         = 131072L;
+    public static final long AV_CH_STEREO_LEFT            = 536870912L;
+    public static final long AV_CH_STEREO_RIGHT           = 1073741824L;
+    public static final long AV_CH_WIDE_LEFT              = 2147483648L;
+    public static final long AV_CH_WIDE_RIGHT             = 4294967296L;
+    public static final long AV_CH_SURROUND_DIRECT_LEFT   = 8589934592L;
+    public static final long AV_CH_SURROUND_DIRECT_RIGHT  = 17179869184L;
+    public static final long AV_CH_LOW_FREQUENCY_2        = 34359738368L;
+    public static final long AV_CH_TOP_SIDE_LEFT          = 68719476736L;
+    public static final long AV_CH_TOP_SIDE_RIGHT         = 137438953472L;
+    public static final long AV_CH_BOTTOM_FRONT_CENTER    = 274877906944L;
+    public static final long AV_CH_BOTTOM_FRONT_LEFT      = 549755813888L;
+    public static final long AV_CH_BOTTOM_FRONT_RIGHT     = 1099511627776L;
+    public static final long AV_CH_SIDE_SURROUND_LEFT     = 2199023255552L;
+    public static final long AV_CH_SIDE_SURROUND_RIGHT    = 4398046511104L;
+    public static final long AV_CH_TOP_SURROUND_LEFT      = 8796093022208L;
+    public static final long AV_CH_TOP_SURROUND_RIGHT     = 17592186044416L;
+    public static final long AV_CH_BINAURAL_LEFT          = 2305843009213693952L;
+    public static final long AV_CH_BINAURAL_RIGHT         = 4611686018427387904L;
+
+    /** Channel-layout bit masks, {@code AV_CH_LAYOUT_*} from {@code libavutil/channel_layout.h}. 64-bit. */
+    public static final long AV_CH_LAYOUT_MONO              = 4L;
+    public static final long AV_CH_LAYOUT_STEREO            = 3L;
+    public static final long AV_CH_LAYOUT_2POINT1           = 11L;
+    public static final long AV_CH_LAYOUT_2_1               = 259L;
+    public static final long AV_CH_LAYOUT_SURROUND          = 7L;
+    public static final long AV_CH_LAYOUT_3POINT1           = 15L;
+    public static final long AV_CH_LAYOUT_4POINT0           = 263L;
+    public static final long AV_CH_LAYOUT_4POINT1           = 271L;
+    public static final long AV_CH_LAYOUT_2_2               = 1539L;
+    public static final long AV_CH_LAYOUT_QUAD              = 51L;
+    public static final long AV_CH_LAYOUT_5POINT0           = 1543L;
+    public static final long AV_CH_LAYOUT_5POINT1           = 1551L;
+    public static final long AV_CH_LAYOUT_5POINT0_BACK      = 55L;
+    public static final long AV_CH_LAYOUT_5POINT1_BACK      = 63L;
+    public static final long AV_CH_LAYOUT_6POINT0           = 1799L;
+    public static final long AV_CH_LAYOUT_6POINT0_FRONT     = 1731L;
+    public static final long AV_CH_LAYOUT_HEXAGONAL         = 311L;
+    public static final long AV_CH_LAYOUT_3POINT1POINT2     = 20495L;
+    public static final long AV_CH_LAYOUT_6POINT1           = 1807L;
+    public static final long AV_CH_LAYOUT_6POINT1_BACK      = 319L;
+    public static final long AV_CH_LAYOUT_6POINT1_FRONT     = 1739L;
+    public static final long AV_CH_LAYOUT_7POINT0           = 1591L;
+    public static final long AV_CH_LAYOUT_7POINT0_FRONT     = 1735L;
+    public static final long AV_CH_LAYOUT_7POINT1           = 1599L;
+    public static final long AV_CH_LAYOUT_7POINT1_WIDE      = 1743L;
+    public static final long AV_CH_LAYOUT_7POINT1_WIDE_BACK = 255L;
+    public static final long AV_CH_LAYOUT_5POINT1POINT2     = 22031L;
+    public static final long AV_CH_LAYOUT_5POINT1POINT2_BACK = 20543L;
+    public static final long AV_CH_LAYOUT_OCTAGONAL         = 1847L;
+    public static final long AV_CH_LAYOUT_CUBE              = 184371L;
+    public static final long AV_CH_LAYOUT_5POINT1POINT4     = 185871L;
+    public static final long AV_CH_LAYOUT_5POINT1POINT6     = 196111L;
+    public static final long AV_CH_LAYOUT_7POINT1POINT2     = 22079L;
+    public static final long AV_CH_LAYOUT_7POINT1POINT4     = 185919L;
+    public static final long AV_CH_LAYOUT_7POINT1POINT6     = 196159L;
+    public static final long AV_CH_LAYOUT_7POINT2POINT3     = 34359825983L;
+    public static final long AV_CH_LAYOUT_9POINT1POINT4     = 186111L;
+    public static final long AV_CH_LAYOUT_9POINT1POINT6     = 206344616319L;
+    public static final long AV_CH_LAYOUT_HEXADECAGONAL     = 6442710839L;
+    public static final long AV_CH_LAYOUT_BINAURAL          = 6917529027641081856L;
+    public static final long AV_CH_LAYOUT_STEREO_DOWNMIX    = 1610612736L;
+    public static final long AV_CH_LAYOUT_22POINT2          = 2164849779327L;
+    /** @deprecated aliases kept for ABI compatibility (FF_API_CHANNEL_LAYOUT_BACK). */
+    public static final long AV_CH_LAYOUT_5POINT1POINT4_BACK = 185871L;
+    public static final long AV_CH_LAYOUT_7POINT1POINT4_BACK = 185919L;
+    public static final long AV_CH_LAYOUT_9POINT1POINT4_BACK = 186111L;
+    public static final long AV_CH_LAYOUT_7POINT1_TOP_BACK   = 20543L;
+
+    /** Channel orders, {@code enum AVChannelOrder}. */
+    public static final int AV_CHANNEL_ORDER_UNSPEC     = 0;
+    public static final int AV_CHANNEL_ORDER_NATIVE     = 1;
+    public static final int AV_CHANNEL_ORDER_CUSTOM     = 2;
+    public static final int AV_CHANNEL_ORDER_AMBISONIC  = 3;
+    public static final int FF_CHANNEL_ORDER_NB         = 4;
+
+    /** Matrix encoding values, {@code enum AVMatrixEncoding}. */
+    public static final int AV_MATRIX_ENCODING_NONE           = 0;
+    public static final int AV_MATRIX_ENCODING_DOLBY          = 1;
+    public static final int AV_MATRIX_ENCODING_DPLII          = 2;
+    public static final int AV_MATRIX_ENCODING_DPLIIX         = 3;
+    public static final int AV_MATRIX_ENCODING_DPLIIZ         = 4;
+    public static final int AV_MATRIX_ENCODING_DOLBYEX        = 5;
+    public static final int AV_MATRIX_ENCODING_DOLBYHEADPHONE = 6;
+    public static final int AV_MATRIX_ENCODING_NB             = 7;
 
     /** SWS algorithm flags mirroring {@code libswscale}. */
     public static final int SWS_FAST_BILINEAR = 1;
@@ -3084,65 +3218,777 @@ public final class FFMpegNative {
     public static final int AV_ROUND_NEAR_INF    = 5;
     public static final int AV_ROUND_PASS_MINMAX = 8192;
 
-    /** Codec id constant, mirrors {@code AV_CODEC_ID_NONE}. */
+    /**
+     * Codec id constants, mirrors every entry of {@code enum AVCodecID}
+     * from {@code libavcodec/codec_id.h}. Values are kept in sync with
+     * the native enum; use these instead of hard-coding magic numbers.
+     */
     public static final int AV_CODEC_ID_NONE = 0;
-
-    /** Common video codec id constants mirroring {@code enum AVCodecID}. */
     public static final int AV_CODEC_ID_MPEG1VIDEO = 1;
     public static final int AV_CODEC_ID_MPEG2VIDEO = 2;
-    public static final int AV_CODEC_ID_MPEG4     = 12;
-    public static final int AV_CODEC_ID_H264       = 27;
-    public static final int AV_CODEC_ID_VP8        = 139;
-    public static final int AV_CODEC_ID_VP9        = 166;
-    public static final int AV_CODEC_ID_HEVC       = 172;
-    public static final int AV_CODEC_ID_AV1        = 222;
+    public static final int AV_CODEC_ID_H261 = 3;
+    public static final int AV_CODEC_ID_H263 = 4;
+    public static final int AV_CODEC_ID_RV10 = 5;
+    public static final int AV_CODEC_ID_RV20 = 6;
+    public static final int AV_CODEC_ID_MJPEG = 7;
+    public static final int AV_CODEC_ID_MJPEGB = 8;
+    public static final int AV_CODEC_ID_LJPEG = 9;
+    public static final int AV_CODEC_ID_SP5X = 10;
+    public static final int AV_CODEC_ID_JPEGLS = 11;
+    public static final int AV_CODEC_ID_MPEG4 = 12;
+    public static final int AV_CODEC_ID_RAWVIDEO = 13;
+    public static final int AV_CODEC_ID_MSMPEG4V1 = 14;
+    public static final int AV_CODEC_ID_MSMPEG4V2 = 15;
+    public static final int AV_CODEC_ID_MSMPEG4V3 = 16;
+    public static final int AV_CODEC_ID_WMV1 = 17;
+    public static final int AV_CODEC_ID_WMV2 = 18;
+    public static final int AV_CODEC_ID_H263P = 19;
+    public static final int AV_CODEC_ID_H263I = 20;
+    public static final int AV_CODEC_ID_FLV1 = 21;
+    public static final int AV_CODEC_ID_SVQ1 = 22;
+    public static final int AV_CODEC_ID_SVQ3 = 23;
+    public static final int AV_CODEC_ID_DVVIDEO = 24;
+    public static final int AV_CODEC_ID_HUFFYUV = 25;
+    public static final int AV_CODEC_ID_CYUV = 26;
+    public static final int AV_CODEC_ID_H264 = 27;
+    public static final int AV_CODEC_ID_INDEO3 = 28;
+    public static final int AV_CODEC_ID_VP3 = 29;
+    public static final int AV_CODEC_ID_THEORA = 30;
+    public static final int AV_CODEC_ID_ASV1 = 31;
+    public static final int AV_CODEC_ID_ASV2 = 32;
+    public static final int AV_CODEC_ID_FFV1 = 33;
+    public static final int AV_CODEC_ID_4XM = 34;
+    public static final int AV_CODEC_ID_VCR1 = 35;
+    public static final int AV_CODEC_ID_CLJR = 36;
+    public static final int AV_CODEC_ID_MDEC = 37;
+    public static final int AV_CODEC_ID_ROQ = 38;
+    public static final int AV_CODEC_ID_INTERPLAY_VIDEO = 39;
+    public static final int AV_CODEC_ID_XAN_WC3 = 40;
+    public static final int AV_CODEC_ID_XAN_WC4 = 41;
+    public static final int AV_CODEC_ID_RPZA = 42;
+    public static final int AV_CODEC_ID_CINEPAK = 43;
+    public static final int AV_CODEC_ID_WS_VQA = 44;
+    public static final int AV_CODEC_ID_MSRLE = 45;
+    public static final int AV_CODEC_ID_MSVIDEO1 = 46;
+    public static final int AV_CODEC_ID_IDCIN = 47;
+    public static final int AV_CODEC_ID_8BPS = 48;
+    public static final int AV_CODEC_ID_SMC = 49;
+    public static final int AV_CODEC_ID_FLIC = 50;
+    public static final int AV_CODEC_ID_TRUEMOTION1 = 51;
+    public static final int AV_CODEC_ID_VMDVIDEO = 52;
+    public static final int AV_CODEC_ID_MSZH = 53;
+    public static final int AV_CODEC_ID_ZLIB = 54;
+    public static final int AV_CODEC_ID_QTRLE = 55;
+    public static final int AV_CODEC_ID_TSCC = 56;
+    public static final int AV_CODEC_ID_ULTI = 57;
+    public static final int AV_CODEC_ID_QDRAW = 58;
+    public static final int AV_CODEC_ID_VIXL = 59;
+    public static final int AV_CODEC_ID_QPEG = 60;
+    public static final int AV_CODEC_ID_PNG = 61;
+    public static final int AV_CODEC_ID_PPM = 62;
+    public static final int AV_CODEC_ID_PBM = 63;
+    public static final int AV_CODEC_ID_PGM = 64;
+    public static final int AV_CODEC_ID_PGMYUV = 65;
+    public static final int AV_CODEC_ID_PAM = 66;
+    public static final int AV_CODEC_ID_FFVHUFF = 67;
+    public static final int AV_CODEC_ID_RV30 = 68;
+    public static final int AV_CODEC_ID_RV40 = 69;
+    public static final int AV_CODEC_ID_VC1 = 70;
+    public static final int AV_CODEC_ID_WMV3 = 71;
+    public static final int AV_CODEC_ID_LOCO = 72;
+    public static final int AV_CODEC_ID_WNV1 = 73;
+    public static final int AV_CODEC_ID_AASC = 74;
+    public static final int AV_CODEC_ID_INDEO2 = 75;
+    public static final int AV_CODEC_ID_FRAPS = 76;
+    public static final int AV_CODEC_ID_TRUEMOTION2 = 77;
+    public static final int AV_CODEC_ID_BMP = 78;
+    public static final int AV_CODEC_ID_CSCD = 79;
+    public static final int AV_CODEC_ID_MMVIDEO = 80;
+    public static final int AV_CODEC_ID_ZMBV = 81;
+    public static final int AV_CODEC_ID_AVS = 82;
+    public static final int AV_CODEC_ID_SMACKVIDEO = 83;
+    public static final int AV_CODEC_ID_NUV = 84;
+    public static final int AV_CODEC_ID_KMVC = 85;
+    public static final int AV_CODEC_ID_FLASHSV = 86;
+    public static final int AV_CODEC_ID_CAVS = 87;
+    public static final int AV_CODEC_ID_JPEG2000 = 88;
+    public static final int AV_CODEC_ID_VMNC = 89;
+    public static final int AV_CODEC_ID_VP5 = 90;
+    public static final int AV_CODEC_ID_VP6 = 91;
+    public static final int AV_CODEC_ID_VP6F = 92;
+    public static final int AV_CODEC_ID_TARGA = 93;
+    public static final int AV_CODEC_ID_DSICINVIDEO = 94;
+    public static final int AV_CODEC_ID_TIERTEXSEQVIDEO = 95;
+    public static final int AV_CODEC_ID_TIFF = 96;
+    public static final int AV_CODEC_ID_GIF = 97;
+    public static final int AV_CODEC_ID_DXA = 98;
+    public static final int AV_CODEC_ID_DNXHD = 99;
+    public static final int AV_CODEC_ID_THP = 100;
+    public static final int AV_CODEC_ID_SGI = 101;
+    public static final int AV_CODEC_ID_C93 = 102;
+    public static final int AV_CODEC_ID_BETHSOFTVID = 103;
+    public static final int AV_CODEC_ID_PTX = 104;
+    public static final int AV_CODEC_ID_TXD = 105;
+    public static final int AV_CODEC_ID_VP6A = 106;
+    public static final int AV_CODEC_ID_AMV = 107;
+    public static final int AV_CODEC_ID_VB = 108;
+    public static final int AV_CODEC_ID_PCX = 109;
+    public static final int AV_CODEC_ID_SUNRAST = 110;
+    public static final int AV_CODEC_ID_INDEO4 = 111;
+    public static final int AV_CODEC_ID_INDEO5 = 112;
+    public static final int AV_CODEC_ID_MIMIC = 113;
+    public static final int AV_CODEC_ID_RL2 = 114;
+    public static final int AV_CODEC_ID_ESCAPE124 = 115;
+    public static final int AV_CODEC_ID_DIRAC = 116;
+    public static final int AV_CODEC_ID_BFI = 117;
+    public static final int AV_CODEC_ID_CMV = 118;
+    public static final int AV_CODEC_ID_MOTIONPIXELS = 119;
+    public static final int AV_CODEC_ID_TGV = 120;
+    public static final int AV_CODEC_ID_TGQ = 121;
+    public static final int AV_CODEC_ID_TQI = 122;
+    public static final int AV_CODEC_ID_AURA = 123;
+    public static final int AV_CODEC_ID_AURA2 = 124;
+    public static final int AV_CODEC_ID_V210X = 125;
+    public static final int AV_CODEC_ID_TMV = 126;
+    public static final int AV_CODEC_ID_V210 = 127;
+    public static final int AV_CODEC_ID_DPX = 128;
+    public static final int AV_CODEC_ID_MAD = 129;
+    public static final int AV_CODEC_ID_FRWU = 130;
+    public static final int AV_CODEC_ID_FLASHSV2 = 131;
+    public static final int AV_CODEC_ID_CDGRAPHICS = 132;
+    public static final int AV_CODEC_ID_R210 = 133;
+    public static final int AV_CODEC_ID_ANM = 134;
+    public static final int AV_CODEC_ID_BINKVIDEO = 135;
+    public static final int AV_CODEC_ID_IFF_ILBM = 136;
+    public static final int AV_CODEC_ID_KGV1 = 137;
+    public static final int AV_CODEC_ID_YOP = 138;
+    public static final int AV_CODEC_ID_VP8 = 139;
+    public static final int AV_CODEC_ID_PICTOR = 140;
+    public static final int AV_CODEC_ID_ANSI = 141;
+    public static final int AV_CODEC_ID_A64_MULTI = 142;
+    public static final int AV_CODEC_ID_A64_MULTI5 = 143;
+    public static final int AV_CODEC_ID_R10K = 144;
+    public static final int AV_CODEC_ID_MXPEG = 145;
+    public static final int AV_CODEC_ID_LAGARITH = 146;
+    public static final int AV_CODEC_ID_PRORES = 147;
+    public static final int AV_CODEC_ID_JV = 148;
+    public static final int AV_CODEC_ID_DFA = 149;
+    public static final int AV_CODEC_ID_WMV3IMAGE = 150;
+    public static final int AV_CODEC_ID_VC1IMAGE = 151;
+    public static final int AV_CODEC_ID_UTVIDEO = 152;
+    public static final int AV_CODEC_ID_BMV_VIDEO = 153;
+    public static final int AV_CODEC_ID_VBLE = 154;
+    public static final int AV_CODEC_ID_DXTORY = 155;
+    public static final int AV_CODEC_ID_XWD = 156;
+    public static final int AV_CODEC_ID_CDXL = 157;
+    public static final int AV_CODEC_ID_XBM = 158;
+    public static final int AV_CODEC_ID_ZEROCODEC = 159;
+    public static final int AV_CODEC_ID_MSS1 = 160;
+    public static final int AV_CODEC_ID_MSA1 = 161;
+    public static final int AV_CODEC_ID_TSCC2 = 162;
+    public static final int AV_CODEC_ID_MTS2 = 163;
+    public static final int AV_CODEC_ID_CLLC = 164;
+    public static final int AV_CODEC_ID_MSS2 = 165;
+    public static final int AV_CODEC_ID_VP9 = 166;
+    public static final int AV_CODEC_ID_AIC = 167;
+    public static final int AV_CODEC_ID_ESCAPE130 = 168;
+    public static final int AV_CODEC_ID_G2M = 169;
+    public static final int AV_CODEC_ID_WEBP = 170;
+    public static final int AV_CODEC_ID_HNM4_VIDEO = 171;
+    public static final int AV_CODEC_ID_HEVC = 172;
+    public static final int AV_CODEC_ID_FIC = 173;
+    public static final int AV_CODEC_ID_ALIAS_PIX = 174;
+    public static final int AV_CODEC_ID_BRENDER_PIX = 175;
+    public static final int AV_CODEC_ID_PAF_VIDEO = 176;
+    public static final int AV_CODEC_ID_EXR = 177;
+    public static final int AV_CODEC_ID_VP7 = 178;
+    public static final int AV_CODEC_ID_SANM = 179;
+    public static final int AV_CODEC_ID_SGIRLE = 180;
+    public static final int AV_CODEC_ID_MVC1 = 181;
+    public static final int AV_CODEC_ID_MVC2 = 182;
+    public static final int AV_CODEC_ID_HQX = 183;
+    public static final int AV_CODEC_ID_TDSC = 184;
+    public static final int AV_CODEC_ID_HQ_HQA = 185;
+    public static final int AV_CODEC_ID_HAP = 186;
+    public static final int AV_CODEC_ID_DDS = 187;
+    public static final int AV_CODEC_ID_DXV = 188;
+    public static final int AV_CODEC_ID_SCREENPRESSO = 189;
+    public static final int AV_CODEC_ID_RSCC = 190;
+    public static final int AV_CODEC_ID_AVS2 = 191;
+    public static final int AV_CODEC_ID_PGX = 192;
+    public static final int AV_CODEC_ID_AVS3 = 193;
+    public static final int AV_CODEC_ID_MSP2 = 194;
+    public static final int AV_CODEC_ID_VVC = 195;
+    public static final int AV_CODEC_ID_Y41P = 196;
+    public static final int AV_CODEC_ID_AVRP = 197;
+    public static final int AV_CODEC_ID_012V = 198;
+    public static final int AV_CODEC_ID_AVUI = 199;
+    public static final int AV_CODEC_ID_TARGA_Y216 = 200;
+    public static final int AV_CODEC_ID_YUV4 = 201;
+    public static final int AV_CODEC_ID_AVRN = 202;
+    public static final int AV_CODEC_ID_CPIA = 203;
+    public static final int AV_CODEC_ID_XFACE = 204;
+    public static final int AV_CODEC_ID_SNOW = 205;
+    public static final int AV_CODEC_ID_SMVJPEG = 206;
+    public static final int AV_CODEC_ID_APNG = 207;
+    public static final int AV_CODEC_ID_DAALA = 208;
+    public static final int AV_CODEC_ID_CFHD = 209;
+    public static final int AV_CODEC_ID_TRUEMOTION2RT = 210;
+    public static final int AV_CODEC_ID_M101 = 211;
+    public static final int AV_CODEC_ID_MAGICYUV = 212;
+    public static final int AV_CODEC_ID_SHEERVIDEO = 213;
+    public static final int AV_CODEC_ID_YLC = 214;
+    public static final int AV_CODEC_ID_PSD = 215;
+    public static final int AV_CODEC_ID_PIXLET = 216;
+    public static final int AV_CODEC_ID_SPEEDHQ = 217;
+    public static final int AV_CODEC_ID_FMVC = 218;
+    public static final int AV_CODEC_ID_SCPR = 219;
+    public static final int AV_CODEC_ID_CLEARVIDEO = 220;
+    public static final int AV_CODEC_ID_XPM = 221;
+    public static final int AV_CODEC_ID_AV1 = 222;
+    public static final int AV_CODEC_ID_BITPACKED = 223;
+    public static final int AV_CODEC_ID_MSCC = 224;
+    public static final int AV_CODEC_ID_SRGC = 225;
+    public static final int AV_CODEC_ID_SVG = 226;
+    public static final int AV_CODEC_ID_GDV = 227;
+    public static final int AV_CODEC_ID_FITS = 228;
+    public static final int AV_CODEC_ID_IMM4 = 229;
+    public static final int AV_CODEC_ID_PROSUMER = 230;
+    public static final int AV_CODEC_ID_MWSC = 231;
+    public static final int AV_CODEC_ID_WCMV = 232;
+    public static final int AV_CODEC_ID_RASC = 233;
+    public static final int AV_CODEC_ID_HYMT = 234;
+    public static final int AV_CODEC_ID_ARBC = 235;
+    public static final int AV_CODEC_ID_AGM = 236;
+    public static final int AV_CODEC_ID_LSCR = 237;
+    public static final int AV_CODEC_ID_VP4 = 238;
+    public static final int AV_CODEC_ID_IMM5 = 239;
+    public static final int AV_CODEC_ID_MVDV = 240;
+    public static final int AV_CODEC_ID_MVHA = 241;
+    public static final int AV_CODEC_ID_CDTOONS = 242;
+    public static final int AV_CODEC_ID_MV30 = 243;
+    public static final int AV_CODEC_ID_NOTCHLC = 244;
+    public static final int AV_CODEC_ID_PFM = 245;
+    public static final int AV_CODEC_ID_MOBICLIP = 246;
+    public static final int AV_CODEC_ID_PHOTOCD = 247;
+    public static final int AV_CODEC_ID_IPU = 248;
+    public static final int AV_CODEC_ID_ARGO = 249;
+    public static final int AV_CODEC_ID_CRI = 250;
+    public static final int AV_CODEC_ID_SIMBIOSIS_IMX = 251;
+    public static final int AV_CODEC_ID_SGA_VIDEO = 252;
+    public static final int AV_CODEC_ID_GEM = 253;
+    public static final int AV_CODEC_ID_VBN = 254;
+    public static final int AV_CODEC_ID_JPEGXL = 255;
+    public static final int AV_CODEC_ID_QOI = 256;
+    public static final int AV_CODEC_ID_PHM = 257;
+    public static final int AV_CODEC_ID_RADIANCE_HDR = 258;
+    public static final int AV_CODEC_ID_WBMP = 259;
+    public static final int AV_CODEC_ID_MEDIA100 = 260;
+    public static final int AV_CODEC_ID_VQC = 261;
+    public static final int AV_CODEC_ID_PDV = 262;
+    public static final int AV_CODEC_ID_EVC = 263;
+    public static final int AV_CODEC_ID_RTV1 = 264;
+    public static final int AV_CODEC_ID_VMIX = 265;
+    public static final int AV_CODEC_ID_LEAD = 266;
+    public static final int AV_CODEC_ID_DNXUC = 267;
+    public static final int AV_CODEC_ID_RV60 = 268;
+    public static final int AV_CODEC_ID_JPEGXL_ANIM = 269;
+    public static final int AV_CODEC_ID_APV = 270;
+    public static final int AV_CODEC_ID_PRORES_RAW = 271;
+    public static final int AV_CODEC_ID_JPEGXS = 272;
+    public static final int AV_CODEC_ID_WEBP_ANIM = 273;
+    public static final int AV_CODEC_ID_ASTC = 274;
+    public static final int AV_CODEC_ID_RW2 = 275;
+    public static final int AV_CODEC_ID_IMM6 = 276;
+    /* Audio: PCM codecs */
+    public static final int AV_CODEC_ID_FIRST_AUDIO = 0x10000; // = 65536
+    public static final int AV_CODEC_ID_PCM_S16LE = 0x10000; // = 65536
+    public static final int AV_CODEC_ID_PCM_S16BE = 0x10001; // = 65537
+    public static final int AV_CODEC_ID_PCM_U16LE = 0x10002; // = 65538
+    public static final int AV_CODEC_ID_PCM_U16BE = 0x10003; // = 65539
+    public static final int AV_CODEC_ID_PCM_S8 = 0x10004; // = 65540
+    public static final int AV_CODEC_ID_PCM_U8 = 0x10005; // = 65541
+    public static final int AV_CODEC_ID_PCM_MULAW = 0x10006; // = 65542
+    public static final int AV_CODEC_ID_PCM_ALAW = 0x10007; // = 65543
+    public static final int AV_CODEC_ID_PCM_S32LE = 0x10008; // = 65544
+    public static final int AV_CODEC_ID_PCM_S32BE = 0x10009; // = 65545
+    public static final int AV_CODEC_ID_PCM_U32LE = 0x1000A; // = 65546
+    public static final int AV_CODEC_ID_PCM_U32BE = 0x1000B; // = 65547
+    public static final int AV_CODEC_ID_PCM_S24LE = 0x1000C; // = 65548
+    public static final int AV_CODEC_ID_PCM_S24BE = 0x1000D; // = 65549
+    public static final int AV_CODEC_ID_PCM_U24LE = 0x1000E; // = 65550
+    public static final int AV_CODEC_ID_PCM_U24BE = 0x1000F; // = 65551
+    public static final int AV_CODEC_ID_PCM_S24DAUD = 0x10010; // = 65552
+    public static final int AV_CODEC_ID_PCM_ZORK = 0x10011; // = 65553
+    public static final int AV_CODEC_ID_PCM_S16LE_PLANAR = 0x10012; // = 65554
+    public static final int AV_CODEC_ID_PCM_DVD = 0x10013; // = 65555
+    public static final int AV_CODEC_ID_PCM_F32BE = 0x10014; // = 65556
+    public static final int AV_CODEC_ID_PCM_F32LE = 0x10015; // = 65557
+    public static final int AV_CODEC_ID_PCM_F64BE = 0x10016; // = 65558
+    public static final int AV_CODEC_ID_PCM_F64LE = 0x10017; // = 65559
+    public static final int AV_CODEC_ID_PCM_BLURAY = 0x10018; // = 65560
+    public static final int AV_CODEC_ID_PCM_LXF = 0x10019; // = 65561
+    public static final int AV_CODEC_ID_S302M = 0x1001A; // = 65562
+    public static final int AV_CODEC_ID_PCM_S8_PLANAR = 0x1001B; // = 65563
+    public static final int AV_CODEC_ID_PCM_S24LE_PLANAR = 0x1001C; // = 65564
+    public static final int AV_CODEC_ID_PCM_S32LE_PLANAR = 0x1001D; // = 65565
+    public static final int AV_CODEC_ID_PCM_S16BE_PLANAR = 0x1001E; // = 65566
+    public static final int AV_CODEC_ID_PCM_S64LE = 0x1001F; // = 65567
+    public static final int AV_CODEC_ID_PCM_S64BE = 0x10020; // = 65568
+    public static final int AV_CODEC_ID_PCM_F16LE = 0x10021; // = 65569
+    public static final int AV_CODEC_ID_PCM_F24LE = 0x10022; // = 65570
+    public static final int AV_CODEC_ID_PCM_VIDC = 0x10023; // = 65571
+    public static final int AV_CODEC_ID_PCM_SGA = 0x10024; // = 65572
+    public static final int AV_CODEC_ID_PCM_DVDA = 0x10025; // = 65573
+    /* Audio: ADPCM codecs */
+    public static final int AV_CODEC_ID_ADPCM_IMA_QT = 0x11000; // = 69632
+    public static final int AV_CODEC_ID_ADPCM_IMA_WAV = 0x11001; // = 69633
+    public static final int AV_CODEC_ID_ADPCM_IMA_DK3 = 0x11002; // = 69634
+    public static final int AV_CODEC_ID_ADPCM_IMA_DK4 = 0x11003; // = 69635
+    public static final int AV_CODEC_ID_ADPCM_IMA_WS = 0x11004; // = 69636
+    public static final int AV_CODEC_ID_ADPCM_IMA_SMJPEG = 0x11005; // = 69637
+    public static final int AV_CODEC_ID_ADPCM_MS = 0x11006; // = 69638
+    public static final int AV_CODEC_ID_ADPCM_4XM = 0x11007; // = 69639
+    public static final int AV_CODEC_ID_ADPCM_XA = 0x11008; // = 69640
+    public static final int AV_CODEC_ID_ADPCM_ADX = 0x11009; // = 69641
+    public static final int AV_CODEC_ID_ADPCM_EA = 0x1100A; // = 69642
+    public static final int AV_CODEC_ID_ADPCM_G726 = 0x1100B; // = 69643
+    public static final int AV_CODEC_ID_ADPCM_CT = 0x1100C; // = 69644
+    public static final int AV_CODEC_ID_ADPCM_SWF = 0x1100D; // = 69645
+    public static final int AV_CODEC_ID_ADPCM_YAMAHA = 0x1100E; // = 69646
+    public static final int AV_CODEC_ID_ADPCM_SBPRO_4 = 0x1100F; // = 69647
+    public static final int AV_CODEC_ID_ADPCM_SBPRO_3 = 0x11010; // = 69648
+    public static final int AV_CODEC_ID_ADPCM_SBPRO_2 = 0x11011; // = 69649
+    public static final int AV_CODEC_ID_ADPCM_THP = 0x11012; // = 69650
+    public static final int AV_CODEC_ID_ADPCM_IMA_AMV = 0x11013; // = 69651
+    public static final int AV_CODEC_ID_ADPCM_EA_R1 = 0x11014; // = 69652
+    public static final int AV_CODEC_ID_ADPCM_EA_R3 = 0x11015; // = 69653
+    public static final int AV_CODEC_ID_ADPCM_EA_R2 = 0x11016; // = 69654
+    public static final int AV_CODEC_ID_ADPCM_IMA_EA_SEAD = 0x11017; // = 69655
+    public static final int AV_CODEC_ID_ADPCM_IMA_EA_EACS = 0x11018; // = 69656
+    public static final int AV_CODEC_ID_ADPCM_EA_XAS = 0x11019; // = 69657
+    public static final int AV_CODEC_ID_ADPCM_EA_MAXIS_XA = 0x1101A; // = 69658
+    public static final int AV_CODEC_ID_ADPCM_IMA_ISS = 0x1101B; // = 69659
+    public static final int AV_CODEC_ID_ADPCM_G722 = 0x1101C; // = 69660
+    public static final int AV_CODEC_ID_ADPCM_IMA_APC = 0x1101D; // = 69661
+    public static final int AV_CODEC_ID_ADPCM_VIMA = 0x1101E; // = 69662
+    public static final int AV_CODEC_ID_ADPCM_AFC = 0x1101F; // = 69663
+    public static final int AV_CODEC_ID_ADPCM_IMA_OKI = 0x11020; // = 69664
+    public static final int AV_CODEC_ID_ADPCM_DTK = 0x11021; // = 69665
+    public static final int AV_CODEC_ID_ADPCM_IMA_RAD = 0x11022; // = 69666
+    public static final int AV_CODEC_ID_ADPCM_G726LE = 0x11023; // = 69667
+    public static final int AV_CODEC_ID_ADPCM_THP_LE = 0x11024; // = 69668
+    public static final int AV_CODEC_ID_ADPCM_PSX = 0x11025; // = 69669
+    public static final int AV_CODEC_ID_ADPCM_AICA = 0x11026; // = 69670
+    public static final int AV_CODEC_ID_ADPCM_IMA_DAT4 = 0x11027; // = 69671
+    public static final int AV_CODEC_ID_ADPCM_MTAF = 0x11028; // = 69672
+    public static final int AV_CODEC_ID_ADPCM_AGM = 0x11029; // = 69673
+    public static final int AV_CODEC_ID_ADPCM_ARGO = 0x1102A; // = 69674
+    public static final int AV_CODEC_ID_ADPCM_IMA_SSI = 0x1102B; // = 69675
+    public static final int AV_CODEC_ID_ADPCM_ZORK = 0x1102C; // = 69676
+    public static final int AV_CODEC_ID_ADPCM_IMA_APM = 0x1102D; // = 69677
+    public static final int AV_CODEC_ID_ADPCM_IMA_ALP = 0x1102E; // = 69678
+    public static final int AV_CODEC_ID_ADPCM_IMA_MTF = 0x1102F; // = 69679
+    public static final int AV_CODEC_ID_ADPCM_IMA_CUNNING = 0x11030; // = 69680
+    public static final int AV_CODEC_ID_ADPCM_IMA_MOFLEX = 0x11031; // = 69681
+    public static final int AV_CODEC_ID_ADPCM_IMA_ACORN = 0x11032; // = 69682
+    public static final int AV_CODEC_ID_ADPCM_XMD = 0x11033; // = 69683
+    public static final int AV_CODEC_ID_ADPCM_IMA_XBOX = 0x11034; // = 69684
+    public static final int AV_CODEC_ID_ADPCM_SANYO = 0x11035; // = 69685
+    public static final int AV_CODEC_ID_ADPCM_IMA_HVQM4 = 0x11036; // = 69686
+    public static final int AV_CODEC_ID_ADPCM_IMA_PDA = 0x11037; // = 69687
+    public static final int AV_CODEC_ID_ADPCM_N64 = 0x11038; // = 69688
+    public static final int AV_CODEC_ID_ADPCM_IMA_HVQM2 = 0x11039; // = 69689
+    public static final int AV_CODEC_ID_ADPCM_IMA_MAGIX = 0x1103A; // = 69690
+    public static final int AV_CODEC_ID_ADPCM_PSXC = 0x1103B; // = 69691
+    public static final int AV_CODEC_ID_ADPCM_CIRCUS = 0x1103C; // = 69692
+    public static final int AV_CODEC_ID_ADPCM_IMA_ESCAPE = 0x1103D; // = 69693
+    public static final int AV_CODEC_ID_ADPCM_RHETOREX = 0x1103E; // = 69694
+    public static final int AV_CODEC_ID_ADPCM_IMA_CITRIX = 0x1103F; // = 69695
+    /* Audio: AMR */
+    public static final int AV_CODEC_ID_AMR_NB = 0x12000; // = 73728
+    public static final int AV_CODEC_ID_AMR_WB = 0x12001; // = 73729
+    /* Audio: RealAudio */
+    public static final int AV_CODEC_ID_RA_144 = 0x13000; // = 77824
+    public static final int AV_CODEC_ID_RA_288 = 0x13001; // = 77825
+    /* Audio: DPCM codecs */
+    public static final int AV_CODEC_ID_ROQ_DPCM = 0x14000; // = 81920
+    public static final int AV_CODEC_ID_INTERPLAY_DPCM = 0x14001; // = 81921
+    public static final int AV_CODEC_ID_XAN_DPCM = 0x14002; // = 81922
+    public static final int AV_CODEC_ID_SOL_DPCM = 0x14003; // = 81923
+    public static final int AV_CODEC_ID_SDX2_DPCM = 0x14004; // = 81924
+    public static final int AV_CODEC_ID_GREMLIN_DPCM = 0x14005; // = 81925
+    public static final int AV_CODEC_ID_DERF_DPCM = 0x14006; // = 81926
+    public static final int AV_CODEC_ID_WADY_DPCM = 0x14007; // = 81927
+    public static final int AV_CODEC_ID_CBD2_DPCM = 0x14008; // = 81928
+    /* Audio codecs */
+    public static final int AV_CODEC_ID_MP2 = 0x15000; // = 86016
+    public static final int AV_CODEC_ID_MP3 = 0x15001; // = 86017
+    public static final int AV_CODEC_ID_AAC = 0x15002; // = 86018
+    public static final int AV_CODEC_ID_AC3 = 0x15003; // = 86019
+    public static final int AV_CODEC_ID_DTS = 0x15004; // = 86020
+    public static final int AV_CODEC_ID_VORBIS = 0x15005; // = 86021
+    public static final int AV_CODEC_ID_DVAUDIO = 0x15006; // = 86022
+    public static final int AV_CODEC_ID_WMAV1 = 0x15007; // = 86023
+    public static final int AV_CODEC_ID_WMAV2 = 0x15008; // = 86024
+    public static final int AV_CODEC_ID_MACE3 = 0x15009; // = 86025
+    public static final int AV_CODEC_ID_MACE6 = 0x1500A; // = 86026
+    public static final int AV_CODEC_ID_VMDAUDIO = 0x1500B; // = 86027
+    public static final int AV_CODEC_ID_FLAC = 0x1500C; // = 86028
+    public static final int AV_CODEC_ID_MP3ADU = 0x1500D; // = 86029
+    public static final int AV_CODEC_ID_MP3ON4 = 0x1500E; // = 86030
+    public static final int AV_CODEC_ID_SHORTEN = 0x1500F; // = 86031
+    public static final int AV_CODEC_ID_ALAC = 0x15010; // = 86032
+    public static final int AV_CODEC_ID_WESTWOOD_SND1 = 0x15011; // = 86033
+    public static final int AV_CODEC_ID_GSM = 0x15012; // = 86034
+    public static final int AV_CODEC_ID_QDM2 = 0x15013; // = 86035
+    public static final int AV_CODEC_ID_COOK = 0x15014; // = 86036
+    public static final int AV_CODEC_ID_TRUESPEECH = 0x15015; // = 86037
+    public static final int AV_CODEC_ID_TTA = 0x15016; // = 86038
+    public static final int AV_CODEC_ID_SMACKAUDIO = 0x15017; // = 86039
+    public static final int AV_CODEC_ID_QCELP = 0x15018; // = 86040
+    public static final int AV_CODEC_ID_WAVPACK = 0x15019; // = 86041
+    public static final int AV_CODEC_ID_DSICINAUDIO = 0x1501A; // = 86042
+    public static final int AV_CODEC_ID_IMC = 0x1501B; // = 86043
+    public static final int AV_CODEC_ID_MUSEPACK7 = 0x1501C; // = 86044
+    public static final int AV_CODEC_ID_MLP = 0x1501D; // = 86045
+    public static final int AV_CODEC_ID_GSM_MS = 0x1501E; // = 86046
+    public static final int AV_CODEC_ID_ATRAC3 = 0x1501F; // = 86047
+    public static final int AV_CODEC_ID_APE = 0x15020; // = 86048
+    public static final int AV_CODEC_ID_NELLYMOSER = 0x15021; // = 86049
+    public static final int AV_CODEC_ID_MUSEPACK8 = 0x15022; // = 86050
+    public static final int AV_CODEC_ID_SPEEX = 0x15023; // = 86051
+    public static final int AV_CODEC_ID_WMAVOICE = 0x15024; // = 86052
+    public static final int AV_CODEC_ID_WMAPRO = 0x15025; // = 86053
+    public static final int AV_CODEC_ID_WMALOSSLESS = 0x15026; // = 86054
+    public static final int AV_CODEC_ID_ATRAC3P = 0x15027; // = 86055
+    public static final int AV_CODEC_ID_EAC3 = 0x15028; // = 86056
+    public static final int AV_CODEC_ID_SIPR = 0x15029; // = 86057
+    public static final int AV_CODEC_ID_MP1 = 0x1502A; // = 86058
+    public static final int AV_CODEC_ID_TWINVQ = 0x1502B; // = 86059
+    public static final int AV_CODEC_ID_TRUEHD = 0x1502C; // = 86060
+    public static final int AV_CODEC_ID_MP4ALS = 0x1502D; // = 86061
+    public static final int AV_CODEC_ID_ATRAC1 = 0x1502E; // = 86062
+    public static final int AV_CODEC_ID_BINKAUDIO_RDFT = 0x1502F; // = 86063
+    public static final int AV_CODEC_ID_BINKAUDIO_DCT = 0x15030; // = 86064
+    public static final int AV_CODEC_ID_AAC_LATM = 0x15031; // = 86065
+    public static final int AV_CODEC_ID_QDMC = 0x15032; // = 86066
+    public static final int AV_CODEC_ID_CELT = 0x15033; // = 86067
+    public static final int AV_CODEC_ID_G723_1 = 0x15034; // = 86068
+    public static final int AV_CODEC_ID_G729 = 0x15035; // = 86069
+    public static final int AV_CODEC_ID_8SVX_EXP = 0x15036; // = 86070
+    public static final int AV_CODEC_ID_8SVX_FIB = 0x15037; // = 86071
+    public static final int AV_CODEC_ID_BMV_AUDIO = 0x15038; // = 86072
+    public static final int AV_CODEC_ID_RALF = 0x15039; // = 86073
+    public static final int AV_CODEC_ID_IAC = 0x1503A; // = 86074
+    public static final int AV_CODEC_ID_ILBC = 0x1503B; // = 86075
+    public static final int AV_CODEC_ID_OPUS = 0x1503C; // = 86076
+    public static final int AV_CODEC_ID_COMFORT_NOISE = 0x1503D; // = 86077
+    public static final int AV_CODEC_ID_TAK = 0x1503E; // = 86078
+    public static final int AV_CODEC_ID_METASOUND = 0x1503F; // = 86079
+    public static final int AV_CODEC_ID_PAF_AUDIO = 0x15040; // = 86080
+    public static final int AV_CODEC_ID_ON2AVC = 0x15041; // = 86081
+    public static final int AV_CODEC_ID_DSS_SP = 0x15042; // = 86082
+    public static final int AV_CODEC_ID_CODEC2 = 0x15043; // = 86083
+    public static final int AV_CODEC_ID_FFWAVESYNTH = 0x15044; // = 86084
+    public static final int AV_CODEC_ID_SONIC = 0x15045; // = 86085
+    public static final int AV_CODEC_ID_SONIC_LS = 0x15046; // = 86086
+    public static final int AV_CODEC_ID_EVRC = 0x15047; // = 86087
+    public static final int AV_CODEC_ID_SMV = 0x15048; // = 86088
+    public static final int AV_CODEC_ID_DSD_LSBF = 0x15049; // = 86089
+    public static final int AV_CODEC_ID_DSD_MSBF = 0x1504A; // = 86090
+    public static final int AV_CODEC_ID_DSD_LSBF_PLANAR = 0x1504B; // = 86091
+    public static final int AV_CODEC_ID_DSD_MSBF_PLANAR = 0x1504C; // = 86092
+    public static final int AV_CODEC_ID_4GV = 0x1504D; // = 86093
+    public static final int AV_CODEC_ID_INTERPLAY_ACM = 0x1504E; // = 86094
+    public static final int AV_CODEC_ID_XMA1 = 0x1504F; // = 86095
+    public static final int AV_CODEC_ID_XMA2 = 0x15050; // = 86096
+    public static final int AV_CODEC_ID_DST = 0x15051; // = 86097
+    public static final int AV_CODEC_ID_ATRAC3AL = 0x15052; // = 86098
+    public static final int AV_CODEC_ID_ATRAC3PAL = 0x15053; // = 86099
+    public static final int AV_CODEC_ID_DOLBY_E = 0x15054; // = 86100
+    public static final int AV_CODEC_ID_APTX = 0x15055; // = 86101
+    public static final int AV_CODEC_ID_APTX_HD = 0x15056; // = 86102
+    public static final int AV_CODEC_ID_SBC = 0x15057; // = 86103
+    public static final int AV_CODEC_ID_ATRAC9 = 0x15058; // = 86104
+    public static final int AV_CODEC_ID_HCOM = 0x15059; // = 86105
+    public static final int AV_CODEC_ID_ACELP_KELVIN = 0x1505A; // = 86106
+    public static final int AV_CODEC_ID_MPEGH_3D_AUDIO = 0x1505B; // = 86107
+    public static final int AV_CODEC_ID_SIREN = 0x1505C; // = 86108
+    public static final int AV_CODEC_ID_HCA = 0x1505D; // = 86109
+    public static final int AV_CODEC_ID_FASTAUDIO = 0x1505E; // = 86110
+    public static final int AV_CODEC_ID_MSNSIREN = 0x1505F; // = 86111
+    public static final int AV_CODEC_ID_DFPWM = 0x15060; // = 86112
+    public static final int AV_CODEC_ID_BONK = 0x15061; // = 86113
+    public static final int AV_CODEC_ID_MISC4 = 0x15062; // = 86114
+    public static final int AV_CODEC_ID_APAC = 0x15063; // = 86115
+    public static final int AV_CODEC_ID_FTR = 0x15064; // = 86116
+    public static final int AV_CODEC_ID_WAVARC = 0x15065; // = 86117
+    public static final int AV_CODEC_ID_RKA = 0x15066; // = 86118
+    public static final int AV_CODEC_ID_AC4 = 0x15067; // = 86119
+    public static final int AV_CODEC_ID_OSQ = 0x15068; // = 86120
+    public static final int AV_CODEC_ID_QOA = 0x15069; // = 86121
+    public static final int AV_CODEC_ID_LC3 = 0x1506A; // = 86122
+    public static final int AV_CODEC_ID_G728 = 0x1506B; // = 86123
+    public static final int AV_CODEC_ID_AHX = 0x1506C; // = 86124
+    public static final int AV_CODEC_ID_APPLE_APAC = 0x1506D; // = 86125
+    /* Subtitle codecs */
+    public static final int AV_CODEC_ID_FIRST_SUBTITLE = 0x17000; // = 94208
+    public static final int AV_CODEC_ID_DVD_SUBTITLE = 0x17000; // = 94208
+    public static final int AV_CODEC_ID_DVB_SUBTITLE = 0x17001; // = 94209
+    public static final int AV_CODEC_ID_TEXT = 0x17002; // = 94210
+    public static final int AV_CODEC_ID_XSUB = 0x17003; // = 94211
+    public static final int AV_CODEC_ID_SSA = 0x17004; // = 94212
+    public static final int AV_CODEC_ID_MOV_TEXT = 0x17005; // = 94213
+    public static final int AV_CODEC_ID_HDMV_PGS_SUBTITLE = 0x17006; // = 94214
+    public static final int AV_CODEC_ID_DVB_TELETEXT = 0x17007; // = 94215
+    public static final int AV_CODEC_ID_SRT = 0x17008; // = 94216
+    public static final int AV_CODEC_ID_MICRODVD = 0x17009; // = 94217
+    public static final int AV_CODEC_ID_EIA_608 = 0x1700A; // = 94218
+    public static final int AV_CODEC_ID_JACOSUB = 0x1700B; // = 94219
+    public static final int AV_CODEC_ID_SAMI = 0x1700C; // = 94220
+    public static final int AV_CODEC_ID_REALTEXT = 0x1700D; // = 94221
+    public static final int AV_CODEC_ID_STL = 0x1700E; // = 94222
+    public static final int AV_CODEC_ID_SUBVIEWER1 = 0x1700F; // = 94223
+    public static final int AV_CODEC_ID_SUBVIEWER = 0x17010; // = 94224
+    public static final int AV_CODEC_ID_SUBRIP = 0x17011; // = 94225
+    public static final int AV_CODEC_ID_WEBVTT = 0x17012; // = 94226
+    public static final int AV_CODEC_ID_MPL2 = 0x17013; // = 94227
+    public static final int AV_CODEC_ID_VPLAYER = 0x17014; // = 94228
+    public static final int AV_CODEC_ID_PJS = 0x17015; // = 94229
+    public static final int AV_CODEC_ID_ASS = 0x17016; // = 94230
+    public static final int AV_CODEC_ID_HDMV_TEXT_SUBTITLE = 0x17017; // = 94231
+    public static final int AV_CODEC_ID_TTML = 0x17018; // = 94232
+    public static final int AV_CODEC_ID_ARIB_CAPTION = 0x17019; // = 94233
+    public static final int AV_CODEC_ID_IVTV_VBI = 0x1701A; // = 94234
+    /* Other / attachments */
+    public static final int AV_CODEC_ID_FIRST_UNKNOWN = 0x18000; // = 98304
+    public static final int AV_CODEC_ID_TTF = 0x18000; // = 98304
+    public static final int AV_CODEC_ID_SCTE_35 = 0x18001; // = 98305
+    public static final int AV_CODEC_ID_EPG = 0x18002; // = 98306
+    public static final int AV_CODEC_ID_BINTEXT = 0x18003; // = 98307
+    public static final int AV_CODEC_ID_XBIN = 0x18004; // = 98308
+    public static final int AV_CODEC_ID_IDF = 0x18005; // = 98309
+    public static final int AV_CODEC_ID_OTF = 0x18006; // = 98310
+    public static final int AV_CODEC_ID_SMPTE_KLV = 0x18007; // = 98311
+    public static final int AV_CODEC_ID_DVD_NAV = 0x18008; // = 98312
+    public static final int AV_CODEC_ID_TIMED_ID3 = 0x18009; // = 98313
+    public static final int AV_CODEC_ID_BIN_DATA = 0x1800A; // = 98314
+    public static final int AV_CODEC_ID_SMPTE_2038 = 0x1800B; // = 98315
+    public static final int AV_CODEC_ID_LCEVC = 0x1800C; // = 98316
+    public static final int AV_CODEC_ID_SMPTE_436M_ANC = 0x1800D; // = 98317
+    public static final int AV_CODEC_ID_ITUT_T35 = 0x1800E; // = 98318
+    /* Probe / fake / null codecs */
+    public static final int AV_CODEC_ID_PROBE = 0x19000; // = 102400
+    public static final int AV_CODEC_ID_MPEG2TS = 0x20000; // = 131072
+    public static final int AV_CODEC_ID_MPEG4SYSTEMS = 0x20001; // = 131073
+    public static final int AV_CODEC_ID_FFMETADATA = 0x21000; // = 135168
+    public static final int AV_CODEC_ID_WRAPPED_AVFRAME = 0x21001; // = 135169
+    public static final int AV_CODEC_ID_VNULL = 0x21002; // = 135170
+    public static final int AV_CODEC_ID_ANULL = 0x21003; // = 135171
 
-    /** Common audio codec id constants mirroring {@code enum AVCodecID}. */
-    public static final int AV_CODEC_ID_PCM_S16LE = 0x10000;  // = 65536
-    public static final int AV_CODEC_ID_AMR_NB     = 0x12000; // = 73728
-    public static final int AV_CODEC_ID_AMR_WB     = 73729;
-    public static final int AV_CODEC_ID_MP3        = 0x15001; // = 86017
-    public static final int AV_CODEC_ID_AAC        = 0x15002; // = 86018
-    public static final int AV_CODEC_ID_AC3        = 0x15003; // = 86019
-    public static final int AV_CODEC_ID_DTS        = 0x15004; // = 86020
-    public static final int AV_CODEC_ID_VORBIS     = 0x15005; // = 86021
-    public static final int AV_CODEC_ID_FLAC       = 0x1500c; // = 86028
-    public static final int AV_CODEC_ID_ALAC       = 0x15010; // = 86032
-    public static final int AV_CODEC_ID_EAC3       = 0x15028; // = 86056
-    public static final int AV_CODEC_ID_OPUS       = 0x1503C; // = 86076
+    /** @deprecated alias kept for parity with {@code AV_CODEC_ID_IFF_ILBM}. */
+    public static final int AV_CODEC_ID_IFF_BYTERUN1 = AV_CODEC_ID_IFF_ILBM;
 
-    /** @deprecated alias kept for parity with {@code AV_CODEC_ID_H265}. */
+    /** @deprecated alias kept for parity with {@code AV_CODEC_ID_HEVC}. */
     public static final int AV_CODEC_ID_H265 = AV_CODEC_ID_HEVC;
 
-    /**
-     * Codec profile constants mirroring {@code AV_PROFILE_*}, for use with
-     * {@link #streamGetParProfile}. Only the audio profiles that matter for
-     * compressed-bitstream passthrough are listed: a DTS stream whose profile
-     * is an HD extension (HRA/MA/Express) needs the {@code dca_core}
-     * bitstream filter before a plain {@code ENCODING_DTS} sink accepts it,
-     * and the same applies to E-AC3 Atmos over {@code eac3_core}.
-     */
-    public static final int AV_PROFILE_UNKNOWN         = -99;
-    public static final int AV_PROFILE_DTS             = 20;
-    public static final int AV_PROFILE_DTS_ES         = 30;
-    public static final int AV_PROFILE_DTS_96_24       = 40;
-    public static final int AV_PROFILE_DTS_HD_HRA     = 50;
-    public static final int AV_PROFILE_DTS_HD_MA       = 60;
-    public static final int AV_PROFILE_DTS_HD_MA_X    = 61;
-    public static final int AV_PROFILE_DTS_HD_MA_X_IMAX = 62;
-    public static final int AV_PROFILE_DTS_EXPRESS    = 70;
-    public static final int AV_PROFILE_EAC3_DDP_ATMOS = 30;
-    public static final int AV_PROFILE_TRUEHD_ATMOS   = 30;
+    /** @deprecated alias kept for parity with {@code AV_CODEC_ID_VVC}. */
+    public static final int AV_CODEC_ID_H266 = AV_CODEC_ID_VVC;
 
     /**
-     * AAC profiles ({@code libavcodec/defs.h}). Only AAC LC can be
-     * ADTS-packed for {@code ENCODING_AAC_LC} passthrough; HE / HEv2 carry
-     * SBR/PS signalling that plain ADTS cannot express and must go through
-     * the software decoder.
+     * Misc codec constants mirrored from {@code libavcodec/defs.h}: input
+     * padding, error-detection flags, compliance levels, every codec profile
+     * ({@code AV_PROFILE_*}), level, field order, discard levels and audio
+     * service types. Values match the native macros/enums.
+     *
+     * <p>The {@code AV_PROFILE_*} set is the full list from {@code defs.h};
+     * for compressed-bitstream passthrough the relevant ones are the audio
+     * profiles (e.g. {@link #AV_PROFILE_DTS}, {@link #AV_PROFILE_EAC3_DDP_ATMOS})
+     * and the AAC profiles ({@link #AV_PROFILE_AAC_LOW} for ADTS packing).
      */
-    public static final int AV_PROFILE_AAC_LOW   = 1;
-    public static final int AV_PROFILE_AAC_HE    = 4;
+    public static final int AV_INPUT_BUFFER_PADDING_SIZE = 64;
+
+    /** Error-detection flags, {@code AV_EF_*}. */
+    public static final int AV_EF_CRCCHECK   = 1;
+    public static final int AV_EF_BITSTREAM  = 2;
+    public static final int AV_EF_BUFFER     = 4;
+    public static final int AV_EF_EXPLODE    = 8;
+    public static final int AV_EF_IGNORE_ERR = 0x8000;  // = 32768
+    public static final int AV_EF_CAREFUL    = 0x10000; // = 65536
+    public static final int AV_EF_COMPLIANT  = 0x20000; // = 131072
+    public static final int AV_EF_AGGRESSIVE = 0x40000; // = 262144
+
+    /** Compliance levels, {@code FF_COMPLIANCE_*}. */
+    public static final int FF_COMPLIANCE_VERY_STRICT = 2;
+    public static final int FF_COMPLIANCE_STRICT       = 1;
+    public static final int FF_COMPLIANCE_NORMAL       = 0;
+    public static final int FF_COMPLIANCE_UNOFFICIAL   = -1;
+    public static final int FF_COMPLIANCE_EXPERIMENTAL = -2;
+
+    /** Codec profiles, every {@code AV_PROFILE_*} from {@code libavcodec/defs.h}. */
+    public static final int AV_PROFILE_AAC_ELD = 38;
+    public static final int AV_PROFILE_AAC_HE = 4;
     public static final int AV_PROFILE_AAC_HE_V2 = 28;
+    public static final int AV_PROFILE_AAC_LD = 22;
+    public static final int AV_PROFILE_AAC_LOW = 1;
+    public static final int AV_PROFILE_AAC_LTP = 3;
+    public static final int AV_PROFILE_AAC_MAIN = 0;
+    public static final int AV_PROFILE_AAC_SSR = 2;
+    public static final int AV_PROFILE_AAC_USAC = 41;
+    public static final int AV_PROFILE_APV_400_10 = 99;
+    public static final int AV_PROFILE_APV_422_10 = 33;
+    public static final int AV_PROFILE_APV_422_12 = 44;
+    public static final int AV_PROFILE_APV_444_10 = 55;
+    public static final int AV_PROFILE_APV_444_12 = 66;
+    public static final int AV_PROFILE_APV_4444_10 = 77;
+    public static final int AV_PROFILE_APV_4444_12 = 88;
+    public static final int AV_PROFILE_ARIB_PROFILE_A = 0;
+    public static final int AV_PROFILE_ARIB_PROFILE_C = 1;
+    public static final int AV_PROFILE_ASTC_HDR = 4;
+    public static final int AV_PROFILE_ASTC_HDR_RGB_LDR_A = 3;
+    public static final int AV_PROFILE_ASTC_LDR = 2;
+    public static final int AV_PROFILE_ASTC_LDR_SRGB = 1;
+    public static final int AV_PROFILE_ASTC_LINEAR_ANY = 5;
+    public static final int AV_PROFILE_AV1_HIGH = 1;
+    public static final int AV_PROFILE_AV1_MAIN = 0;
+    public static final int AV_PROFILE_AV1_PROFESSIONAL = 2;
+    public static final int AV_PROFILE_CAVS_BROADCASTING = 72;
+    public static final int AV_PROFILE_CAVS_JIZHUN = 32;
+    public static final int AV_PROFILE_DNXHD = 0;
+    public static final int AV_PROFILE_DNXHR_444 = 5;
+    public static final int AV_PROFILE_DNXHR_HQ = 3;
+    public static final int AV_PROFILE_DNXHR_HQX = 4;
+    public static final int AV_PROFILE_DNXHR_LB = 1;
+    public static final int AV_PROFILE_DNXHR_SQ = 2;
+    public static final int AV_PROFILE_DTS = 20;
+    public static final int AV_PROFILE_DTS_96_24 = 40;
+    public static final int AV_PROFILE_DTS_ES = 30;
+    public static final int AV_PROFILE_DTS_EXPRESS = 70;
+    public static final int AV_PROFILE_DTS_HD_HRA = 50;
+    public static final int AV_PROFILE_DTS_HD_MA = 60;
+    public static final int AV_PROFILE_DTS_HD_MA_X = 61;
+    public static final int AV_PROFILE_DTS_HD_MA_X_IMAX = 62;
+    public static final int AV_PROFILE_EAC3_DDP_ATMOS = 30;
+    public static final int AV_PROFILE_EVC_BASELINE = 0;
+    public static final int AV_PROFILE_EVC_MAIN = 1;
+    public static final int AV_PROFILE_H264_BASELINE = 66;
+    public static final int AV_PROFILE_H264_CAVLC_444 = 44;
+    public static final int AV_PROFILE_H264_CONSTRAINED = 512;
+    public static final int AV_PROFILE_H264_CONSTRAINED_BASELINE = 578;
+    public static final int AV_PROFILE_H264_EXTENDED = 88;
+    public static final int AV_PROFILE_H264_HIGH = 100;
+    public static final int AV_PROFILE_H264_HIGH_10 = 110;
+    public static final int AV_PROFILE_H264_HIGH_10_INTRA = 2158;
+    public static final int AV_PROFILE_H264_HIGH_422 = 122;
+    public static final int AV_PROFILE_H264_HIGH_422_INTRA = 2170;
+    public static final int AV_PROFILE_H264_HIGH_444 = 144;
+    public static final int AV_PROFILE_H264_HIGH_444_INTRA = 2292;
+    public static final int AV_PROFILE_H264_HIGH_444_PREDICTIVE = 244;
+    public static final int AV_PROFILE_H264_INTRA = 2048;
+    public static final int AV_PROFILE_H264_MAIN = 77;
+    public static final int AV_PROFILE_H264_MULTIVIEW_HIGH = 118;
+    public static final int AV_PROFILE_H264_STEREO_HIGH = 128;
+    public static final int AV_PROFILE_HEVC_MAIN = 1;
+    public static final int AV_PROFILE_HEVC_MAIN_10 = 2;
+    public static final int AV_PROFILE_HEVC_MAIN_STILL_PICTURE = 3;
+    public static final int AV_PROFILE_HEVC_MULTIVIEW_MAIN = 6;
+    public static final int AV_PROFILE_HEVC_REXT = 4;
+    public static final int AV_PROFILE_HEVC_SCC = 9;
+    public static final int AV_PROFILE_JPEG2000_CSTREAM_NO_RESTRICTION = 0x8000; // = 32768
+    public static final int AV_PROFILE_JPEG2000_CSTREAM_RESTRICTION_0 = 1;
+    public static final int AV_PROFILE_JPEG2000_CSTREAM_RESTRICTION_1 = 2;
+    public static final int AV_PROFILE_JPEG2000_DCINEMA_2K = 3;
+    public static final int AV_PROFILE_JPEG2000_DCINEMA_4K = 4;
+    public static final int AV_PROFILE_KLVA_ASYNC = 1;
+    public static final int AV_PROFILE_KLVA_SYNC = 0;
+    public static final int AV_PROFILE_MJPEG_HUFFMAN_BASELINE_DCT = 192;
+    public static final int AV_PROFILE_MJPEG_HUFFMAN_EXTENDED_SEQUENTIAL_DCT = 193;
+    public static final int AV_PROFILE_MJPEG_HUFFMAN_LOSSLESS = 195;
+    public static final int AV_PROFILE_MJPEG_HUFFMAN_PROGRESSIVE_DCT = 194;
+    public static final int AV_PROFILE_MJPEG_JPEG_LS = 247;
+    public static final int AV_PROFILE_MPEG2_422 = 0;
+    public static final int AV_PROFILE_MPEG2_AAC_HE = 131;
+    public static final int AV_PROFILE_MPEG2_AAC_LOW = 128;
+    public static final int AV_PROFILE_MPEG2_HIGH = 1;
+    public static final int AV_PROFILE_MPEG2_MAIN = 4;
+    public static final int AV_PROFILE_MPEG2_SIMPLE = 5;
+    public static final int AV_PROFILE_MPEG2_SNR_SCALABLE = 3;
+    public static final int AV_PROFILE_MPEG2_SS = 2;
+    public static final int AV_PROFILE_MPEG4_ADVANCED_CODING = 11;
+    public static final int AV_PROFILE_MPEG4_ADVANCED_CORE = 12;
+    public static final int AV_PROFILE_MPEG4_ADVANCED_REAL_TIME = 9;
+    public static final int AV_PROFILE_MPEG4_ADVANCED_SCALABLE_TEXTURE = 13;
+    public static final int AV_PROFILE_MPEG4_ADVANCED_SIMPLE = 15;
+    public static final int AV_PROFILE_MPEG4_BASIC_ANIMATED_TEXTURE = 7;
+    public static final int AV_PROFILE_MPEG4_CORE = 2;
+    public static final int AV_PROFILE_MPEG4_CORE_SCALABLE = 10;
+    public static final int AV_PROFILE_MPEG4_HYBRID = 8;
+    public static final int AV_PROFILE_MPEG4_MAIN = 3;
+    public static final int AV_PROFILE_MPEG4_N_BIT = 4;
+    public static final int AV_PROFILE_MPEG4_SCALABLE_TEXTURE = 5;
+    public static final int AV_PROFILE_MPEG4_SIMPLE = 0;
+    public static final int AV_PROFILE_MPEG4_SIMPLE_FACE_ANIMATION = 6;
+    public static final int AV_PROFILE_MPEG4_SIMPLE_SCALABLE = 1;
+    public static final int AV_PROFILE_MPEG4_SIMPLE_STUDIO = 14;
+    public static final int AV_PROFILE_MPEGH_3DA_BL = 3;
+    public static final int AV_PROFILE_MPEGH_3DA_HIGH = 1;
+    public static final int AV_PROFILE_MPEGH_3DA_LC = 2;
+    public static final int AV_PROFILE_MPEGH_3DA_MAIN = 0;
+    public static final int AV_PROFILE_PRORES_4444 = 4;
+    public static final int AV_PROFILE_PRORES_HQ = 3;
+    public static final int AV_PROFILE_PRORES_LT = 1;
+    public static final int AV_PROFILE_PRORES_PROXY = 0;
+    public static final int AV_PROFILE_PRORES_RAW = 0;
+    public static final int AV_PROFILE_PRORES_RAW_HQ = 1;
+    public static final int AV_PROFILE_PRORES_STANDARD = 2;
+    public static final int AV_PROFILE_PRORES_XQ = 5;
+    public static final int AV_PROFILE_RESERVED = -100;
+    public static final int AV_PROFILE_SBC_MSBC = 1;
+    public static final int AV_PROFILE_TRUEHD_ATMOS = 30;
+    public static final int AV_PROFILE_UNKNOWN = -99;
+    public static final int AV_PROFILE_VC1_ADVANCED = 3;
+    public static final int AV_PROFILE_VC1_COMPLEX = 2;
+    public static final int AV_PROFILE_VC1_MAIN = 1;
+    public static final int AV_PROFILE_VC1_SIMPLE = 0;
+    public static final int AV_PROFILE_VP9_0 = 0;
+    public static final int AV_PROFILE_VP9_1 = 1;
+    public static final int AV_PROFILE_VP9_2 = 2;
+    public static final int AV_PROFILE_VP9_3 = 3;
+    public static final int AV_PROFILE_VVC_MAIN_10 = 1;
+    public static final int AV_PROFILE_VVC_MAIN_10_444 = 33;
+
+    /** Unknown level sentinel, {@code AV_LEVEL_UNKNOWN}. */
+    public static final int AV_LEVEL_UNKNOWN = -99;
+
+    /** Field-order values, {@code enum AVFieldOrder}. */
+    public static final int AV_FIELD_UNKNOWN     = 0;
+    public static final int AV_FIELD_PROGRESSIVE = 1;
+    public static final int AV_FIELD_TT          = 2;
+    public static final int AV_FIELD_BB          = 3;
+    public static final int AV_FIELD_TB          = 4;
+    public static final int AV_FIELD_BT          = 5;
+
+    /** Discard levels, {@code enum AVDiscard}. */
+    public static final int AVDISCARD_NONE    = -16;
+    public static final int AVDISCARD_DEFAULT = 0;
+    public static final int AVDISCARD_NONREF  = 8;
+    public static final int AVDISCARD_BIDIR   = 16;
+    public static final int AVDISCARD_NONINTRA = 24;
+    public static final int AVDISCARD_NONKEY  = 32;
+    public static final int AVDISCARD_ALL     = 48;
+
+    /** Audio service types, {@code enum AVAudioServiceType}. */
+    public static final int AV_AUDIO_SERVICE_TYPE_MAIN              = 0;
+    public static final int AV_AUDIO_SERVICE_TYPE_EFFECTS           = 1;
+    public static final int AV_AUDIO_SERVICE_TYPE_VISUALLY_IMPAIRED = 2;
+    public static final int AV_AUDIO_SERVICE_TYPE_HEARING_IMPAIRED  = 3;
+    public static final int AV_AUDIO_SERVICE_TYPE_DIALOGUE          = 4;
+    public static final int AV_AUDIO_SERVICE_TYPE_COMMENTARY        = 5;
+    public static final int AV_AUDIO_SERVICE_TYPE_EMERGENCY         = 6;
+    public static final int AV_AUDIO_SERVICE_TYPE_VOICE_OVER        = 7;
+    public static final int AV_AUDIO_SERVICE_TYPE_KARAOKE           = 8;
+    public static final int AV_AUDIO_SERVICE_TYPE_NB                = 9;
 
     /**
      * {@code ANativeWindow} buffer formats for
