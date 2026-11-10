@@ -2452,7 +2452,12 @@ static int ff_pcm_check_call(const FFPcmSession *s, struct SwrContext *swr,
      *
      * This is deliberately narrow: only the no-input case is exempted. A
      * convert with real input that reports 0 room is still a limit refusal,
-     * because there the caller has data that would be silently dropped. */
+     * because there the caller has data that would be silently dropped.
+     *
+     * Returning room 0 is safe for the caller: swr_convert() with in_arg NULL,
+     * no resampling and an empty in_buffer returns 0 before it ever looks at
+     * out_count (swresample.c), so no staging buffer is touched and the
+     * phase machine below still records the stream as finished. */
     if (in_samples == 0 && bound == 0) {
         *out_room = 0;
         return 0;
