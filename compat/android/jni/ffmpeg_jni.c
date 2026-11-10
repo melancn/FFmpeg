@@ -2441,6 +2441,23 @@ static int ff_pcm_check_call(const FFPcmSession *s, struct SwrContext *swr,
     if (bound < 0)
         return (int)bound;
 
+    /* A drain (in_samples == 0) for which swr reports no possible output is
+     * an EMPTY TAIL, not an over-large request. swr_get_out_samples() returns
+     * `in_buffer_count + in_samples` when no resampling is configured
+     * (swresample.c), so a session converting 48k->48k with an exhausted
+     * buffer reports exactly 0 -- and `room <= 0` below then refused it as
+     * FF_PCM_LIMIT_EXCEEDED, which the caller can only report as a failure.
+     * The stream had in fact finished, so the flush must reach the phase
+     * machine and answer FF_PCM_DRAINED.
+     *
+     * This is deliberately narrow: only the no-input case is exempted. A
+     * convert with real input that reports 0 room is still a limit refusal,
+     * because there the caller has data that would be silently dropped. */
+    if (in_samples == 0 && bound == 0) {
+        *out_room = 0;
+        return 0;
+    }
+
     /* What swr already holds, in output samples so it compares with the
      * output block and with the caller's limit. Checked before the
      * conversion, against the samples this call may add, so the backlog can
