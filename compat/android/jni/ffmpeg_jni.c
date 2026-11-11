@@ -105,6 +105,110 @@ static JavaVM *g_vm = NULL;
 #define PTR(type, h) ((type)(intptr_t)(h))
 
 /* ------------------------------------------------------------------ */
+/* AVDictionary handle validation                                      */
+/*                                                                     */
+/* Java holds a dictionary as a jlong pointing at a calloc'ed          */
+/* AVDictionary** box. A stale or bogus value (freed box, wrong kind   */
+/* of pointer, a char* reused by the allocator) previously reached     */
+/* av_dict_get/av_dict_free unchecked and crashed inside libavutil,    */
+/* e.g. SIGSEGV at av_dict_get+28 dereferencing 0x00696863 ("ci").     */
+/* These helpers turn such a handle into a logged AVERROR(EINVAL).     */
+/* They deliberately do not abort on mismatch: reporting beats dying.  */
+/* ------------------------------------------------------------------ */
+
+#define FF_DICT_BOX_MAGIC 0x44494354u /* "DICT" */
+
+typedef struct FFDictBox {
+    uint32_t magic;         /* FF_DICT_BOX_MAGIC while the box is alive. */
+    uint32_t reserved;      /* Keeps the dictionary pointer 8-byte aligned. */
+    AVDictionary *dict;     /* May be NULL: an empty dictionary. */
+} FFDictBox;
+
+/* Boxes currently alive. A handle missing from this set was never created
+ * here (or has already been freed) and must never be dereferenced. */
+#define FF_DICT_REGISTRY_SLOTS 16
+static FFDictBox *g_dict_registry[FF_DICT_REGISTRY_SLOTS];
+static pthread_mutex_t g_dict_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int ff_dict_box_live(FFDictBox *box)
+{
+    int i;
+    int found = 0;
+    pthread_mutex_lock(&g_dict_registry_lock);
+    for (i = 0; i < FF_DICT_REGISTRY_SLOTS; i++) {
+        if (g_dict_registry[i] == box) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_dict_registry_lock);
+    return found;
+}
+
+/* Registers a freshly calloc'ed box.
+ *
+ * A slot is empty only when dictFree() cleared it: clearing the slot is what
+ * makes the (possibly reused) address unreachable, so reaping entries by
+ * poking at them would defeat the check. Full registry = calloc-free boxes
+ * leaked by Java; reporting beats dereferencing unverifiable handles. */
+static int ff_dict_box_register(FFDictBox *box)
+{
+    int i;
+    int slot = -1;
+    pthread_mutex_lock(&g_dict_registry_lock);
+    for (i = 0; i < FF_DICT_REGISTRY_SLOTS; i++) {
+        if (g_dict_registry[i] == NULL) {
+            g_dict_registry[i] = box;
+            slot = i;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_dict_registry_lock);
+    return slot >= 0;
+}
+
+static void ff_dict_box_unregister(FFDictBox *box)
+{
+    int i;
+    pthread_mutex_lock(&g_dict_registry_lock);
+    for (i = 0; i < FF_DICT_REGISTRY_SLOTS; i++) {
+        if (g_dict_registry[i] == box)
+            g_dict_registry[i] = NULL;
+    }
+    pthread_mutex_unlock(&g_dict_registry_lock);
+}
+
+/* Resolves a Java handle to a live box. NULL (with a log) when the value
+ * is not a box this library created and has not freed. `api` names the
+ * caller so a crash report alone identifies the offending entry point. */
+static FFDictBox *ff_dict_box_from_handle(jlong handle, const char *api)
+{
+    FFDictBox *box = PTR(FFDictBox *, handle);
+    if (!box)
+        return NULL;
+    /* The registry check comes first and must stay first: only a registered
+     * address is known to still be ours, so reading `box->magic` before it
+     * would be exactly the wild read this guard exists to prevent. */
+    if (!ff_dict_box_live(box)) {
+        __android_log_print(ANDROID_LOG_ERROR, "ffmpeg_jni",
+                            "%s: invalid AVDictionary handle 0x%08lx - not a live box "
+                            "(never created here, or already freed) - rejecting instead "
+                            "of dereferencing",
+                            api, (unsigned long)(intptr_t)box);
+        return NULL;
+    }
+    if (box->magic != FF_DICT_BOX_MAGIC) {
+        __android_log_print(ANDROID_LOG_ERROR, "ffmpeg_jni",
+                            "%s: AVDictionary box 0x%08lx has magic 0x%08x, expected 0x%08x "
+                            "- rejecting",
+                            api, (unsigned long)(intptr_t)box, box->magic,
+                            (unsigned)FF_DICT_BOX_MAGIC);
+        return NULL;
+    }
+    return box;
+}
+
+/* ------------------------------------------------------------------ */
 /* Video decoder diagnostics                                           */
 /*                                                                     */
 /* Two facts useful to a playback statistics overlay are not exposed   */
@@ -750,7 +854,18 @@ Java_org_ffmpeg_FFMpegNative_strerror(JNIEnv *env, jobject thiz, jint errnum)
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_dictCreate(JNIEnv *env, jobject thiz)
 {
-    AVDictionary **box = (AVDictionary **)calloc(1, sizeof(AVDictionary *));
+    FFDictBox *box = (FFDictBox *)calloc(1, sizeof(FFDictBox));
+    if (!box)
+        return 0;
+    box->magic = FF_DICT_BOX_MAGIC;
+    if (!ff_dict_box_register(box)) {
+        /* Registry full: refuse instead of handing out an unverifiable handle. */
+        __android_log_print(ANDROID_LOG_ERROR, "ffmpeg_jni",
+                            "dictCreate: handle registry full (%d slots), allocation refused",
+                            FF_DICT_REGISTRY_SLOTS);
+        free(box);
+        return 0;
+    }
     return (jlong)(intptr_t)box;
 }
 
@@ -758,12 +873,12 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_dictSet(JNIEnv *env, jobject thiz,
                                      jlong box, jstring key, jstring val, jint flags)
 {
-    AVDictionary **pp = PTR(AVDictionary **, box);
-    if (!pp || !key)
+    FFDictBox *holder = ff_dict_box_from_handle(box, "dictSet");
+    if (!holder || !key)
         return AVERROR(EINVAL);
     const char *k = (*env)->GetStringUTFChars(env, key, NULL);
     const char *v = val ? (*env)->GetStringUTFChars(env, val, NULL) : NULL;
-    int ret = av_dict_set(pp, k, v, flags);
+    int ret = av_dict_set(&holder->dict, k, v, flags);
     (*env)->ReleaseStringUTFChars(env, key, k);
     if (val)
         (*env)->ReleaseStringUTFChars(env, val, v);
@@ -774,10 +889,10 @@ JNIEXPORT jstring JNICALL
 Java_org_ffmpeg_FFMpegNative_dictGet(JNIEnv *env, jobject thiz,
                                      jlong box, jstring key, jint flags)
 {
-    AVDictionary **pp = PTR(AVDictionary **, box);
-    if (!pp || !key)
+    FFDictBox *holder = ff_dict_box_from_handle(box, "dictGet");
+    if (!holder || !key)
         return NULL;
-    AVDictionary *d = *pp;
+    AVDictionary *d = holder->dict;
     if (!d)
         return NULL;
     const char *k = (*env)->GetStringUTFChars(env, key, NULL);
@@ -789,18 +904,25 @@ Java_org_ffmpeg_FFMpegNative_dictGet(JNIEnv *env, jobject thiz,
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_dictCount(JNIEnv *env, jobject thiz, jlong box)
 {
-    AVDictionary **pp = PTR(AVDictionary **, box);
-    return pp ? (jint)av_dict_count(*pp) : 0;
+    FFDictBox *holder = ff_dict_box_from_handle(box, "dictCount");
+    return holder ? (jint)av_dict_count(holder->dict) : 0;
 }
 
 JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_dictFree(JNIEnv *env, jobject thiz, jlong box)
 {
-    AVDictionary **pp = PTR(AVDictionary **, box);
-    if (pp) {
-        av_dict_free(pp);
-        free(pp);
+    FFDictBox *holder = ff_dict_box_from_handle(box, "dictFree");
+    if (!holder) {
+        /* Double free / stale handle: the lookup already logged and logged the
+         * address. Return without touching the memory - the address may now
+         * belong to someone else (that is how a freed box turns into a
+         * "threads" string and crashes av_dict_get). */
+        return;
     }
+    av_dict_free(&holder->dict);
+    ff_dict_box_unregister(holder);
+    holder->magic = 0;
+    free(holder);
 }
 
 /* ------------------------------------------------------------------ */
@@ -821,7 +943,13 @@ Java_org_ffmpeg_FFMpegNative_formatOpenInput(JNIEnv *env, jobject thiz,
 {
     if (!url)
         return 0;
-    AVDictionary **opts = optionsBox ? PTR(AVDictionary **, optionsBox) : NULL;
+    FFDictBox *holder = NULL;
+    if (optionsBox) {
+        holder = ff_dict_box_from_handle(optionsBox, "formatOpenInput");
+        if (!holder)
+            return 0;
+    }
+    AVDictionary **opts = holder ? &holder->dict : NULL;
     AVFormatContext *ctx = NULL;
     const char *u = (*env)->GetStringUTFChars(env, url, NULL);
     int ret = avformat_open_input(&ctx, u, NULL, opts);
@@ -857,7 +985,13 @@ Java_org_ffmpeg_FFMpegNative_formatOpenInputWithInterrupt(JNIEnv *env, jobject t
 {
     if (!url)
         return 0;
-    AVDictionary **opts = optionsBox ? PTR(AVDictionary **, optionsBox) : NULL;
+    FFDictBox *holder = NULL;
+    if (optionsBox) {
+        holder = ff_dict_box_from_handle(optionsBox, "formatOpenInputWithInterrupt");
+        if (!holder)
+            return 0;
+    }
+    AVDictionary **opts = holder ? &holder->dict : NULL;
     FFInterruptFlag *f = flag ? PTR(FFInterruptFlag *, flag) : NULL;
     /* An already cancelled generation must not start DNS/TLS/probe work. */
     if (ff_jni_interrupt_cb(f))
@@ -3557,10 +3691,15 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_formatWriteHeader(JNIEnv *env, jobject thiz, jlong ctx, jlong optionsBox)
 {
     AVFormatContext *c = PTR(AVFormatContext *, ctx);
-    AVDictionary **opts = optionsBox ? PTR(AVDictionary **, optionsBox) : NULL;
+    FFDictBox *holder = NULL;
     if (!c)
         return AVERROR(EINVAL);
-    return (jint)avformat_write_header(c, opts);
+    if (optionsBox) {
+        holder = ff_dict_box_from_handle(optionsBox, "formatWriteHeader");
+        if (!holder)
+            return AVERROR(EINVAL);
+    }
+    return (jint)avformat_write_header(c, holder ? &holder->dict : NULL);
 }
 
 JNIEXPORT jint JNICALL
@@ -3682,11 +3821,11 @@ Java_org_ffmpeg_FFMpegNative_frameSetAudioFormat(JNIEnv *env, jobject thiz, jlon
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_dictCopy(JNIEnv *env, jobject thiz, jlong dstBox, jlong srcBox, jint flags)
 {
-    AVDictionary **dst = PTR(AVDictionary **, dstBox);
-    AVDictionary **src = srcBox ? PTR(AVDictionary **, srcBox) : NULL;
-    if (!dst)
+    FFDictBox *dstHolder = ff_dict_box_from_handle(dstBox, "dictCopy");
+    FFDictBox *srcHolder = srcBox ? ff_dict_box_from_handle(srcBox, "dictCopy(src)") : NULL;
+    if (!dstHolder || (srcBox && !srcHolder))
         return AVERROR(EINVAL);
-    return (jint)av_dict_copy(dst, src ? *src : NULL, flags);
+    return (jint)av_dict_copy(&dstHolder->dict, srcHolder ? srcHolder->dict : NULL, flags);
 }
 
 JNIEXPORT jlong JNICALL
@@ -4735,13 +4874,13 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_dictParseString(JNIEnv *env, jobject thiz,
                                              jlong box, jstring str, jstring keyValSep, jstring pairsSep, jint flags)
 {
-    AVDictionary **dst = PTR(AVDictionary **, box);
-    if (!dst || !str)
+    FFDictBox *holder = ff_dict_box_from_handle(box, "dictParseString");
+    if (!holder || !str)
         return AVERROR(EINVAL);
     const char *s = (*env)->GetStringUTFChars(env, str, NULL);
     const char *k = keyValSep ? (*env)->GetStringUTFChars(env, keyValSep, NULL) : NULL;
     const char *p = pairsSep ? (*env)->GetStringUTFChars(env, pairsSep, NULL) : NULL;
-    int ret = av_dict_parse_string(dst, s, k ? k : ":", p ? p : ",", flags);
+    int ret = av_dict_parse_string(&holder->dict, s, k ? k : ":", p ? p : ",", flags);
     (*env)->ReleaseStringUTFChars(env, str, s);
     if (k) (*env)->ReleaseStringUTFChars(env, keyValSep, k);
     if (p) (*env)->ReleaseStringUTFChars(env, pairsSep, p);
@@ -4751,13 +4890,13 @@ Java_org_ffmpeg_FFMpegNative_dictParseString(JNIEnv *env, jobject thiz,
 JNIEXPORT jstring JNICALL
 Java_org_ffmpeg_FFMpegNative_dictGetString(JNIEnv *env, jobject thiz, jlong box, jstring keyValSep, jstring pairsSep)
 {
-    AVDictionary **src = PTR(AVDictionary **, box);
-    if (!src)
+    FFDictBox *holder = ff_dict_box_from_handle(box, "dictGetString");
+    if (!holder)
         return NULL;
     char *buf = NULL;
     const char *k = keyValSep ? (*env)->GetStringUTFChars(env, keyValSep, NULL) : NULL;
     const char *p = pairsSep ? (*env)->GetStringUTFChars(env, pairsSep, NULL) : NULL;
-    int ret = av_dict_get_string(*src, &buf, k ? k[0] : ':', p ? p[0] : ',');
+    int ret = av_dict_get_string(holder->dict, &buf, k ? k[0] : ':', p ? p[0] : ',');
     if (k) (*env)->ReleaseStringUTFChars(env, keyValSep, k);
     if (p) (*env)->ReleaseStringUTFChars(env, pairsSep, p);
     jstring result = (ret == 0 && buf) ? (*env)->NewStringUTF(env, buf) : NULL;
@@ -4769,11 +4908,11 @@ Java_org_ffmpeg_FFMpegNative_dictGetString(JNIEnv *env, jobject thiz, jlong box,
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_dictIterate(JNIEnv *env, jobject thiz, jlong box, jlong prevHandle)
 {
-    AVDictionary **pp = PTR(AVDictionary **, box);
+    FFDictBox *holder = ff_dict_box_from_handle(box, "dictIterate");
     const AVDictionaryEntry *prev = PTR(const AVDictionaryEntry *, prevHandle);
-    if (!pp)
+    if (!holder)
         return 0;
-    return (jlong)(intptr_t)av_dict_iterate(*pp, prev);
+    return (jlong)(intptr_t)av_dict_iterate(holder->dict, prev);
 }
 
 JNIEXPORT jstring JNICALL
@@ -5785,10 +5924,17 @@ Java_org_ffmpeg_FFMpegNative_formatFindStreamInfoOpts(JNIEnv *env, jobject thiz,
                                                       jlong ctx, jlong optionsBox)
 {
     AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FFDictBox *holder = NULL;
     if (!c)
         return AVERROR(EINVAL);
-    AVDictionary **opts = optionsBox ? PTR(AVDictionary **, optionsBox) : NULL;
-    return (jint)avformat_find_stream_info(c, opts);
+    /* NULL box = "default probe options". A non-NULL value must be a live box,
+     * otherwise avformat_find_stream_info would hand it to av_dict_get. */
+    if (optionsBox) {
+        holder = ff_dict_box_from_handle(optionsBox, "formatFindStreamInfoOpts");
+        if (!holder)
+            return AVERROR(EINVAL);
+    }
+    return (jint)avformat_find_stream_info(c, holder ? &holder->dict : NULL);
 }
 
 JNIEXPORT jint JNICALL
@@ -6149,11 +6295,11 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_dictSetInt(JNIEnv *env, jobject thiz,
                                         jlong box, jstring key, jlong value, jint flags)
 {
-    AVDictionary **pp = PTR(AVDictionary **, box);
-    if (!pp || !key)
+    FFDictBox *holder = ff_dict_box_from_handle(box, "dictSetInt");
+    if (!holder || !key)
         return AVERROR(EINVAL);
     const char *k = (*env)->GetStringUTFChars(env, key, NULL);
-    int ret = av_dict_set_int(pp, k, (int64_t)value, flags);
+    int ret = av_dict_set_int(&holder->dict, k, (int64_t)value, flags);
     (*env)->ReleaseStringUTFChars(env, key, k);
     return ret;
 }
@@ -6241,10 +6387,16 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_optSetDict(JNIEnv *env, jobject thiz, jlong obj, jlong optionsBox)
 {
     void *o = PTR(void *, obj);
-    AVDictionary **opts = optionsBox ? PTR(AVDictionary **, optionsBox) : NULL;
+    FFDictBox *holder = NULL;
     if (!o)
         return AVERROR(EINVAL);
-    return (jint)av_opt_set_dict(o, opts);
+    if (optionsBox) {
+        holder = ff_dict_box_from_handle(optionsBox, "optSetDict");
+        if (!holder)
+            return AVERROR(EINVAL);
+    }
+    /* av_opt_set_dict() empties the dictionary in place; the box stays valid. */
+    return (jint)av_opt_set_dict(o, holder ? &holder->dict : NULL);
 }
 
 /* av_opt_copy: dest must be allocated (e.g. av_mallocz) but uninitialized */
@@ -6315,10 +6467,15 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_filterInitDict(JNIEnv *env, jobject thiz, jlong ctx, jlong optionsBox)
 {
     AVFilterContext *c = PTR(AVFilterContext *, ctx);
+    FFDictBox *holder = NULL;
     if (!c)
         return AVERROR(EINVAL);
-    AVDictionary **opts = optionsBox ? PTR(AVDictionary **, optionsBox) : NULL;
-    return (jint)avfilter_init_dict(c, opts);
+    if (optionsBox) {
+        holder = ff_dict_box_from_handle(optionsBox, "filterInitDict");
+        if (!holder)
+            return AVERROR(EINVAL);
+    }
+    return (jint)avfilter_init_dict(c, holder ? &holder->dict : NULL);
 }
 
 /* nb_channels of the channel layout negotiated on a link */
@@ -6825,7 +6982,13 @@ Java_org_ffmpeg_FFMpegNative_formatOpenInputFmt(JNIEnv *env, jobject thiz,
     if (!url)
         return 0;
     const AVInputFormat *ifmt = inputFmt ? PTR(const AVInputFormat *, inputFmt) : NULL;
-    AVDictionary **opts = optionsBox ? PTR(AVDictionary **, optionsBox) : NULL;
+    FFDictBox *holder = NULL;
+    if (optionsBox) {
+        holder = ff_dict_box_from_handle(optionsBox, "formatOpenInputFmt");
+        if (!holder)
+            return 0;
+    }
+    AVDictionary **opts = holder ? &holder->dict : NULL;
     AVFormatContext *ctx = NULL;
     const char *u = (*env)->GetStringUTFChars(env, url, NULL);
     int ret = avformat_open_input(&ctx, u, ifmt, opts);
