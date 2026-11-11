@@ -107,13 +107,13 @@ static JavaVM *g_vm = NULL;
 /* ------------------------------------------------------------------ */
 /* AVDictionary handle validation                                      */
 /*                                                                     */
-/* Java holds a dictionary as a jlong pointing at a calloc'ed          */
-/* AVDictionary** box. A stale or bogus value (freed box, wrong kind   */
-/* of pointer, a char* reused by the allocator) previously reached     */
-/* av_dict_get/av_dict_free unchecked and crashed inside libavutil,    */
-/* e.g. SIGSEGV at av_dict_get+28 dereferencing 0x00696863 ("ci").     */
-/* These helpers turn such a handle into a logged AVERROR(EINVAL).     */
-/* They deliberately do not abort on mismatch: reporting beats dying.  */
+/* Java holds a dictionary as a jlong. Historically that was a calloc'ed */
+/* AVDictionary** box, so a stale or bogus value (freed box, wrong kind */
+/* of pointer, an 8-byte block the allocator handed out again) reached  */
+/* av_dict_get/av_dict_free unchecked and crashed inside libavutil:    */
+/* SIGSEGV at av_dict_get+28 reading 0x00696863, then av_dict_free+32   */
+/* on the very same fault address. These helpers turn such a handle    */
+/* into a logged AVERROR(EINVAL); they never abort on mismatch.        */
 /* ------------------------------------------------------------------ */
 
 #define FF_DICT_BOX_MAGIC 0x44494354u /* "DICT" */
@@ -124,88 +124,142 @@ typedef struct FFDictBox {
     AVDictionary *dict;     /* May be NULL: an empty dictionary. */
 } FFDictBox;
 
-/* Boxes currently alive. A handle missing from this set was never created
- * here (or has already been freed) and must never be dereferenced. */
-#define FF_DICT_REGISTRY_SLOTS 16
-static FFDictBox *g_dict_registry[FF_DICT_REGISTRY_SLOTS];
-static pthread_mutex_t g_dict_registry_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static int ff_dict_box_live(FFDictBox *box)
-{
-    int i;
-    int found = 0;
-    pthread_mutex_lock(&g_dict_registry_lock);
-    for (i = 0; i < FF_DICT_REGISTRY_SLOTS; i++) {
-        if (g_dict_registry[i] == box) {
-            found = 1;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_dict_registry_lock);
-    return found;
-}
-
-/* Registers a freshly calloc'ed box.
+/* Boxes come from a fixed arena, never from malloc.
  *
- * A slot is empty only when dictFree() cleared it: clearing the slot is what
- * makes the (possibly reused) address unreachable, so reaping entries by
- * poking at them would defeat the check. Full registry = calloc-free boxes
- * leaked by Java; reporting beats dereferencing unverifiable handles. */
-static int ff_dict_box_register(FFDictBox *box)
+ * Why it matters: a freed box address used to be immediately available for the
+ * allocator to hand out again (a 2-word block is exactly what an 8-byte string
+ * buffer asks for). A late second release then walked that memory as a
+ * dictionary and crashed in av_dict_free. With the arena the address stays
+ * "ours but dead", which the generation flags below report instead of trusting
+ * the contents. Slots are reused only by a *new* dictCreate(). */
+#define FF_DICT_SLOTS 16
+static FFDictBox g_dict_arena[FF_DICT_SLOTS];   /* zeroed: BSS */
+static int g_dict_live[FF_DICT_SLOTS];          /* 0 = slot never used/freed */
+static uint32_t g_dict_epoch[FF_DICT_SLOTS];    /* bumped on every release */
+static pthread_mutex_t g_dict_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Live box count, exposed in logs only. */
+static int g_dict_live_count;
+
+/* Slot of a handle, or -1 when the address is not one of our slots. */
+static int ff_dict_slot_of(jlong handle)
 {
+    uintptr_t base = (uintptr_t)&g_dict_arena[0];
+    uintptr_t addr = (uintptr_t)PTR(void *, handle);
+    uintptr_t first = (uintptr_t)&g_dict_arena[0].magic;
+    if (addr < first)
+        return -1;
+    if (((addr - first) % sizeof(FFDictBox)) != 0)
+        return -1;
+    if ((addr - base) / sizeof(FFDictBox) >= FF_DICT_SLOTS)
+        return -1;
+    return (int)((addr - base) / sizeof(FFDictBox));
+}
+
+/* Grabs a free slot. Never returns a slot that is still live. */
+static FFDictBox *ff_dict_box_alloc(void)
+{
+    FFDictBox *box = NULL;
     int i;
-    int slot = -1;
-    pthread_mutex_lock(&g_dict_registry_lock);
-    for (i = 0; i < FF_DICT_REGISTRY_SLOTS; i++) {
-        if (g_dict_registry[i] == NULL) {
-            g_dict_registry[i] = box;
-            slot = i;
+    pthread_mutex_lock(&g_dict_lock);
+    for (i = 0; i < FF_DICT_SLOTS; i++) {
+        if (!g_dict_live[i]) {
+            g_dict_live[i] = 1;
+            g_dict_epoch[i]++;
+            g_dict_live_count++;
+            box = &g_dict_arena[i];
             break;
         }
     }
-    pthread_mutex_unlock(&g_dict_registry_lock);
-    return slot >= 0;
-}
-
-static void ff_dict_box_unregister(FFDictBox *box)
-{
-    int i;
-    pthread_mutex_lock(&g_dict_registry_lock);
-    for (i = 0; i < FF_DICT_REGISTRY_SLOTS; i++) {
-        if (g_dict_registry[i] == box)
-            g_dict_registry[i] = NULL;
+    pthread_mutex_unlock(&g_dict_lock);
+    if (box) {
+        box->magic = FF_DICT_BOX_MAGIC;
+        box->dict = NULL;
     }
-    pthread_mutex_unlock(&g_dict_registry_lock);
+    return box;
 }
 
-/* Resolves a Java handle to a live box. NULL (with a log) when the value
- * is not a box this library created and has not freed. `api` names the
- * caller so a crash report alone identifies the offending entry point. */
-static FFDictBox *ff_dict_box_from_handle(jlong handle, const char *api)
+/* Releases a live generation. The slot stays in the arena so the address is
+ * never re-used by malloc for something else. */
+static void ff_dict_box_release(FFDictBox *box)
 {
-    FFDictBox *box = PTR(FFDictBox *, handle);
-    if (!box)
+    int slot = ff_dict_slot_of((jlong)(intptr_t)box);
+    if (slot < 0)
+        return;
+    box->magic = 0;
+    box->dict = NULL;
+    pthread_mutex_lock(&g_dict_lock);
+    g_dict_live[slot] = 0;
+    g_dict_epoch[slot]++;
+    g_dict_live_count--;
+    pthread_mutex_unlock(&g_dict_lock);
+}
+
+/* Classifies a Java handle. Returns the box only in OK state; why it failed is
+ * left in *slot_out / *epoch_out / *state_out for the caller to log. */
+typedef enum {
+    FF_DICT_OK = 0,
+    FF_DICT_NOT_A_SLOT,
+    FF_DICT_NOT_LIVE,
+    FF_DICT_BAD_MAGIC,
+} FFDictHandleState;
+
+static FFDictBox *ff_dict_resolve(jlong handle, int *slot_out, uint32_t *epoch_out,
+                                  FFDictHandleState *state_out)
+{
+    int slot;
+    FFDictBox *box;
+    int live;
+    *slot_out = -1;
+    *epoch_out = 0;
+    if (!handle) {
+        *state_out = FF_DICT_NOT_A_SLOT;
         return NULL;
-    /* The registry check comes first and must stay first: only a registered
-     * address is known to still be ours, so reading `box->magic` before it
-     * would be exactly the wild read this guard exists to prevent. */
-    if (!ff_dict_box_live(box)) {
-        __android_log_print(ANDROID_LOG_ERROR, "ffmpeg_jni",
-                            "%s: invalid AVDictionary handle 0x%08lx - not a live box "
-                            "(never created here, or already freed) - rejecting instead "
-                            "of dereferencing",
-                            api, (unsigned long)(intptr_t)box);
+    }
+    slot = ff_dict_slot_of(handle);
+    if (slot < 0) {
+        *state_out = FF_DICT_NOT_A_SLOT;
+        return NULL;
+    }
+    box = &g_dict_arena[slot];
+    *slot_out = slot;
+    pthread_mutex_lock(&g_dict_lock);
+    live = g_dict_live[slot];
+    *epoch_out = g_dict_epoch[slot];
+    pthread_mutex_unlock(&g_dict_lock);
+    if (!live) {
+        *state_out = FF_DICT_NOT_LIVE;
         return NULL;
     }
     if (box->magic != FF_DICT_BOX_MAGIC) {
-        __android_log_print(ANDROID_LOG_ERROR, "ffmpeg_jni",
-                            "%s: AVDictionary box 0x%08lx has magic 0x%08x, expected 0x%08x "
-                            "- rejecting",
-                            api, (unsigned long)(intptr_t)box, box->magic,
-                            (unsigned)FF_DICT_BOX_MAGIC);
+        *state_out = FF_DICT_BAD_MAGIC;
         return NULL;
     }
+    *state_out = FF_DICT_OK;
     return box;
+}
+
+/* Resolves a Java handle to a live box. NULL (with a log) when the value
+ * is not a slot of our arena at all, or is a slot whose current generation
+ * was already released. `api` names the caller so a single logcat line
+ * identifies the offending entry point. */
+static FFDictBox *ff_dict_box_from_handle(jlong handle, const char *api)
+{
+    int slot;
+    uint32_t epoch;
+    FFDictHandleState state;
+    FFDictBox *box = ff_dict_resolve(handle, &slot, &epoch, &state);
+    if (box)
+        return box;
+    __android_log_print(ANDROID_LOG_ERROR, "ffmpeg_jni",
+                        "%s: AVDictionary handle 0x%08lx rejected: %s (slot=%d epoch=%u "
+                        "liveCount=%d)",
+                        api, (unsigned long)(intptr_t)PTR(void *, handle),
+                        state == FF_DICT_NOT_LIVE ? "not live (never created or already freed)"
+                            : state == FF_DICT_BAD_MAGIC ? "magic mismatch"
+                            : "not an arena slot",
+                        slot, (unsigned)epoch, g_dict_live_count);
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -854,16 +908,13 @@ Java_org_ffmpeg_FFMpegNative_strerror(JNIEnv *env, jobject thiz, jint errnum)
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_dictCreate(JNIEnv *env, jobject thiz)
 {
-    FFDictBox *box = (FFDictBox *)calloc(1, sizeof(FFDictBox));
-    if (!box)
-        return 0;
-    box->magic = FF_DICT_BOX_MAGIC;
-    if (!ff_dict_box_register(box)) {
-        /* Registry full: refuse instead of handing out an unverifiable handle. */
+    FFDictBox *box = ff_dict_box_alloc();
+    if (!box) {
+        /* All slots live: boxes leaked by Java. Refuse instead of handing out
+         * a handle that cannot be verified on the way back. */
         __android_log_print(ANDROID_LOG_ERROR, "ffmpeg_jni",
-                            "dictCreate: handle registry full (%d slots), allocation refused",
-                            FF_DICT_REGISTRY_SLOTS);
-        free(box);
+                            "dictCreate: arena full (%d slots live), allocation refused",
+                            FF_DICT_SLOTS);
         return 0;
     }
     return (jlong)(intptr_t)box;
@@ -878,7 +929,18 @@ Java_org_ffmpeg_FFMpegNative_dictSet(JNIEnv *env, jobject thiz,
         return AVERROR(EINVAL);
     const char *k = (*env)->GetStringUTFChars(env, key, NULL);
     const char *v = val ? (*env)->GetStringUTFChars(env, val, NULL) : NULL;
-    int ret = av_dict_set(&holder->dict, k, v, flags);
+    /* AVDictionary values live in libavutil-allocated memory. Passing JNI
+     * scratch pointers (GetStringUTFChars) as READONLY would leave the entry
+     * pointing into a released VM buffer, and av_opt_set_dict() later *writes*
+     * through those pointers (that is where the av_dict_free/av_strdup pair
+     * blew up). Never hand a JNI string to libavutil: duplicate first. */
+    char *kcopy = k ? av_strdup(k) : NULL;
+    char *vcopy = v ? av_strdup(v) : NULL;
+    int ret = AVERROR(ENOMEM);
+    if (kcopy && (v == NULL || vcopy))
+        ret = av_dict_set(&holder->dict, kcopy, vcopy, flags);
+    av_free(kcopy);
+    av_free(vcopy);
     (*env)->ReleaseStringUTFChars(env, key, k);
     if (val)
         (*env)->ReleaseStringUTFChars(env, val, v);
@@ -913,16 +975,17 @@ Java_org_ffmpeg_FFMpegNative_dictFree(JNIEnv *env, jobject thiz, jlong box)
 {
     FFDictBox *holder = ff_dict_box_from_handle(box, "dictFree");
     if (!holder) {
-        /* Double free / stale handle: the lookup already logged and logged the
-         * address. Return without touching the memory - the address may now
-         * belong to someone else (that is how a freed box turns into a
-         * "threads" string and crashes av_dict_get). */
+        /* Not the live generation of this slot. It may be a late duplicate
+         * release of a box that has already been freed - that is the normal
+         * shape of a double free, and the old code crashed here inside
+         * av_dict_free on the very same address. Reporting beats dying. */
+        __android_log_print(ANDROID_LOG_WARN, "ffmpeg_jni",
+                            "dictFree: handle 0x%08lx is not live (double free?) liveCount=%d",
+                            (unsigned long)(intptr_t)PTR(void *, box), g_dict_live_count);
         return;
     }
     av_dict_free(&holder->dict);
-    ff_dict_box_unregister(holder);
-    holder->magic = 0;
-    free(holder);
+    ff_dict_box_release(holder);
 }
 
 /* ------------------------------------------------------------------ */
@@ -6299,7 +6362,11 @@ Java_org_ffmpeg_FFMpegNative_dictSetInt(JNIEnv *env, jobject thiz,
     if (!holder || !key)
         return AVERROR(EINVAL);
     const char *k = (*env)->GetStringUTFChars(env, key, NULL);
-    int ret = av_dict_set_int(&holder->dict, k, (int64_t)value, flags);
+    /* Same reason as dictSet(): the key must outlive the JNI scratch copy. */
+    char *kcopy = k ? av_strdup(k) : NULL;
+    int ret = kcopy ? av_dict_set_int(&holder->dict, kcopy, (int64_t)value, flags)
+                    : AVERROR(ENOMEM);
+    av_free(kcopy);
     (*env)->ReleaseStringUTFChars(env, key, k);
     return ret;
 }
