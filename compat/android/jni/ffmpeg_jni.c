@@ -1329,7 +1329,7 @@ Java_org_ffmpeg_FFMpegNative_codecSendPacket(JNIEnv *env, jobject thiz, jlong co
 }
 
 JNIEXPORT jint JNICALL
-Java_org_ffmpeg_FFmpegNative_codecReceiveFrame(JNIEnv *env, jobject thiz, jlong codecCtx, jlong frame)
+Java_org_ffmpeg_FFMpegNative_codecReceiveFrame(JNIEnv *env, jobject thiz, jlong codecCtx, jlong frame)
 {
     AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
     AVFrame *f = PTR(AVFrame *, frame);
