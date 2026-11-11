@@ -1031,6 +1031,8 @@ typedef struct FFTestJniState {
     jbyte last_byte[FFTEST_OUT_CAP_MAX];  /* what SetByteArrayRegion wrote */
     int   last_byte_len;                  /* bytes written, -1 if never  */
     int   last_status;                    /* what SetIntArrayRegion wrote */
+    jlong last_long[16];                  /* what SetLongArrayRegion wrote */
+    int   last_long_len;                  /* elements written, -1 if never */
     int   exception;                      /* a pending exception is set   */
     int   calls;                          /* completed Set*Region calls    */
     int   fail_publish;                   /* inject: Set*Region raises    */
@@ -1059,6 +1061,7 @@ static void fftest_jni_reset(void)
 {
     memset(&g_fftest_jni, 0, sizeof(g_fftest_jni));
     g_fftest_jni.last_byte_len = -1;
+    g_fftest_jni.last_long_len = -1;
 }
 
 static int fftest_last_status(void)
@@ -1153,6 +1156,35 @@ static void fftest_set_int_region(JNIEnv *env, jintArray a, jsize start,
     g_fftest_jni.calls++;
 }
 
+static void fftest_set_long_region(JNIEnv *env, jlongArray a, jsize start,
+                                   jsize len, const jlong *buf)
+{
+    FFTestJniArray *arr = (FFTestJniArray *)(void *)a;
+    size_t n;
+
+    (void)env;
+    if (!arr || start < 0 || len < 0 ||
+        (size_t)len * sizeof(jlong) > arr->capacity ||
+        (size_t)start * sizeof(jlong) > arr->capacity - (size_t)len * sizeof(jlong)) {
+        fftest_raise_exception(env);
+        return;
+    }
+    if (g_fftest_jni.fail_publish) {
+        fftest_raise_exception(env);
+        return;
+    }
+    if (len > 0) {
+        n = (size_t)len;
+        if (n > sizeof(g_fftest_jni.last_long) / sizeof(g_fftest_jni.last_long[0]))
+            n = sizeof(g_fftest_jni.last_long) / sizeof(g_fftest_jni.last_long[0]);
+        memcpy(g_fftest_jni.last_long, buf, n * sizeof(jlong));
+        g_fftest_jni.last_long_len = len;
+    } else {
+        g_fftest_jni.last_long_len = 0;
+    }
+    g_fftest_jni.calls++;
+}
+
 static jbyteArray fftest_new_byte_array(jsize len)
 {
     return (jbyteArray)(void *)fftest_array_alloc(len, sizeof(jbyte));
@@ -1161,6 +1193,11 @@ static jbyteArray fftest_new_byte_array(jsize len)
 static jintArray fftest_new_int_array(jsize len)
 {
     return (jintArray)(void *)fftest_array_alloc(len, sizeof(jint));
+}
+
+static jlongArray fftest_new_long_array(jsize len)
+{
+    return (jlongArray)(void *)fftest_array_alloc(len, sizeof(jlong));
 }
 
 static jthrowable fftest_exception_occurred(JNIEnv *env)
@@ -1179,8 +1216,9 @@ static void fftest_exception_clear(JNIEnv *env)
  * and only the implemented slots are filled, so an entry point nobody
  * stubbed is a NULL call rather than a compile error in the test: this list
  * is the contract. The wrappers under test use GetArrayLength,
- * ExceptionCheck and the two Set*ArrayRegion; the others are stubbed because
- * the wrappers are expected to keep using exactly these and nothing more. */
+ * ExceptionCheck and the three Set*ArrayRegion; the others are stubbed
+ * because the wrappers are expected to keep using exactly these and nothing
+ * more. */
 static struct JNINativeInterface g_fftest_functions;
 
 static void fftest_init_functions(void)
@@ -1193,6 +1231,7 @@ static void fftest_init_functions(void)
     g_fftest_functions.ThrowNew           = fftest_throw_new;
     g_fftest_functions.SetByteArrayRegion = fftest_set_byte_region;
     g_fftest_functions.SetIntArrayRegion  = fftest_set_int_region;
+    g_fftest_functions.SetLongArrayRegion = fftest_set_long_region;
 }
 
 /* JNIEnv is a pointer TYPE, not a struct: jni.h declares
@@ -2356,7 +2395,7 @@ static void test_release_capabilities(void)
     CHECK(Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(NULL, NULL) ==
           FF_JNI_BRIDGE_API_VERSION);
     CHECK(FF_JNI_BRIDGE_API_MAJOR == 1);
-    CHECK(FF_JNI_BRIDGE_API_MINOR == 3);
+    CHECK(FF_JNI_BRIDGE_API_MINOR == 4);
 
     /* Promised by this release, each with a test set behind it. */
     CHECK(caps & FF_JNI_CAP_PCM_SESSION_SAFE_V2);
@@ -2371,6 +2410,12 @@ static void test_release_capabilities(void)
      * because that suite runs in the same binary. */
     CHECK(caps & FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO);
     CHECK(caps & FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO);
+    /* The 1.4 diagnostics: the component-name query and the counter
+     * snapshot. Both have entry points in ffmpeg_jni.c; the snapshot is
+     * driven below, and the component-name entry point's refusal paths are
+     * driven there too (its positive path needs a live platform MediaCodec). */
+    CHECK(caps & FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME);
+    CHECK(caps & FF_JNI_CAP_VIDEO_DECODE_STATS);
 
     /* NOT promised: batch B is deferred. This is the assertion that must
      * fail first if a later change starts advertising scoped accounting
@@ -2398,7 +2443,9 @@ static void test_release_capabilities(void)
                             FF_JNI_CAP_PCM_SESSION_SAFE_V2 |
                             FF_JNI_CAP_RENDERER_SAFE_CLOSE |
                             FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO |
-                            FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO;
+                            FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO |
+                            FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME |
+                            FF_JNI_CAP_VIDEO_DECODE_STATS;
 
         CHECK((caps & ~known) == 0);
     }
@@ -2412,10 +2459,185 @@ static void test_release_capabilities(void)
     CHECK(FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO == (1LL << 9));
     CHECK(FF_JNI_CAP_AUDIO_PROBE_POLICY == (1LL << 10));
     CHECK(FF_JNI_CAP_AUDIO_PROBE_STATS == (1LL << 11));
+    CHECK(FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME == (1LL << 12));
+    CHECK(FF_JNI_CAP_VIDEO_DECODE_STATS == (1LL << 13));
 
     /* The whole mask for this release, written out once so an unannounced
      * bit is a test failure rather than a silent contract change. */
-    CHECK(caps == (jlong)0x37f);
+    CHECK(caps == (jlong)0x337f);
+}
+
+/* ------------------------------------------------------------------ */
+/* 1.4 video diagnostics                                               */
+/*                                                                     */
+/* videoCodecComponentName() must never invent an answer: a null       */
+/* handle, a software decoder, a MediaCodec encoder and an unopened    */
+/* context all answer NULL. The positive component path needs a live   */
+/* platform MediaCodec and stays a device-gate item.                   */
+/*                                                                     */
+/* videoDecodeStats() must fill the frozen schema from a per-context   */
+/* entry, keep two contexts independent, and refuse a short array or   */
+/* len before writing anything. No codec is opened here, so this runs  */
+/* on any ABI without a device.                                        */
+/* ------------------------------------------------------------------ */
+
+static void test_video_diagnostics(void)
+{
+    JNIEnv env = fftest_jni_env();
+    const AVCodec *sw, *mc, *enc;
+    AVCodecContext *sw_cc = NULL, *mc_cc = NULL, *mc2_cc = NULL;
+    jlongArray out;
+    jlong *values = g_fftest_jni.last_long;
+    int ret;
+
+    /* A null handle is not a decoder and must not be dereferenced. */
+    CHECK(Java_org_ffmpeg_FFMpegNative_videoCodecComponentName(
+              NULL, NULL, 0) == NULL);
+
+    /* A native software decoder is not a MediaCodec decoder. */
+    sw = avcodec_find_decoder_by_name("h264");
+    if (!sw)
+        sw = avcodec_find_decoder(AV_CODEC_ID_H264);
+    if (sw && !sw->wrapper_name) {
+        sw_cc = (AVCodecContext *)(intptr_t)
+                Java_org_ffmpeg_FFMpegNative_allocCodecContext(
+                    NULL, NULL, (jlong)(intptr_t)sw);
+        CHECK(sw_cc != NULL);
+        if (sw_cc) {
+            CHECK(Java_org_ffmpeg_FFMpegNative_videoCodecComponentName(
+                      NULL, NULL, (jlong)(intptr_t)sw_cc) == NULL);
+
+            fftest_jni_reset();
+            out = fftest_new_long_array(FF_JNI_VIDEO_DECODE_STATS_SLOTS);
+            CHECK(out != NULL);
+            CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_videoDecodeStats(
+                              &env, NULL, (jlong)(intptr_t)sw_cc, out,
+                              FF_JNI_VIDEO_DECODE_STATS_SLOTS), EINVAL);
+            CHECK(g_fftest_jni.last_long_len == -1);
+
+            Java_org_ffmpeg_FFMpegNative_codecFreeContext(
+                NULL, NULL, (jlong)(intptr_t)sw_cc);
+        }
+    }
+
+    /* The mediacodec encoder shares the wrapper name but is not a decoder. */
+    enc = avcodec_find_encoder_by_name("h264_mediacodec");
+    if (enc) {
+        AVCodecContext *enc_cc = (AVCodecContext *)(intptr_t)
+                Java_org_ffmpeg_FFMpegNative_allocCodecContext(
+                    NULL, NULL, (jlong)(intptr_t)enc);
+        CHECK(enc_cc != NULL);
+        if (enc_cc) {
+            CHECK(Java_org_ffmpeg_FFMpegNative_videoCodecComponentName(
+                      NULL, NULL, (jlong)(intptr_t)enc_cc) == NULL);
+
+            fftest_jni_reset();
+            out = fftest_new_long_array(FF_JNI_VIDEO_DECODE_STATS_SLOTS);
+            CHECK(out != NULL);
+            CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_videoDecodeStats(
+                              &env, NULL, (jlong)(intptr_t)enc_cc, out,
+                              FF_JNI_VIDEO_DECODE_STATS_SLOTS), EINVAL);
+            CHECK(g_fftest_jni.last_long_len == -1);
+
+            Java_org_ffmpeg_FFMpegNative_codecFreeContext(
+                NULL, NULL, (jlong)(intptr_t)enc_cc);
+        }
+    }
+
+    mc = avcodec_find_decoder_by_name("h264_mediacodec");
+    if (!mc)
+        return;                     /* this build has no mediacodec decoder */
+
+    mc_cc = (AVCodecContext *)(intptr_t)
+            Java_org_ffmpeg_FFMpegNative_allocCodecContext(
+                NULL, NULL, (jlong)(intptr_t)mc);
+    CHECK(mc_cc != NULL);
+    if (!mc_cc)
+        return;
+
+    /* Allocated but not opened: the platform has not chosen a component. */
+    CHECK(Java_org_ffmpeg_FFMpegNative_videoCodecComponentName(
+              NULL, NULL, (jlong)(intptr_t)mc_cc) == NULL);
+
+    /* Fresh snapshot: schema v1, zeroed counters, unknown bit rate. */
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_VIDEO_DECODE_STATS_SLOTS);
+    CHECK(out != NULL);
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_videoDecodeStats(
+                 &env, NULL, (jlong)(intptr_t)mc_cc, out,
+                 FF_JNI_VIDEO_DECODE_STATS_SLOTS));
+    CHECK(g_fftest_jni.last_long_len == FF_JNI_VIDEO_DECODE_STATS_SLOTS);
+    CHECK(values[FF_JNI_VIDEO_STATS_SCHEMA_VERSION_SLOT] ==
+          FF_JNI_VIDEO_STATS_SCHEMA_VERSION);
+    CHECK(values[FF_JNI_VIDEO_STATS_DECODED_FRAMES] == 0);
+    CHECK(values[FF_JNI_VIDEO_STATS_RENDERED_FRAMES] == 0);
+    CHECK(values[FF_JNI_VIDEO_STATS_DROPPED_FRAMES] == 0);
+    CHECK(values[FF_JNI_VIDEO_STATS_DECODE_ERRORS] == 0);
+    CHECK(values[FF_JNI_VIDEO_STATS_CURRENT_BITRATE] == 0);
+
+    /* Counters advance independently, and the snapshot reports them. */
+    ff_video_stats_add(mc_cc, FF_VIDEO_STAT_DECODED);
+    ff_video_stats_add(mc_cc, FF_VIDEO_STAT_RENDERED);
+    ff_video_stats_add(mc_cc, FF_VIDEO_STAT_RENDERED);
+    ff_video_stats_add(mc_cc, FF_VIDEO_STAT_DROPPED);
+    ff_video_stats_add(mc_cc, FF_VIDEO_STAT_ERROR);
+    mc_cc->bit_rate = 123456;
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_VIDEO_DECODE_STATS_SLOTS);
+    CHECK(out != NULL);
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_videoDecodeStats(
+                 &env, NULL, (jlong)(intptr_t)mc_cc, out,
+                 FF_JNI_VIDEO_DECODE_STATS_SLOTS));
+    CHECK(values[FF_JNI_VIDEO_STATS_DECODED_FRAMES] == 1);
+    CHECK(values[FF_JNI_VIDEO_STATS_RENDERED_FRAMES] == 2);
+    CHECK(values[FF_JNI_VIDEO_STATS_DROPPED_FRAMES] == 1);
+    CHECK(values[FF_JNI_VIDEO_STATS_DECODE_ERRORS] == 1);
+    CHECK(values[FF_JNI_VIDEO_STATS_CURRENT_BITRATE] == 123456);
+
+    /* A second context must not see the first one's counters. */
+    mc2_cc = (AVCodecContext *)(intptr_t)
+             Java_org_ffmpeg_FFMpegNative_allocCodecContext(
+                 NULL, NULL, (jlong)(intptr_t)mc);
+    CHECK(mc2_cc != NULL);
+    if (mc2_cc) {
+        fftest_jni_reset();
+        out = fftest_new_long_array(FF_JNI_VIDEO_DECODE_STATS_SLOTS);
+        CHECK(out != NULL);
+        CHECK_OK(Java_org_ffmpeg_FFMpegNative_videoDecodeStats(
+                     &env, NULL, (jlong)(intptr_t)mc2_cc, out,
+                     FF_JNI_VIDEO_DECODE_STATS_SLOTS));
+        CHECK(values[FF_JNI_VIDEO_STATS_DECODED_FRAMES] == 0);
+        CHECK(values[FF_JNI_VIDEO_STATS_RENDERED_FRAMES] == 0);
+        CHECK(values[FF_JNI_VIDEO_STATS_DROPPED_FRAMES] == 0);
+    }
+
+    /* A short caller length or Java array is refused before any write. */
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_VIDEO_DECODE_STATS_SLOTS);
+    CHECK(out != NULL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_videoDecodeStats(
+                      &env, NULL, (jlong)(intptr_t)mc_cc, out,
+                      FF_JNI_VIDEO_DECODE_STATS_SLOTS - 1), EINVAL);
+    CHECK(g_fftest_jni.last_long_len == -1);
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_VIDEO_DECODE_STATS_SLOTS - 1);
+    CHECK(out != NULL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_videoDecodeStats(
+                      &env, NULL, (jlong)(intptr_t)mc_cc, out,
+                      FF_JNI_VIDEO_DECODE_STATS_SLOTS), EINVAL);
+    CHECK(g_fftest_jni.last_long_len == -1);
+
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_videoDecodeStats(
+                      &env, NULL, (jlong)(intptr_t)mc_cc, NULL,
+                      FF_JNI_VIDEO_DECODE_STATS_SLOTS), EINVAL);
+
+    if (mc2_cc)
+        Java_org_ffmpeg_FFMpegNative_codecFreeContext(
+            NULL, NULL, (jlong)(intptr_t)mc2_cc);
+    Java_org_ffmpeg_FFMpegNative_codecFreeContext(
+        NULL, NULL, (jlong)(intptr_t)mc_cc);
 }
 
 /* BuildInfo must be well-formed JSON with every field present, and any field
@@ -3381,6 +3603,7 @@ int main(void)
     test_pcm_publish_failure_poisons_session();
     test_pcm_session_rejects_planar_output();
     test_pcm_convert_status_initialised_on_refusal();
+    test_video_diagnostics();
     test_release_capabilities();
     test_build_info_is_complete();
     test_mediasurface_no_buffer_is_not_counted();

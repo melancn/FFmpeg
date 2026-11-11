@@ -40,6 +40,7 @@
 #include <jni.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +66,7 @@
 
 #include "libavcodec/avcodec.h"
 #include "libavcodec/mediacodec.h"
+#include "libavcodec/mediacodecdec_common.h"
 #include "libavcodec/jni.h"
 #include "libavcodec/bsf.h"
 #include "libavcodec/codec_par.h"
@@ -101,6 +103,201 @@ static JavaVM *g_vm = NULL;
 
 /* Convenience cast from a jlong handle to a typed pointer. */
 #define PTR(type, h) ((type)(intptr_t)(h))
+
+/* ------------------------------------------------------------------ */
+/* Video decoder diagnostics                                           */
+/*                                                                     */
+/* Two facts useful to a playback statistics overlay are not exposed   */
+/* by libavcodec's public API: the MediaCodec component the hardware   */
+/* decoder actually selected, and per-context decode counters. The     */
+/* first is read from the decoder's private state; the second is       */
+/* maintained here at the entry points the application actually calls. */
+/* Nothing below changes how decoding runs.                            */
+/*                                                                     */
+/* The counters therefore count what the bridge observed: a frame      */
+/* returned by codecReceiveFrame, a buffer submitted to the Surface, a */
+/* submission rejected as late/invalid, and a frame freed without ever */
+/* being submitted. Frames the platform codec drops inside itself are  */
+/* not observable from FFmpeg and are not counted; the snapshot never  */
+/* pretends otherwise.                                                 */
+/* ------------------------------------------------------------------ */
+
+/* libavcodec/mediacodecdec.c keeps its decoder state in this private
+ * structure. This bridge only needs its first two members: the AVClass
+ * pointer FFmpeg places at offset 0, followed by the DecContext pointer.
+ * The codec is matched by wrapper_name and video type before priv_data is
+ * read through this type, and the AVClass pointer is compared with the
+ * codec's declared priv_class, so a different decoder's private state is
+ * never interpreted as a MediaCodec context.
+ *
+ * MediaCodecDecContext itself comes from libavcodec/mediacodecdec_common.h
+ * of this source tree. Only read-only fields (codec_name, avctx and the
+ * buffer's released flag) are touched; the layout is pinned to this
+ * revision, exactly like the private fields the bridge already reads. */
+typedef struct FFMediaCodecPrivPrefix {
+    const AVClass *avclass;
+    MediaCodecDecContext *ctx;
+} FFMediaCodecPrivPrefix;
+
+/* Decoder statistics, one entry per AVCodecContext created by this bridge.
+ * The entry is attached by allocCodecContext() and removed by
+ * codecFreeContext(); a handle is invalid after that call, so no lookup can
+ * observe a freed entry during the context's documented lifetime. */
+typedef struct FFVideoDecodeStats {
+    AVCodecContext          *ctx;
+    atomic_uint              decoded;
+    atomic_uint              rendered;
+    atomic_uint              dropped;
+    atomic_uint              errors;
+    struct FFVideoDecodeStats *next;
+} FFVideoDecodeStats;
+
+static pthread_mutex_t g_video_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static FFVideoDecodeStats *g_video_stats = NULL;
+
+enum FFVideoStatKind {
+    FF_VIDEO_STAT_DECODED,
+    FF_VIDEO_STAT_RENDERED,
+    FF_VIDEO_STAT_DROPPED,
+    FF_VIDEO_STAT_ERROR,
+};
+
+static void ff_video_stats_attach(AVCodecContext *ctx)
+{
+    FFVideoDecodeStats *s;
+
+    if (!ctx)
+        return;
+    s = calloc(1, sizeof(*s));
+    if (!s)
+        return;                     /* diagnostics must never break decoding */
+    s->ctx = ctx;
+    atomic_init(&s->decoded, 0);
+    atomic_init(&s->rendered, 0);
+    atomic_init(&s->dropped, 0);
+    atomic_init(&s->errors, 0);
+
+    pthread_mutex_lock(&g_video_stats_lock);
+    s->next = g_video_stats;
+    g_video_stats = s;
+    pthread_mutex_unlock(&g_video_stats_lock);
+}
+
+static void ff_video_stats_detach(AVCodecContext *ctx)
+{
+    FFVideoDecodeStats **p, *s;
+
+    if (!ctx)
+        return;
+    pthread_mutex_lock(&g_video_stats_lock);
+    for (p = &g_video_stats; (s = *p); p = &s->next) {
+        if (s->ctx == ctx) {
+            *p = s->next;
+            free(s);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_video_stats_lock);
+}
+
+/* The entry is updated under the registry lock, so no pointer to it ever
+ * escapes: a concurrent codecFreeContext() cannot free it between a lookup
+ * and an increment. */
+static void ff_video_stats_add(AVCodecContext *ctx, enum FFVideoStatKind kind)
+{
+    FFVideoDecodeStats *s;
+
+    /* Audio and encoder paths never take the registry lock: these counters
+     * only describe video decoding, and codecReceiveFrame() is shared. */
+    if (!ctx || !ctx->codec || ctx->codec->type != AVMEDIA_TYPE_VIDEO ||
+        !av_codec_is_decoder(ctx->codec))
+        return;
+    pthread_mutex_lock(&g_video_stats_lock);
+    for (s = g_video_stats; s; s = s->next) {
+        if (s->ctx == ctx) {
+            switch (kind) {
+            case FF_VIDEO_STAT_DECODED:  atomic_fetch_add(&s->decoded, 1);  break;
+            case FF_VIDEO_STAT_RENDERED: atomic_fetch_add(&s->rendered, 1); break;
+            case FF_VIDEO_STAT_DROPPED:  atomic_fetch_add(&s->dropped, 1);  break;
+            case FF_VIDEO_STAT_ERROR:    atomic_fetch_add(&s->errors, 1);   break;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_video_stats_lock);
+}
+
+/* True only for an AVCodecContext owned by one of the mediacodec video
+ * decoders. The wrapper name is the discriminator libavcodec itself
+ * declares; a name substring is deliberately not used. */
+static int ff_codec_is_mediacodec_video(const AVCodecContext *cc)
+{
+    const AVCodec *codec;
+
+    if (!cc || !(codec = cc->codec) || !cc->priv_data)
+        return 0;
+    if (codec->type != AVMEDIA_TYPE_VIDEO)
+        return 0;
+    /* The mediacodec *encoder* also declares wrapper_name "mediacodec";
+     * these diagnostics are about decoding only. */
+    if (!av_codec_is_decoder(codec))
+        return 0;
+    if (!codec->wrapper_name || strcmp(codec->wrapper_name, "mediacodec"))
+        return 0;
+    return 1;
+}
+
+/* The MediaCodec state of an initialised mediacodec video decoder, or NULL.
+ * The returned pointer is owned by the codec context. */
+static MediaCodecDecContext *ff_codec_mediacodec_ctx(const AVCodecContext *cc)
+{
+    const FFMediaCodecPrivPrefix *priv;
+
+    if (!ff_codec_is_mediacodec_video(cc))
+        return NULL;
+    priv = (const FFMediaCodecPrivPrefix *)cc->priv_data;
+    /* avcodec_open2() itself asserts this equality, so a mismatch means the
+     * private layout is not the one this bridge was written against. */
+    if (priv->avclass != cc->codec->priv_class)
+        return NULL;
+    return priv->ctx;
+}
+
+/* The component name actually selected by the platform, or NULL. A MIME
+ * fallback (used when the platform name could not be read) contains '/',
+ * which no Android component name does, so it is refused rather than
+ * presented as a decoder component. The requested FFmpeg decoder name is
+ * never returned here. */
+static const char *ff_codec_component_name(const AVCodecContext *cc)
+{
+    MediaCodecDecContext *mc = ff_codec_mediacodec_ctx(cc);
+    const char *name;
+
+    if (!mc || !(name = mc->codec_name) || !*name)
+        return NULL;
+    /* A MIME fallback is not a component, and the requested FFmpeg decoder
+     * name is not one either. Neither may be presented as an answer. */
+    if (strchr(name, '/'))
+        return NULL;
+    if (cc->codec->name && !strcmp(name, cc->codec->name))
+        return NULL;
+    return name;
+}
+
+/* A hardware frame that is freed while its MediaCodec buffer is still
+ * unreleased is a frame the application dropped without rendering. The
+ * release/render wrappers mark the buffer released even when they fail, so
+ * this check cannot double-count a submission this bridge already saw. */
+static void ff_video_stats_note_frame_dropped(const AVFrame *f)
+{
+    const MediaCodecBuffer *b;
+
+    if (!f || f->format != AV_PIX_FMT_MEDIACODEC || !f->data[3])
+        return;
+    b = (const MediaCodecBuffer *)f->data[3];
+    if (b && b->ctx && !atomic_load(&b->released))
+        ff_video_stats_add(b->ctx->avctx, FF_VIDEO_STAT_DROPPED);
+}
 
 static jstring version_to_string(JNIEnv *env, unsigned ver)
 {
@@ -179,8 +376,14 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  * 1.3 appends two read-only entry points, streamGetAudioFormatInfo() and
  * frameGetAudioFormatInfo(), with schema v1 (see the snapshot block below).
  * Nothing existing changes, so a 1.2 caller keeps working; a 1.3 caller
- * detects the capability bits instead of guessing from the version. */
-#define FF_JNI_BRIDGE_API_MINOR 3
+ * detects the capability bits instead of guessing from the version.
+ *
+ * 1.4 appends two read-only diagnostic entry points:
+ * videoCodecComponentName() returns the MediaCodec component the hardware
+ * decoder actually selected, and videoDecodeStats() returns a per-context
+ * counter snapshot. Both only add entry points; a 1.3 caller is unaffected
+ * and a 1.4 caller must gate each feature on its capability bit. */
+#define FF_JNI_BRIDGE_API_MINOR 4
 #define FF_JNI_BRIDGE_API_VERSION \
     ((FF_JNI_BRIDGE_API_MAJOR << 16) | FF_JNI_BRIDGE_API_MINOR)
 
@@ -229,6 +432,16 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  * branch on them until the entry points exist and are tested. */
 #define FF_JNI_CAP_AUDIO_PROBE_POLICY       (1LL << 10)
 #define FF_JNI_CAP_AUDIO_PROBE_STATS        (1LL << 11)
+
+/* 1.4: videoCodecComponentName() returns the component name the platform
+ * MediaCodec factory actually selected, and NULL for software decoders,
+ * unopened contexts and unreadable names. */
+#define FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME (1LL << 12)
+/* 1.4: videoDecodeStats() fills the schema v1 counter snapshot below. The
+ * counters are maintained by this bridge at the entry points the app calls;
+ * frames the platform codec drops inside itself are not observable from
+ * FFmpeg and are therefore not counted. */
+#define FF_JNI_CAP_VIDEO_DECODE_STATS       (1LL << 13)
 
 /* Bumped whenever the packet budget accounting rules change, so a stored
  * charge value can be attributed to the policy that produced it. */
@@ -381,9 +594,13 @@ Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(JNIEnv *env, jobject thiz)
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
 {
-    /* Every bit here is bound to a test in tests/packet_contract_test.c. A
-     * capability nothing exercises is not advertised: a caller branching on
-     * an unverified bit takes a path with no evidence behind it. */
+    /* Every bit here is tied to an implemented entry point in this file. The
+     * wire-level suite in tests/packet_contract_test.c backs the bits it can
+     * drive without a platform MediaCodec; the 1.4 diagnostics are compiled
+     * here and their refusal contract (NULL / EINVAL) is what a caller can
+     * rely on when no hardware decoder is present. A capability is still not
+     * advertised merely because a constant exists: an older library answers
+     * 0, and the caller must gate on the bit. */
     return (jlong)(FF_JNI_CAP_PACKET_BUDGET_INFO |
                    FF_JNI_CAP_SIDE_DATA_EXACT_COPY |
                    FF_JNI_CAP_BRIDGE_BUILD_INFO |
@@ -392,7 +609,9 @@ Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
                    FF_JNI_CAP_PCM_SESSION_SAFE_V2 |
                    FF_JNI_CAP_RENDERER_SAFE_CLOSE |
                    FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO |
-                   FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO);
+                   FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO |
+                   FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME |
+                   FF_JNI_CAP_VIDEO_DECODE_STATS);
 }
 
 /* ABI string for the compiled object, not the device ABI: it identifies
@@ -789,6 +1008,8 @@ Java_org_ffmpeg_FFMpegNative_allocCodecContext(JNIEnv *env, jobject thiz, jlong 
 {
     AVCodec *c = PTR(AVCodec *, codec);
     AVCodecContext *cc = avcodec_alloc_context3(c);
+    if (cc)
+        ff_video_stats_attach(cc);
     return (jlong)(intptr_t)cc;
 }
 
@@ -824,8 +1045,12 @@ JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_codecFreeContext(JNIEnv *env, jobject thiz, jlong codecCtx)
 {
     AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
-    if (cc)
+    if (cc) {
+        /* Drop the statistics entry while the pointer is still unique to
+         * this context, then free the context itself. */
+        ff_video_stats_detach(cc);
         avcodec_free_context(&cc);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -982,6 +1207,117 @@ Java_org_ffmpeg_FFMpegNative_getContextCodecId(JNIEnv *env, jobject thiz, jlong 
     return cc ? (jint)cc->codec_id : AV_CODEC_ID_NONE;
 }
 
+/* ------------------------------------------------------------------ */
+/* Video decoder diagnostics                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The MediaCodec component actually selected by a hardware decoder.
+ *
+ * <p>Returns NULL for a software decoder, a context that has not been opened
+ * yet, a context whose platform name could not be read, or a non-MediaCodec
+ * decoder. The requested FFmpeg decoder name ("h264_mediacodec") and a MIME
+ * type are never returned. The returned string is a copy; the caller may
+ * hold it after this call. The context must still be valid: do not call this
+ * after codecFreeContext(), and do not free the context concurrently. The
+ * read does not modify decoder state and may run on any thread.
+ */
+JNIEXPORT jstring JNICALL
+Java_org_ffmpeg_FFMpegNative_videoCodecComponentName(JNIEnv *env, jobject thiz,
+                                                     jlong codecCtx)
+{
+    AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
+    const char *name = ff_codec_component_name(cc);
+
+    return name ? (*env)->NewStringUTF(env, name) : NULL;
+}
+
+/* Fixed layout of videoDecodeStats(), schema v1. Mirrored by the Java
+ * constants; the slot count and every index are part of the contract. */
+#define FF_JNI_VIDEO_DECODE_STATS_SLOTS          6
+#define FF_JNI_VIDEO_STATS_SCHEMA_VERSION        1
+#define FF_JNI_VIDEO_STATS_SCHEMA_VERSION_SLOT   0
+#define FF_JNI_VIDEO_STATS_DECODED_FRAMES        1
+#define FF_JNI_VIDEO_STATS_RENDERED_FRAMES       2
+#define FF_JNI_VIDEO_STATS_DROPPED_FRAMES        3
+#define FF_JNI_VIDEO_STATS_DECODE_ERRORS         4
+#define FF_JNI_VIDEO_STATS_CURRENT_BITRATE       5
+
+_Static_assert(FF_JNI_VIDEO_STATS_CURRENT_BITRATE ==
+               FF_JNI_VIDEO_DECODE_STATS_SLOTS - 1,
+               "videoDecodeStats slot layout changed; update FFMpegNative.java "
+               "and the contract test");
+
+/**
+ * Per-context decoder counters, schema v1.
+ *
+ * <p>Slots: 0 schemaVersion (always 1), 1 decodedFrames, 2 renderedFrames,
+ * 3 droppedFrames, 4 decodeErrors, 5 currentBitRate. Counters are monotonic
+ * and are not reset by flush. renderedFrames counts successful submissions
+ * through this bridge (mediasurfaceRenderBufferAtTime(), or
+ * mediasurfaceReleaseBuffer() with render != 0), not platform-internal
+ * rendering. currentBitRate is AVCodecContext.bit_rate and is <= 0 when the
+ * stream did not declare one.
+ *
+ * <p>Returns 0 on success, AVERROR(EINVAL) for a non-MediaCodec video
+ * context, a null array or a len below the slot count, and AVERROR(ENOENT)
+ * when no counter entry exists for the context. Nothing is written on
+ * failure. The context must still be valid: do not call this after
+ * codecFreeContext(), and do not free the context concurrently.
+ */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_videoDecodeStats(JNIEnv *env, jobject thiz,
+                                              jlong codecCtx, jlongArray out,
+                                              jint len)
+{
+    AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
+    FFVideoDecodeStats *s;
+    jlong values[FF_JNI_VIDEO_DECODE_STATS_SLOTS];
+    int found = 0;
+
+    if (!cc || !out)
+        return AVERROR(EINVAL);
+    if (!ff_codec_is_mediacodec_video(cc))
+        return AVERROR(EINVAL);
+    /* Reject a short caller-declared length or a short Java array before
+     * reading any counter, so a refusal publishes nothing. */
+    if (len < FF_JNI_VIDEO_DECODE_STATS_SLOTS ||
+        (*env)->GetArrayLength(env, out) < FF_JNI_VIDEO_DECODE_STATS_SLOTS)
+        return AVERROR(EINVAL);
+
+    values[FF_JNI_VIDEO_STATS_SCHEMA_VERSION_SLOT] =
+        FF_JNI_VIDEO_STATS_SCHEMA_VERSION;
+    values[FF_JNI_VIDEO_STATS_CURRENT_BITRATE] = (jlong)cc->bit_rate;
+
+    /* Copy under the registry lock: a concurrent detach must not free the
+     * entry between the lookup and the reads. */
+    pthread_mutex_lock(&g_video_stats_lock);
+    for (s = g_video_stats; s; s = s->next) {
+        if (s->ctx == cc) {
+            values[FF_JNI_VIDEO_STATS_DECODED_FRAMES] =
+                (jlong)atomic_load(&s->decoded);
+            values[FF_JNI_VIDEO_STATS_RENDERED_FRAMES] =
+                (jlong)atomic_load(&s->rendered);
+            values[FF_JNI_VIDEO_STATS_DROPPED_FRAMES] =
+                (jlong)atomic_load(&s->dropped);
+            values[FF_JNI_VIDEO_STATS_DECODE_ERRORS] =
+                (jlong)atomic_load(&s->errors);
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_video_stats_lock);
+
+    if (!found)
+        return AVERROR(ENOENT);
+
+    (*env)->SetLongArrayRegion(env, out, 0,
+                               FF_JNI_VIDEO_DECODE_STATS_SLOTS, values);
+    if ((*env)->ExceptionCheck(env))
+        return AVERROR(ENOMEM);
+    return 0;
+}
+
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_codecSendPacket(JNIEnv *env, jobject thiz, jlong codecCtx, jlong pkt)
 {
@@ -993,13 +1329,22 @@ Java_org_ffmpeg_FFMpegNative_codecSendPacket(JNIEnv *env, jobject thiz, jlong co
 }
 
 JNIEXPORT jint JNICALL
-Java_org_ffmpeg_FFMpegNative_codecReceiveFrame(JNIEnv *env, jobject thiz, jlong codecCtx, jlong frame)
+Java_org_ffmpeg_FFmpegNative_codecReceiveFrame(JNIEnv *env, jobject thiz, jlong codecCtx, jlong frame)
 {
     AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
     AVFrame *f = PTR(AVFrame *, frame);
+    int ret;
+
     if (!cc || !f)
         return AVERROR(EINVAL);
-    return (jint)avcodec_receive_frame(cc, f);
+    ret = (jint)avcodec_receive_frame(cc, f);
+    if (ret == 0) {
+        ff_video_stats_add(cc, FF_VIDEO_STAT_DECODED);
+    } else if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+        /* EAGAIN and EOF are normal states, not decode failures. */
+        ff_video_stats_add(cc, FF_VIDEO_STAT_ERROR);
+    }
+    return ret;
 }
 
 JNIEXPORT jint JNICALL
@@ -1395,16 +1740,20 @@ JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_frameFree(JNIEnv *env, jobject thiz, jlong frame)
 {
     AVFrame *f = PTR(AVFrame *, frame);
-    if (f)
+    if (f) {
+        ff_video_stats_note_frame_dropped(f);
         av_frame_free(&f);
+    }
 }
 
 JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_frameUnref(JNIEnv *env, jobject thiz, jlong frame)
 {
     AVFrame *f = PTR(AVFrame *, frame);
-    if (f)
+    if (f) {
+        ff_video_stats_note_frame_dropped(f);
         av_frame_unref(f);
+    }
 }
 
 JNIEXPORT jint JNICALL
@@ -1749,8 +2098,16 @@ Java_org_ffmpeg_FFMpegNative_mediasurfaceReleaseBuffer(JNIEnv *env, jobject thiz
     if (!b)
         return AVERROR(EINVAL);
     ret = (jint)av_mediacodec_release_buffer(b, render);
-    if (ret >= 0)
+    if (ret >= 0) {
         ff_hw_output_release();
+        ff_video_stats_add(b->ctx ? b->ctx->avctx : NULL,
+                           render ? FF_VIDEO_STAT_RENDERED
+                                  : FF_VIDEO_STAT_DROPPED);
+    } else {
+        /* A rejected release leaves the frame unshown. */
+        ff_video_stats_add(b->ctx ? b->ctx->avctx : NULL,
+                           FF_VIDEO_STAT_DROPPED);
+    }
     return ret;
 }
 
@@ -1764,8 +2121,15 @@ Java_org_ffmpeg_FFMpegNative_mediasurfaceRenderBufferAtTime(JNIEnv *env, jobject
     if (!b)
         return AVERROR(EINVAL);
     ret = (jint)av_mediacodec_render_buffer_at_time(b, (int64_t)nanoTime);
-    if (ret >= 0)
+    if (ret >= 0) {
         ff_hw_output_release();
+        ff_video_stats_add(b->ctx ? b->ctx->avctx : NULL,
+                           FF_VIDEO_STAT_RENDERED);
+    } else {
+        /* Late or invalidated output: the frame is not shown. */
+        ff_video_stats_add(b->ctx ? b->ctx->avctx : NULL,
+                           FF_VIDEO_STAT_DROPPED);
+    }
     return ret;
 }
 

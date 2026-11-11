@@ -124,8 +124,14 @@ public final class FFMpegNative {
      * points and their schema. A 1.2 caller is unaffected; a 1.3 caller
      * should detect {@link #CAP_AUDIO_STREAM_FORMAT_INFO} /
      * {@link #CAP_AUDIO_FRAME_FORMAT_INFO} rather than comparing versions.
+     *
+     * <p>1.4 appends two read-only video diagnostics,
+     * {@link #videoCodecComponentName} and {@link #videoDecodeStats}. A 1.3
+     * caller is unaffected; a 1.4 caller must gate each feature on
+     * {@link #CAP_VIDEO_CODEC_COMPONENT_NAME} /
+     * {@link #CAP_VIDEO_DECODE_STATS} rather than comparing versions.
      */
-    public static final int BRIDGE_API_MINOR = 3;
+    public static final int BRIDGE_API_MINOR = 4;
 
     /** {@code major << 16 | minor}; first release is {@code 0x00010000}. */
     public static final int BRIDGE_API_VERSION = (BRIDGE_API_MAJOR << 16) | BRIDGE_API_MINOR;
@@ -228,6 +234,27 @@ public final class FFMpegNative {
      * this build, for the same reason as {@link #CAP_AUDIO_PROBE_POLICY}.
      */
     public static final long CAP_AUDIO_PROBE_STATS = 1L << 11;
+
+    /**
+     * {@link #videoCodecComponentName} is implemented and returns the
+     * MediaCodec component the platform actually selected.
+     *
+     * <p>Gate every call on this bit: a library built before 1.4 has no such
+     * entry point, and calling it anyway throws
+     * {@link UnsatisfiedLinkError} instead of returning {@code null}.
+     */
+    public static final long CAP_VIDEO_CODEC_COMPONENT_NAME = 1L << 12;
+
+    /**
+     * {@link #videoDecodeStats} is implemented and fills the schema v1
+     * counter layout described by {@code VIDEO_DECODE_STATS_*}.
+     *
+     * <p>Gate on this bit for the same reason as
+     * {@link #CAP_VIDEO_CODEC_COMPONENT_NAME}. The counters describe what
+     * this bridge observed; output the platform codec drops internally is not
+     * visible and is not counted.
+     */
+    public static final long CAP_VIDEO_DECODE_STATS = 1L << 13;
 
     /* ================================================================== */
     /* Audio format snapshot (schema v1)                                   */
@@ -887,6 +914,103 @@ public final class FFMpegNative {
 
     /** @return codec id configured on the context. */
     public native int getContextCodecId(long codecCtx);
+
+    /* -------------------------------------------------------------- */
+    /* Video decoder diagnostics (1.4)                                 */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Return the MediaCodec component the hardware decoder actually selected,
+     * for example {@code "c2.qti.avc.decoder"} or
+     * {@code "OMX.NVIDIA.h264.decode"}.
+     *
+     * <p>FFmpeg chooses this component internally when a
+     * {@code *_mediacodec} decoder is opened. {@link #codecGetName} reports
+     * only the FFmpeg codec name (for example {@code "h264"}) and
+     * {@link #findDecoderByName} the requested decoder name (for example
+     * {@code "h264_mediacodec"}); neither is the platform component. This
+     * method is the only source of the actual component.
+     *
+     * <p>Returns {@code null} for a software decoder, an AVS2/platform
+     * decoder that is not backed by this FFmpeg codec context, a context that
+     * has not been opened, and when the platform name could not be read. A
+     * MIME type and the requested FFmpeg decoder name are never returned.
+     * {@code null} means "not known", never "software decode is in use".
+     *
+     * <p>Gate on {@link #CAP_VIDEO_CODEC_COMPONENT_NAME}. The read does not
+     * modify decoder state and may run on any thread, but the context must
+     * still be valid: do not call this after {@link #codecFreeContext}, and
+     * do not free the context concurrently. Every call returns a new String.
+     *
+     * @param codecCtx an opened codec context handle
+     * @return the actual MediaCodec component name, or {@code null}
+     */
+    public native String videoCodecComponentName(long codecCtx);
+
+    /** Value of the schema-version slot in a {@link #videoDecodeStats} snapshot. */
+    public static final int VIDEO_DECODE_STATS_SCHEMA_VERSION = 1;
+
+    /** Elements required in {@code out}. */
+    public static final int VIDEO_DECODE_STATS_SLOTS = 6;
+
+    /* Fixed indices into the videoDecodeStats() output array. */
+    /** Always {@link #VIDEO_DECODE_STATS_SCHEMA_VERSION} for this schema. */
+    public static final int VIDEO_DECODE_STATS_SCHEMA_VERSION_INDEX = 0;
+    /** Frames returned by {@link #codecReceiveFrame} with status 0. */
+    public static final int VIDEO_DECODE_STATS_DECODED_FRAMES      = 1;
+    /** Successful Surface submissions through this bridge. */
+    public static final int VIDEO_DECODE_STATS_RENDERED_FRAMES     = 2;
+    /** Frames discarded without being shown, as observed by this bridge. */
+    public static final int VIDEO_DECODE_STATS_DROPPED_FRAMES      = 3;
+    /** Hard decode failures; EAGAIN and EOF are not counted. */
+    public static final int VIDEO_DECODE_STATS_DECODE_ERRORS       = 4;
+    /** {@code AVCodecContext.bit_rate} in bit/s; {@code <= 0} is unknown. */
+    public static final int VIDEO_DECODE_STATS_CURRENT_BITRATE     = 5;
+
+    /**
+     * Read a per-context decoder counter snapshot (schema v1).
+     *
+     * <p>Schema v1 fills {@link #VIDEO_DECODE_STATS_SLOTS} slots, indexed by
+     * the {@code VIDEO_DECODE_STATS_*} constants:
+     * <pre>
+     * 0  schemaVersion   always 1
+     * 1  decodedFrames   frames returned by codecReceiveFrame
+     * 2  renderedFrames  successful Surface submissions through this bridge
+     * 3  droppedFrames   frames observed as discarded without being shown
+     * 4  decodeErrors    hard decode failures
+     * 5  currentBitRate  AVCodecContext.bit_rate, bit/s; &lt;= 0 unknown
+     * </pre>
+     *
+     * <p>Counters are monotonic and are not reset by flush or seek. They are
+     * maintained at this bridge's entry points:
+     * {@link #codecReceiveFrame} for decoded frames and hard errors, and
+     * {@link #mediasurfaceRenderBufferAtTime} /
+     * {@link #mediasurfaceReleaseBuffer} for rendered and dropped frames.
+     * Output the platform MediaCodec drops inside itself is not observable
+     * from FFmpeg and is not counted, so a zero dropped count does not prove
+     * that the platform dropped nothing.
+     *
+     * <p>{@link #VIDEO_DECODE_STATS_CURRENT_BITRATE} is the codec context's
+     * declared bit rate; it is not derived from payload size or elapsed time
+     * and is {@code <= 0} when the stream did not declare one.
+     *
+     * <p>Only a hardware MediaCodec video decoder context created by
+     * {@link #allocCodecContext} is accepted. Software decoders, audio
+     * contexts and encoders answer {@code AVERROR(EINVAL)}; a context with no
+     * counter entry answers {@code AVERROR(ENOENT)}. Nothing is written on
+     * failure. The context must still be valid: do not call this after
+     * {@link #codecFreeContext}, and do not free the context concurrently.
+     *
+     * <p>Gate on {@link #CAP_VIDEO_DECODE_STATS}.
+     *
+     * @param codecCtx codec context handle
+     * @param out      destination array, at least
+     *                 {@link #VIDEO_DECODE_STATS_SLOTS} elements
+     * @param len      number of slots the caller offers; must be at least
+     *                 {@link #VIDEO_DECODE_STATS_SLOTS}
+     * @return 0 on success, or a negative AVERROR as described above
+     */
+    public native int videoDecodeStats(long codecCtx, long[] out, int len);
 
     /**
      * Send a packet to the decoder (drain by passing {@code pkt==0}).
