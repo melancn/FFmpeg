@@ -130,8 +130,16 @@ public final class FFMpegNative {
      * caller is unaffected; a 1.4 caller must gate each feature on
      * {@link #CAP_VIDEO_CODEC_COMPONENT_NAME} /
      * {@link #CAP_VIDEO_DECODE_STATS} rather than comparing versions.
+     *
+     * <p>1.5 appends the libass message channel,
+     * {@link #assSetLogLevel} / {@link #assGetLogLevel}. libass already
+     * computes the font decision (requested family/bold/italic, selected
+     * file, TTC face index, every missing-glyph fallback); the bridge now
+     * forwards its messages to logcat under {@code MediaHub/Libass}. A 1.4
+     * caller is unaffected; gate on {@link #CAP_LIBASS_FONT_LOG} because a
+     * non-libass build does not contain the entry points at all.
      */
-    public static final int BRIDGE_API_MINOR = 4;
+    public static final int BRIDGE_API_MINOR = 5;
 
     /** {@code major << 16 | minor}; first release is {@code 0x00010000}. */
     public static final int BRIDGE_API_VERSION = (BRIDGE_API_MAJOR << 16) | BRIDGE_API_MINOR;
@@ -255,6 +263,22 @@ public final class FFMpegNative {
      * visible and is not counted.
      */
     public static final long CAP_VIDEO_DECODE_STATS = 1L << 13;
+
+    /**
+     * libass messages are forwarded to logcat under the {@code MediaHub/Libass}
+     * tag, and {@link #assSetLogLevel} / {@link #assGetLogLevel} control that
+     * channel.
+     *
+     * <p>This is the only observable record of the font libass actually
+     * chose: the requested family/bold/italic, the selected file, the TTC
+     * face index, each missing-glyph fallback and the final "not found"
+     * verdict. None of it is exposed by the libass public API, so Kotlin-side
+     * logging cannot substitute.
+     *
+     * <p>Gate on this bit: a non-libass build has no such entry points, and
+     * calling them anyway throws {@link UnsatisfiedLinkError}.
+     */
+    public static final long CAP_LIBASS_FONT_LOG = 1L << 14;
 
     /* ================================================================== */
     /* Audio format snapshot (schema v1)                                   */
@@ -2811,6 +2835,12 @@ public final class FFMpegNative {
      * }
      * assSetFonts(rend, null, "sans-serif", ASS_FONT_SELECT_ENABLE);
      * assSetFrameSize(rend, viewWidth, viewHeight);
+     * // Font diagnostics (opt-in; default is already 4):
+     * //   adb logcat -s "MediaHub/Libass"
+     * //   I MediaHub/Libass: fontselect: (Family, 700, 0) -&gt; path, faceIndex, psname
+     * //   I MediaHub/Libass: Glyph 0x7EED not found, selecting one more font for (...)
+     * //   E MediaHub/Libass: Glyph 0x7EED not found in font for (...)
+     * assSetLogLevel(4);   // MSGL_INFO
      *
      * // subtitle stream: allocCodecContext + codecParametersToContext +
      * // codecOpen2, then per decoded event:
@@ -2842,6 +2872,26 @@ public final class FFMpegNative {
     public native long assLibCreate();
     /** Free an ASS_Library (renderers/tracks created from it first). */
     public native void assLibFree(long lib);
+
+    /**
+     * Set the threshold for libass messages forwarded to logcat under the
+     * {@code MediaHub/Libass} tag. Values are libass {@code MSGL_*} levels:
+     * 0 fatal, 1 error, 2/3 warning, 4/5 info, 6 verbose, 7 debug.
+     *
+     * <p>The default is 4 (info) and should normally stay there: the
+     * {@code fontselect: (family, bold, italic) -> file, faceIndex, psname}
+     * success line and {@code Glyph 0x... not found, selecting one more font}
+     * are both {@code MSGL_INFO}. Filtering at warning level would hide the
+     * font decision this channel exists to expose. Level 6 additionally logs
+     * every subtitle event and is only useful for short debugging sessions.
+     *
+     * <p>This does not affect {@link #logSetLevel}, which controls the
+     * separate {@code FFmpeg} tag. Gate on {@link #CAP_LIBASS_FONT_LOG}.
+     */
+    public native void assSetLogLevel(int level);
+
+    /** @return the current {@code MediaHub/Libass} threshold (default 4). */
+    public native int assGetLogLevel();
 
     /** @return ASS_Renderer handle bound to {@code lib}, or 0. */
     public native long assRendererCreate(long lib);

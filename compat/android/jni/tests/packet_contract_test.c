@@ -2395,7 +2395,7 @@ static void test_release_capabilities(void)
     CHECK(Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(NULL, NULL) ==
           FF_JNI_BRIDGE_API_VERSION);
     CHECK(FF_JNI_BRIDGE_API_MAJOR == 1);
-    CHECK(FF_JNI_BRIDGE_API_MINOR == 4);
+    CHECK(FF_JNI_BRIDGE_API_MINOR == 5);
 
     /* Promised by this release, each with a test set behind it. */
     CHECK(caps & FF_JNI_CAP_PCM_SESSION_SAFE_V2);
@@ -2417,6 +2417,16 @@ static void test_release_capabilities(void)
     CHECK(caps & FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME);
     CHECK(caps & FF_JNI_CAP_VIDEO_DECODE_STATS);
 
+    /* The 1.5 libass channel exists only where the libass section is compiled
+     * in. This build enables it (the binary links -lass), so the bit must be
+     * set here; a build without libass must answer 0 rather than advertise an
+     * entry point it does not contain. */
+#if CONFIG_LIBASS
+    CHECK(caps & FF_JNI_CAP_LIBASS_FONT_LOG);
+#else
+    CHECK((caps & FF_JNI_CAP_LIBASS_FONT_LOG) == 0);
+#endif
+
     /* NOT promised: batch B is deferred. This is the assertion that must
      * fail first if a later change starts advertising scoped accounting
      * without the wiring and the tests behind it. */
@@ -2435,17 +2445,20 @@ static void test_release_capabilities(void)
      * an unregistered feature or a shifted constant, and a consumer cannot
      * tell which. */
     {
-        const jlong known = FF_JNI_CAP_PACKET_BUDGET_INFO |
-                            FF_JNI_CAP_SIDE_DATA_EXACT_COPY |
-                            FF_JNI_CAP_BRIDGE_BUILD_INFO |
-                            FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE |
-                            FF_JNI_CAP_BOUNDED_PCM_RESAMPLE |
-                            FF_JNI_CAP_PCM_SESSION_SAFE_V2 |
-                            FF_JNI_CAP_RENDERER_SAFE_CLOSE |
-                            FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO |
-                            FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO |
-                            FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME |
-                            FF_JNI_CAP_VIDEO_DECODE_STATS;
+        jlong known = FF_JNI_CAP_PACKET_BUDGET_INFO |
+                      FF_JNI_CAP_SIDE_DATA_EXACT_COPY |
+                      FF_JNI_CAP_BRIDGE_BUILD_INFO |
+                      FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE |
+                      FF_JNI_CAP_BOUNDED_PCM_RESAMPLE |
+                      FF_JNI_CAP_PCM_SESSION_SAFE_V2 |
+                      FF_JNI_CAP_RENDERER_SAFE_CLOSE |
+                      FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO |
+                      FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO |
+                      FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME |
+                      FF_JNI_CAP_VIDEO_DECODE_STATS;
+#if CONFIG_LIBASS
+        known |= FF_JNI_CAP_LIBASS_FONT_LOG;
+#endif
 
         CHECK((caps & ~known) == 0);
     }
@@ -2461,10 +2474,31 @@ static void test_release_capabilities(void)
     CHECK(FF_JNI_CAP_AUDIO_PROBE_STATS == (1LL << 11));
     CHECK(FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME == (1LL << 12));
     CHECK(FF_JNI_CAP_VIDEO_DECODE_STATS == (1LL << 13));
+    CHECK(FF_JNI_CAP_LIBASS_FONT_LOG == (1LL << 14));
 
     /* The whole mask for this release, written out once so an unannounced
-     * bit is a test failure rather than a silent contract change. */
+     * bit is a test failure rather than a silent contract change. The 1.5
+     * libass bit is present only in a libass build. */
+#if CONFIG_LIBASS
+    CHECK(caps == (jlong)0x737f);
+#else
     CHECK(caps == (jlong)0x337f);
+#endif
+}
+
+/* The 1.5 libass threshold is the only knob on the "MediaHub/Libass" channel.
+ * It must round-trip, and it must default to MSGL_INFO (4): the fontselect
+ * success line and the missing-glyph fallback line are both INFO, so a lower
+ * default would hide the evidence the channel exists for. */
+static void test_libass_log_level(void)
+{
+#if CONFIG_LIBASS
+    CHECK(Java_org_ffmpeg_FFMpegNative_assGetLogLevel(NULL, NULL) == 4);
+    Java_org_ffmpeg_FFMpegNative_assSetLogLevel(NULL, NULL, 2);
+    CHECK(Java_org_ffmpeg_FFMpegNative_assGetLogLevel(NULL, NULL) == 2);
+    Java_org_ffmpeg_FFMpegNative_assSetLogLevel(NULL, NULL, 4);
+    CHECK(Java_org_ffmpeg_FFMpegNative_assGetLogLevel(NULL, NULL) == 4);
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -3605,6 +3639,7 @@ int main(void)
     test_pcm_convert_status_initialised_on_refusal();
     test_video_diagnostics();
     test_release_capabilities();
+    test_libass_log_level();
     test_build_info_is_complete();
     test_mediasurface_no_buffer_is_not_counted();
     test_mediasurface_null_handles();

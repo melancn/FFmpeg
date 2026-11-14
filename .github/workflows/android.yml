@@ -716,6 +716,8 @@ jobs:
                       Java_org_ffmpeg_FFMpegNative_codecGetSubtitleHeader \
                       Java_org_ffmpeg_FFMpegNative_assLibCreate \
                       Java_org_ffmpeg_FFMpegNative_assLibFree \
+                      Java_org_ffmpeg_FFMpegNative_assSetLogLevel \
+                      Java_org_ffmpeg_FFMpegNative_assGetLogLevel \
                       Java_org_ffmpeg_FFMpegNative_assRendererCreate \
                       Java_org_ffmpeg_FFMpegNative_assRendererFree \
                       Java_org_ffmpeg_FFMpegNative_assTrackCreate \
@@ -795,7 +797,7 @@ jobs:
           # it needs are present. The optional ass/subtitles AVFilter objects
           # may be omitted by static archive extraction when no caller refers
           # to those filters; that does not affect application-driven rendering.
-          for sym in ass_library_init ass_add_font ass_render_frame; do
+          for sym in ass_library_init ass_set_message_cb ass_add_font ass_render_frame; do
             if ! grep -q " ${sym}$" /tmp/jni_syms.txt; then
               echo "::error::libffmpeg_jni.so missing ${sym} (libass JNI rendering not linked)"
               exit 1

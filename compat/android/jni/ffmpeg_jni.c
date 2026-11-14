@@ -40,8 +40,10 @@
 #include <jni.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -540,8 +542,17 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  * videoCodecComponentName() returns the MediaCodec component the hardware
  * decoder actually selected, and videoDecodeStats() returns a per-context
  * counter snapshot. Both only add entry points; a 1.3 caller is unaffected
- * and a 1.4 caller must gate each feature on its capability bit. */
-#define FF_JNI_BRIDGE_API_MINOR 4
+ * and a 1.4 caller must gate each feature on its capability bit.
+ *
+ * 1.5 appends the libass message channel: assSetLogLevel()/assGetLogLevel()
+ * control a callback registered on every ASS_Library created by this bridge.
+ * libass already emits its font-selection decisions (requested family/bold/
+ * italic, selected path, TTC face index, missing-glyph fallbacks) through
+ * ass_set_message_cb(); without this callback those messages are discarded on
+ * Android. The entries only append, so a 1.4 caller is unaffected; a 1.5
+ * caller gates on FF_JNI_CAP_LIBASS_FONT_LOG because the whole libass section
+ * is absent from a non-libass build. */
+#define FF_JNI_BRIDGE_API_MINOR 5
 #define FF_JNI_BRIDGE_API_VERSION \
     ((FF_JNI_BRIDGE_API_MAJOR << 16) | FF_JNI_BRIDGE_API_MINOR)
 
@@ -600,6 +611,15 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  * frames the platform codec drops inside itself are not observable from
  * FFmpeg and are therefore not counted. */
 #define FF_JNI_CAP_VIDEO_DECODE_STATS       (1LL << 13)
+
+/* 1.5: assLibCreate() registers ass_set_message_cb() and forwards libass's
+ * own messages to logcat under "MediaHub/Libass"; assSetLogLevel()/
+ * assGetLogLevel() control the threshold. This is the only way to observe the
+ * font family/bold/italic libass requested, the file/face it selected, the
+ * TTC face index, and each missing-glyph fallback: none of that is exposed by
+ * the libass public API, and Kotlin-side logging cannot see it. Only set when
+ * CONFIG_LIBASS is on, because the entry points do not exist otherwise. */
+#define FF_JNI_CAP_LIBASS_FONT_LOG          (1LL << 14)
 
 /* Bumped whenever the packet budget accounting rules change, so a stored
  * charge value can be attributed to the policy that produced it. */
@@ -758,18 +778,25 @@ Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
      * here and their refusal contract (NULL / EINVAL) is what a caller can
      * rely on when no hardware decoder is present. A capability is still not
      * advertised merely because a constant exists: an older library answers
-     * 0, and the caller must gate on the bit. */
-    return (jlong)(FF_JNI_CAP_PACKET_BUDGET_INFO |
-                   FF_JNI_CAP_SIDE_DATA_EXACT_COPY |
-                   FF_JNI_CAP_BRIDGE_BUILD_INFO |
-                   FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE |
-                   FF_JNI_CAP_BOUNDED_PCM_RESAMPLE |
-                   FF_JNI_CAP_PCM_SESSION_SAFE_V2 |
-                   FF_JNI_CAP_RENDERER_SAFE_CLOSE |
-                   FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO |
-                   FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO |
-                   FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME |
-                   FF_JNI_CAP_VIDEO_DECODE_STATS);
+     * 0, and the caller must gate on the bit.
+     *
+     * The 1.5 libass bit is conditional: the entry points live inside
+     * #if CONFIG_LIBASS, so a non-libass build must not claim them. */
+    jlong caps = (jlong)(FF_JNI_CAP_PACKET_BUDGET_INFO |
+                         FF_JNI_CAP_SIDE_DATA_EXACT_COPY |
+                         FF_JNI_CAP_BRIDGE_BUILD_INFO |
+                         FF_JNI_CAP_FRAME_LAYOUT_NORMALIZE |
+                         FF_JNI_CAP_BOUNDED_PCM_RESAMPLE |
+                         FF_JNI_CAP_PCM_SESSION_SAFE_V2 |
+                         FF_JNI_CAP_RENDERER_SAFE_CLOSE |
+                         FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO |
+                         FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO |
+                         FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME |
+                         FF_JNI_CAP_VIDEO_DECODE_STATS);
+#if CONFIG_LIBASS
+    caps |= (jlong)FF_JNI_CAP_LIBASS_FONT_LOG;
+#endif
+    return caps;
 }
 
 /* ABI string for the compiled object, not the device ABI: it identifies
@@ -7269,13 +7296,78 @@ Java_org_ffmpeg_FFMpegNative_codecGetSubtitleHeader(JNIEnv *env, jobject thiz,
 
 #if CONFIG_LIBASS
 
+/* libass messages are the only source of the font decision it actually made:
+ * the requested (family, bold, italic), the selected file/face and TTC face
+ * index, every missing-glyph fallback, and the final "not found" verdict.
+ * None of that is reachable through the public API. Without a callback libass
+ * writes levels < 5 to stderr, which goes nowhere on Android, so the whole
+ * decision is invisible. This callback forwards it under its own tag.
+ *
+ * Level mapping: libass uses MSGL_FATAL=0, MSGL_ERR=1, MSGL_WARN=2,
+ * MSGL_INFO=4, MSGL_V=6, MSGL_DBG2=7 (3 and 5 are undefined; see the map in
+ * libavfilter/vf_subtitles.c). The callback is invoked for every message, so
+ * the threshold is applied here. The default is INFO on purpose: the
+ * "fontselect: (...) -> path, index, psname" success line and "Glyph 0x...
+ * not found, selecting one more font" are both MSGL_INFO. A WARN threshold
+ * would hide exactly the evidence this channel exists for. MSGL_V (6) carries
+ * per-event text and is left off unless asked for. */
+static volatile int g_ass_log_level = 4;        /* MSGL_INFO */
+
+static void ff_ass_log_cb(int level, const char *fmt, va_list args, void *data)
+{
+    int prio;
+    char line[1024];
+
+    if (level > g_ass_log_level)
+        return;
+
+    switch (level) {
+    case 0:
+    case 1:  prio = ANDROID_LOG_ERROR;   break;     /* MSGL_FATAL / MSGL_ERR */
+    case 2:
+    case 3:  prio = ANDROID_LOG_WARN;    break;     /* MSGL_WARN / undefined */
+    case 4:
+    case 5:  prio = ANDROID_LOG_INFO;    break;     /* MSGL_INFO / undefined */
+    case 6:  prio = ANDROID_LOG_DEBUG;   break;     /* MSGL_V */
+    default: prio = ANDROID_LOG_VERBOSE; break;     /* MSGL_DBG2 */
+    }
+
+    /* vsnprintf, never fmt directly: fmt is a printf template, and va_list is
+     * single-use. Truncation is safe; logcat adds the newline. */
+    vsnprintf(line, sizeof(line), fmt, args);
+    __android_log_write(prio, "MediaHub/Libass", line);
+}
+
+/* Threshold for the "MediaHub/Libass" channel only; it does not touch
+ * av_log_set_level() (the "FFmpeg" tag). */
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_assSetLogLevel(JNIEnv *env, jobject thiz, jint level)
+{
+    g_ass_log_level = level;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assGetLogLevel(JNIEnv *env, jobject thiz)
+{
+    return g_ass_log_level;
+}
+
 /* ASS_Library lifecycle (ass_library_init/done). One library can back many
  * renderers/tracks; the embedded-font cache used by assAddFont is global to
- * the process but is managed through a library handle. */
+ * the process but is managed through a library handle.
+ *
+ * The message callback is registered here, not at renderer creation: the
+ * font provider choice ("Using font provider ...") and the fonts_dir scan
+ * both happen inside ass_renderer_init(), so a later registration would miss
+ * them. data is NULL because the callback needs no per-library state and
+ * nothing can outlive ass_library_done(). */
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_assLibCreate(JNIEnv *env, jobject thiz)
 {
-    return (jlong)(intptr_t)ass_library_init();
+    ASS_Library *l = ass_library_init();
+    if (l)
+        ass_set_message_cb(l, ff_ass_log_cb, NULL);
+    return (jlong)(intptr_t)l;
 }
 
 JNIEXPORT void JNICALL
@@ -7367,6 +7459,12 @@ Java_org_ffmpeg_FFMpegNative_assAddFont(JNIEnv *env, jobject thiz, jlong lib,
     }
     (*env)->GetByteArrayRegion(env, in, off, len, (jbyte *)buf);
     ass_add_font(l, n, (const char *)buf, len);
+    /* ass_add_font() does not log at INFO, so a missing-glyph report could
+     * not be tied back to whether the embedded font was registered at all, or
+     * under which name. The name must stay valid here; release it after. */
+    if (g_ass_log_level >= 4)
+        __android_log_print(ANDROID_LOG_INFO, "MediaHub/Libass",
+                            "fontAdd name=%s bytes=%d", n, (int)len);
     (*env)->ReleaseStringUTFChars(env, name, n);
     av_free(buf);
     return 0;
