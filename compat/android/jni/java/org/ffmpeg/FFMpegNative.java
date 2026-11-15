@@ -3390,6 +3390,7 @@ public final class FFMpegNative {
     public static final long AV_CH_LAYOUT_STEREO_DOWNMIX    = 1610612736L;
     public static final long AV_CH_LAYOUT_22POINT2          = 2164663779327L;
     /** @deprecated aliases kept for ABI compatibility (FF_API_CHANNEL_LAYOUT_BACK). */
+    @Deprecated
     public static final long AV_CH_LAYOUT_5POINT1POINT4_BACK = 185871L;
     public static final long AV_CH_LAYOUT_7POINT1POINT4_BACK = 185919L;
     public static final long AV_CH_LAYOUT_9POINT1POINT4_BACK = 186111L;
@@ -4078,12 +4079,15 @@ public final class FFMpegNative {
     public static final int AV_CODEC_ID_ANULL = 0x21003; // = 135171
 
     /** @deprecated alias kept for parity with {@code AV_CODEC_ID_IFF_ILBM}. */
+    @Deprecated
     public static final int AV_CODEC_ID_IFF_BYTERUN1 = AV_CODEC_ID_IFF_ILBM;
 
     /** @deprecated alias kept for parity with {@code AV_CODEC_ID_HEVC}. */
+    @Deprecated
     public static final int AV_CODEC_ID_H265 = AV_CODEC_ID_HEVC;
 
     /** @deprecated alias kept for parity with {@code AV_CODEC_ID_VVC}. */
+    @Deprecated
     public static final int AV_CODEC_ID_H266 = AV_CODEC_ID_VVC;
 
     /**
