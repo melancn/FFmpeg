@@ -955,19 +955,20 @@ Java_org_ffmpeg_FFMpegNative_dictSet(JNIEnv *env, jobject thiz,
     if (!holder || !key)
         return AVERROR(EINVAL);
     const char *k = (*env)->GetStringUTFChars(env, key, NULL);
-    const char *v = val ? (*env)->GetStringUTFChars(env, val, NULL) : NULL;
-    /* AVDictionary values live in libavutil-allocated memory. Passing JNI
-     * scratch pointers (GetStringUTFChars) as READONLY would leave the entry
-     * pointing into a released VM buffer, and av_opt_set_dict() later *writes*
-     * through those pointers (that is where the av_dict_free/av_strdup pair
-     * blew up). Never hand a JNI string to libavutil: duplicate first. */
-    char *kcopy = k ? av_strdup(k) : NULL;
-    char *vcopy = v ? av_strdup(v) : NULL;
-    int ret = AVERROR(ENOMEM);
-    if (kcopy && (v == NULL || vcopy))
-        ret = av_dict_set(&holder->dict, kcopy, vcopy, flags);
-    av_free(kcopy);
-    av_free(vcopy);
+    const char *v = NULL;
+    int ret;
+
+    if (!k)
+        return AVERROR(ENOMEM);
+    if (val) {
+        v = (*env)->GetStringUTFChars(env, val, NULL);
+        if (!v) {
+            (*env)->ReleaseStringUTFChars(env, key, k);
+            return AVERROR(ENOMEM);
+        }
+    }
+    ret = av_dict_set(&holder->dict, k, v,
+                      flags & ~(AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL));
     (*env)->ReleaseStringUTFChars(env, key, k);
     if (val)
         (*env)->ReleaseStringUTFChars(env, val, v);
@@ -985,6 +986,8 @@ Java_org_ffmpeg_FFMpegNative_dictGet(JNIEnv *env, jobject thiz,
     if (!d)
         return NULL;
     const char *k = (*env)->GetStringUTFChars(env, key, NULL);
+    if (!k)
+        return NULL;
     AVDictionaryEntry *e = av_dict_get(d, k, NULL, flags);
     (*env)->ReleaseStringUTFChars(env, key, k);
     return e ? (*env)->NewStringUTF(env, e->value) : NULL;
@@ -3915,7 +3918,8 @@ Java_org_ffmpeg_FFMpegNative_dictCopy(JNIEnv *env, jobject thiz, jlong dstBox, j
     FFDictBox *srcHolder = srcBox ? ff_dict_box_from_handle(srcBox, "dictCopy(src)") : NULL;
     if (!dstHolder || (srcBox && !srcHolder))
         return AVERROR(EINVAL);
-    return (jint)av_dict_copy(&dstHolder->dict, srcHolder ? srcHolder->dict : NULL, flags);
+    return (jint)av_dict_copy(&dstHolder->dict, srcHolder ? srcHolder->dict : NULL,
+                              flags & ~(AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL));
 }
 
 JNIEXPORT jlong JNICALL
@@ -4968,9 +4972,29 @@ Java_org_ffmpeg_FFMpegNative_dictParseString(JNIEnv *env, jobject thiz,
     if (!holder || !str)
         return AVERROR(EINVAL);
     const char *s = (*env)->GetStringUTFChars(env, str, NULL);
-    const char *k = keyValSep ? (*env)->GetStringUTFChars(env, keyValSep, NULL) : NULL;
-    const char *p = pairsSep ? (*env)->GetStringUTFChars(env, pairsSep, NULL) : NULL;
-    int ret = av_dict_parse_string(&holder->dict, s, k ? k : ":", p ? p : ",", flags);
+    const char *k = NULL;
+    const char *p = NULL;
+    int ret;
+
+    if (!s)
+        return AVERROR(ENOMEM);
+    if (keyValSep) {
+        k = (*env)->GetStringUTFChars(env, keyValSep, NULL);
+        if (!k) {
+            (*env)->ReleaseStringUTFChars(env, str, s);
+            return AVERROR(ENOMEM);
+        }
+    }
+    if (pairsSep) {
+        p = (*env)->GetStringUTFChars(env, pairsSep, NULL);
+        if (!p) {
+            if (k) (*env)->ReleaseStringUTFChars(env, keyValSep, k);
+            (*env)->ReleaseStringUTFChars(env, str, s);
+            return AVERROR(ENOMEM);
+        }
+    }
+    ret = av_dict_parse_string(&holder->dict, s, k ? k : ":", p ? p : ",",
+                               flags & ~(AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL));
     (*env)->ReleaseStringUTFChars(env, str, s);
     if (k) (*env)->ReleaseStringUTFChars(env, keyValSep, k);
     if (p) (*env)->ReleaseStringUTFChars(env, pairsSep, p);
@@ -4984,8 +5008,20 @@ Java_org_ffmpeg_FFMpegNative_dictGetString(JNIEnv *env, jobject thiz, jlong box,
     if (!holder)
         return NULL;
     char *buf = NULL;
-    const char *k = keyValSep ? (*env)->GetStringUTFChars(env, keyValSep, NULL) : NULL;
-    const char *p = pairsSep ? (*env)->GetStringUTFChars(env, pairsSep, NULL) : NULL;
+    const char *k = NULL;
+    const char *p = NULL;
+    if (keyValSep) {
+        k = (*env)->GetStringUTFChars(env, keyValSep, NULL);
+        if (!k)
+            return NULL;
+    }
+    if (pairsSep) {
+        p = (*env)->GetStringUTFChars(env, pairsSep, NULL);
+        if (!p) {
+            if (k) (*env)->ReleaseStringUTFChars(env, keyValSep, k);
+            return NULL;
+        }
+    }
     int ret = av_dict_get_string(holder->dict, &buf, k ? k[0] : ':', p ? p[0] : ',');
     if (k) (*env)->ReleaseStringUTFChars(env, keyValSep, k);
     if (p) (*env)->ReleaseStringUTFChars(env, pairsSep, p);
@@ -6386,14 +6422,16 @@ Java_org_ffmpeg_FFMpegNative_dictSetInt(JNIEnv *env, jobject thiz,
                                         jlong box, jstring key, jlong value, jint flags)
 {
     FFDictBox *holder = ff_dict_box_from_handle(box, "dictSetInt");
+    const char *k;
+    int ret;
+
     if (!holder || !key)
         return AVERROR(EINVAL);
-    const char *k = (*env)->GetStringUTFChars(env, key, NULL);
-    /* Same reason as dictSet(): the key must outlive the JNI scratch copy. */
-    char *kcopy = k ? av_strdup(k) : NULL;
-    int ret = kcopy ? av_dict_set_int(&holder->dict, kcopy, (int64_t)value, flags)
-                    : AVERROR(ENOMEM);
-    av_free(kcopy);
+    k = (*env)->GetStringUTFChars(env, key, NULL);
+    if (!k)
+        return AVERROR(ENOMEM);
+    ret = av_dict_set_int(&holder->dict, k, (int64_t)value,
+                          flags & ~(AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL));
     (*env)->ReleaseStringUTFChars(env, key, k);
     return ret;
 }
@@ -6800,6 +6838,8 @@ Java_org_ffmpeg_FFMpegNative_streamGetMetadata(JNIEnv *env, jobject thiz,
     if (!d)
         return NULL;
     const char *k = (*env)->GetStringUTFChars(env, key, NULL);
+    if (!k)
+        return NULL;
     AVDictionaryEntry *e = av_dict_get(d, k, NULL, 0);
     (*env)->ReleaseStringUTFChars(env, key, k);
     return e ? (*env)->NewStringUTF(env, e->value) : NULL;
@@ -6814,8 +6854,19 @@ Java_org_ffmpeg_FFMpegNative_streamSetMetadata(JNIEnv *env, jobject thiz,
     if (!c || index < 0 || index >= (jint)c->nb_streams || !key)
         return AVERROR(EINVAL);
     const char *k = (*env)->GetStringUTFChars(env, key, NULL);
-    const char *v = val ? (*env)->GetStringUTFChars(env, val, NULL) : NULL;
-    int ret = av_dict_set(&c->streams[index]->metadata, k, v, 0);
+    const char *v = NULL;
+    int ret;
+
+    if (!k)
+        return AVERROR(ENOMEM);
+    if (val) {
+        v = (*env)->GetStringUTFChars(env, val, NULL);
+        if (!v) {
+            (*env)->ReleaseStringUTFChars(env, key, k);
+            return AVERROR(ENOMEM);
+        }
+    }
+    ret = av_dict_set(&c->streams[index]->metadata, k, v, 0);
     (*env)->ReleaseStringUTFChars(env, key, k);
     if (val)
         (*env)->ReleaseStringUTFChars(env, val, v);

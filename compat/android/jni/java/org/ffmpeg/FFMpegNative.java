@@ -3126,8 +3126,15 @@ public final class FFMpegNative {
     public static final int AV_PIX_FMT_YUYV422 = 1;
     public static final int AV_PIX_FMT_RGB24    = 2;
     public static final int AV_PIX_FMT_BGR24    = 3;
+    public static final int AV_PIX_FMT_YUV422P      = 4;
+    public static final int AV_PIX_FMT_YUV444P      = 5;
+    public static final int AV_PIX_FMT_NV21         = 24;
     public static final int AV_PIX_FMT_RGBA     = 26;
     public static final int AV_PIX_FMT_BGRA     = 28;
+    public static final int AV_PIX_FMT_YUV420P10LE  = 62;
+    public static final int AV_PIX_FMT_YUV422P10LE  = 64;
+    public static final int AV_PIX_FMT_YUV444P10LE  = 68;
+    public static final int AV_PIX_FMT_P010LE       = 158;
     /**
      * Software NV12 (Y + interleaved UV). The mediacodec decoder falls back
      * to this format (mapped from the platform {@code COLOR_FormatYUV420*}
@@ -3164,6 +3171,8 @@ public final class FFMpegNative {
     public static final int AV_SAMPLE_FMT_S32P   = 7;
     public static final int AV_SAMPLE_FMT_FLTP    = 8;
     public static final int AV_SAMPLE_FMT_DBLP    = 9;
+    public static final int AV_SAMPLE_FMT_S64     = 10;
+    public static final int AV_SAMPLE_FMT_S64P    = 11;
 
     /**
      * Channel constants mirrored from {@code libavutil/channel_layout.h}.
@@ -3327,15 +3336,38 @@ public final class FFMpegNative {
     public static final int SWS_POINT            = 0x10;
     public static final int SWS_AREA              = 0x20;
     public static final int SWS_BICUBLIN          = 0x40;
-    public static final int SWS_LANCZOS           = 0x80;
+    public static final int SWS_GAUSS             = 0x80;
+    public static final int SWS_SINC              = 0x100;
+    public static final int SWS_LANCZOS           = 0x200;
+    public static final int SWS_SPLINE            = 0x400;
+    public static final int SWS_STRICT            = 0x800;
+    public static final int SWS_PRINT_INFO        = 0x1000;
+    public static final int SWS_FULL_CHR_H_INT    = 0x2000;
+    public static final int SWS_FULL_CHR_H_INP    = 0x4000;
+    public static final int SWS_DIRECT_BGR        = 0x8000;
+    public static final int SWS_ACCURATE_RND      = 0x40000;
+    public static final int SWS_BITEXACT          = 0x80000;
+    public static final int SWS_ERROR_DIFFUSION   = 0x800000;
+    public static final int SWS_PARAM_DEFAULT     = 123456;
+    public static final int SWS_CS_ITU709         = 1;
+    public static final int SWS_CS_FCC            = 4;
+    public static final int SWS_CS_ITU601         = 5;
+    public static final int SWS_CS_ITU624         = 5;
+    public static final int SWS_CS_SMPTE170M      = 5;
+    public static final int SWS_CS_SMPTE240M      = 7;
+    public static final int SWS_CS_BT2020         = 9;
+    public static final int SWS_CS_DEFAULT        = 5;
 
     /** Dictionary flags mirroring {@code AV_DICT_*}. */
     public static final int AV_DICT_MATCH_CASE    = 1;
     public static final int AV_DICT_IGNORE_SUFFIX = 2;
-    public static final int AV_DICT_DONT_STRDUP    = 4;
+    public static final int AV_DICT_DONT_STRDUP_KEY = 4;
+    public static final int AV_DICT_DONT_STRDUP_VAL = 8;
+    public static final int AV_DICT_DONT_STRDUP    = AV_DICT_DONT_STRDUP_KEY;
     public static final int AV_DICT_DONT_OVERWRITE  = 16;
     public static final int AV_DICT_APPEND          = 32;
     public static final int AV_DICT_MULTIKEY        = 64;
+    public static final int AV_DICT_DEDUP           = 128;
 
     /** Seek flags mirroring {@code AVSEEK_FLAG_*}. */
     public static final int AVSEEK_FLAG_BACKWARD = 1;
@@ -4206,4 +4238,257 @@ public final class FFMpegNative {
     public static final int AV_OPT_FLAG_RUNTIME_PARAM   = 1 << 15;  /* 32768 */
     public static final int AV_OPT_FLAG_FILTERING_PARAM = 1 << 16;  /* 65536 */
     public static final int AV_OPT_FLAG_DEPRECATED      = 1 << 17;  /* 131072 */
+
+    public static final int AV_OPT_TYPE_FLAGS       = 1;
+    public static final int AV_OPT_TYPE_INT         = 2;
+    public static final int AV_OPT_TYPE_INT64       = 3;
+    public static final int AV_OPT_TYPE_DOUBLE      = 4;
+    public static final int AV_OPT_TYPE_FLOAT       = 5;
+    public static final int AV_OPT_TYPE_STRING      = 6;
+    public static final int AV_OPT_TYPE_RATIONAL    = 7;
+    public static final int AV_OPT_TYPE_BINARY      = 8;
+    public static final int AV_OPT_TYPE_DICT        = 9;
+    public static final int AV_OPT_TYPE_UINT64      = 10;
+    public static final int AV_OPT_TYPE_CONST       = 11;
+    public static final int AV_OPT_TYPE_IMAGE_SIZE  = 12;
+    public static final int AV_OPT_TYPE_PIXEL_FMT   = 13;
+    public static final int AV_OPT_TYPE_SAMPLE_FMT  = 14;
+    public static final int AV_OPT_TYPE_VIDEO_RATE  = 15;
+    public static final int AV_OPT_TYPE_DURATION    = 16;
+    public static final int AV_OPT_TYPE_COLOR       = 17;
+    public static final int AV_OPT_TYPE_BOOL        = 18;
+    public static final int AV_OPT_TYPE_CHLAYOUT    = 19;
+    public static final int AV_OPT_TYPE_UINT        = 20;
+    public static final int AV_OPT_TYPE_FLAG_ARRAY  = 65536;
+
+    public static final int AV_PKT_DATA_PALETTE                       = 0;
+    public static final int AV_PKT_DATA_NEW_EXTRADATA                 = 1;
+    public static final int AV_PKT_DATA_PARAM_CHANGE                  = 2;
+    public static final int AV_PKT_DATA_H263_MB_INFO                  = 3;
+    public static final int AV_PKT_DATA_REPLAYGAIN                    = 4;
+    public static final int AV_PKT_DATA_DISPLAYMATRIX                 = 5;
+    public static final int AV_PKT_DATA_STEREO3D                      = 6;
+    public static final int AV_PKT_DATA_AUDIO_SERVICE_TYPE            = 7;
+    public static final int AV_PKT_DATA_QUALITY_STATS                 = 8;
+    public static final int AV_PKT_DATA_FALLBACK_TRACK                = 9;
+    public static final int AV_PKT_DATA_CPB_PROPERTIES                = 10;
+    public static final int AV_PKT_DATA_SKIP_SAMPLES                  = 11;
+    public static final int AV_PKT_DATA_JP_DUALMONO                   = 12;
+    public static final int AV_PKT_DATA_STRINGS_METADATA              = 13;
+    public static final int AV_PKT_DATA_SUBTITLE_POSITION             = 14;
+    public static final int AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL      = 15;
+    public static final int AV_PKT_DATA_WEBVTT_IDENTIFIER             = 16;
+    public static final int AV_PKT_DATA_WEBVTT_SETTINGS               = 17;
+    public static final int AV_PKT_DATA_METADATA_UPDATE               = 18;
+    public static final int AV_PKT_DATA_MPEGTS_STREAM_ID              = 19;
+    public static final int AV_PKT_DATA_MASTERING_DISPLAY_METADATA    = 20;
+    public static final int AV_PKT_DATA_SPHERICAL                     = 21;
+    public static final int AV_PKT_DATA_CONTENT_LIGHT_LEVEL           = 22;
+    public static final int AV_PKT_DATA_A53_CC                        = 23;
+    public static final int AV_PKT_DATA_ENCRYPTION_INIT_INFO          = 24;
+    public static final int AV_PKT_DATA_ENCRYPTION_INFO               = 25;
+    public static final int AV_PKT_DATA_AFD                           = 26;
+    public static final int AV_PKT_DATA_PRFT                          = 27;
+    public static final int AV_PKT_DATA_ICC_PROFILE                   = 28;
+    public static final int AV_PKT_DATA_DOVI_CONF                     = 29;
+    public static final int AV_PKT_DATA_S12M_TIMECODE                 = 30;
+    public static final int AV_PKT_DATA_DYNAMIC_HDR10_PLUS            = 31;
+    public static final int AV_PKT_DATA_IAMF_MIX_GAIN_PARAM           = 32;
+    public static final int AV_PKT_DATA_IAMF_DEMIXING_INFO_PARAM      = 33;
+    public static final int AV_PKT_DATA_IAMF_RECON_GAIN_INFO_PARAM    = 34;
+    public static final int AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT  = 35;
+    public static final int AV_PKT_DATA_FRAME_CROPPING                = 36;
+    public static final int AV_PKT_DATA_LCEVC                         = 37;
+    public static final int AV_PKT_DATA_3D_REFERENCE_DISPLAYS         = 38;
+    public static final int AV_PKT_DATA_RTCP_SR                        = 39;
+    public static final int AV_PKT_DATA_EXIF                          = 40;
+    public static final int AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5   = 41;
+    public static final int AV_PKT_DATA_HEVC_CONF                     = 42;
+    public static final int AV_PKT_DATA_GAIN_MAP_PARAMS               = 43;
+    public static final int AV_PKT_DATA_NB                            = 44;
+
+    public static final int AV_SIDE_DATA_PARAM_CHANGE_SAMPLE_RATE  = 0x0004;
+    public static final int AV_SIDE_DATA_PARAM_CHANGE_DIMENSIONS   = 0x0008;
+
+    public static final int AVERROR_BSF_NOT_FOUND       = -1179861752;
+    public static final int AVERROR_BUG                 = -558323010;
+    public static final int AVERROR_BUFFER_TOO_SMALL    = -1397118274;
+    public static final int AVERROR_DECODER_NOT_FOUND   = -1128613112;
+    public static final int AVERROR_DEMUXER_NOT_FOUND   = -1296385272;
+    public static final int AVERROR_ENCODER_NOT_FOUND   = -1129203192;
+    public static final int AVERROR_EOF                 = -541478725;
+    public static final int AVERROR_EXIT                = -1414092869;
+    public static final int AVERROR_EXTERNAL            = -542398533;
+    public static final int AVERROR_FILTER_NOT_FOUND    = -1279870712;
+    public static final int AVERROR_INVALIDDATA         = -1094995529;
+    public static final int AVERROR_MUXER_NOT_FOUND     = -1481985528;
+    public static final int AVERROR_OPTION_NOT_FOUND    = -1414549496;
+    public static final int AVERROR_PATCHWELCOME        = -1163346256;
+    public static final int AVERROR_PROTOCOL_NOT_FOUND  = -1330794744;
+    public static final int AVERROR_STREAM_NOT_FOUND    = -1381258232;
+    public static final int AVERROR_BUG2                = -541545794;
+    public static final int AVERROR_UNKNOWN             = -1313558101;
+    public static final int AVERROR_EXPERIMENTAL        = -733130664;
+    public static final int AVERROR_INPUT_CHANGED       = -1668179713;
+    public static final int AVERROR_OUTPUT_CHANGED      = -1668179714;
+    public static final int AVERROR_HTTP_BAD_REQUEST    = -808465656;
+    public static final int AVERROR_HTTP_UNAUTHORIZED   = -825242872;
+    public static final int AVERROR_HTTP_FORBIDDEN      = -858797304;
+    public static final int AVERROR_HTTP_NOT_FOUND      = -875574520;
+    public static final int AVERROR_HTTP_TOO_MANY_REQUESTS = -959591672;
+    public static final int AVERROR_HTTP_OTHER_4XX      = -1482175736;
+    public static final int AVERROR_HTTP_SERVER_ERROR   = -1482175992;
+
+    public static final int AVERROR_E2BIG   = -7;
+    public static final int AVERROR_ENOENT  = -2;
+    public static final int AVERROR_EAGAIN  = -11;
+    public static final int AVERROR_ENOMEM  = -12;
+    public static final int AVERROR_EINVAL  = -22;
+    public static final int AVERROR_ENOSPC  = -28;
+    public static final int AVERROR_ENOSYS  = -38;
+
+    public static final int AV_DISPOSITION_DEFAULT            = 1;
+    public static final int AV_DISPOSITION_DUB                = 2;
+    public static final int AV_DISPOSITION_ORIGINAL           = 4;
+    public static final int AV_DISPOSITION_COMMENT            = 8;
+    public static final int AV_DISPOSITION_LYRICS             = 16;
+    public static final int AV_DISPOSITION_KARAOKE            = 32;
+    public static final int AV_DISPOSITION_FORCED             = 64;
+    public static final int AV_DISPOSITION_HEARING_IMPAIRED   = 128;
+    public static final int AV_DISPOSITION_VISUAL_IMPAIRED    = 256;
+    public static final int AV_DISPOSITION_CLEAN_EFFECTS      = 512;
+    public static final int AV_DISPOSITION_ATTACHED_PIC       = 1024;
+    public static final int AV_DISPOSITION_TIMED_THUMBNAILS   = 2048;
+    public static final int AV_DISPOSITION_NON_DIEGETIC       = 4096;
+    public static final int AV_DISPOSITION_CAPTIONS           = 65536;
+    public static final int AV_DISPOSITION_DESCRIPTIONS       = 131072;
+    public static final int AV_DISPOSITION_METADATA           = 262144;
+    public static final int AV_DISPOSITION_DEPENDENT          = 524288;
+    public static final int AV_DISPOSITION_STILL_IMAGE        = 1048576;
+    public static final int AV_DISPOSITION_MULTILAYER         = 2097152;
+
+    public static final int AVCOL_RANGE_UNSPECIFIED  = 0;
+    public static final int AVCOL_RANGE_MPEG         = 1;
+    public static final int AVCOL_RANGE_JPEG         = 2;
+    public static final int AVCOL_RANGE_NB           = 3;
+
+    public static final int AVCOL_SPC_RGB                = 0;
+    public static final int AVCOL_SPC_BT709              = 1;
+    public static final int AVCOL_SPC_UNSPECIFIED        = 2;
+    public static final int AVCOL_SPC_RESERVED           = 3;
+    public static final int AVCOL_SPC_FCC                = 4;
+    public static final int AVCOL_SPC_BT470BG            = 5;
+    public static final int AVCOL_SPC_SMPTE170M          = 6;
+    public static final int AVCOL_SPC_SMPTE240M          = 7;
+    public static final int AVCOL_SPC_YCGCO              = 8;
+    public static final int AVCOL_SPC_BT2020_NCL         = 9;
+    public static final int AVCOL_SPC_BT2020_CL          = 10;
+    public static final int AVCOL_SPC_SMPTE2085          = 11;
+    public static final int AVCOL_SPC_CHROMA_DERIVED_NCL = 12;
+    public static final int AVCOL_SPC_CHROMA_DERIVED_CL  = 13;
+    public static final int AVCOL_SPC_ICTCP              = 14;
+    public static final int AVCOL_SPC_IPT_C2             = 15;
+    public static final int AVCOL_SPC_YCGCO_RE           = 16;
+    public static final int AVCOL_SPC_YCGCO_RO           = 17;
+    public static final int AVCOL_SPC_YCOCG              = 8;
+    public static final int AVCOL_SPC_NB                 = 18;
+
+    public static final int AVCOL_PRI_RESERVED0      = 0;
+    public static final int AVCOL_PRI_BT709          = 1;
+    public static final int AVCOL_PRI_UNSPECIFIED    = 2;
+    public static final int AVCOL_PRI_RESERVED       = 3;
+    public static final int AVCOL_PRI_BT470M         = 4;
+    public static final int AVCOL_PRI_BT470BG        = 5;
+    public static final int AVCOL_PRI_SMPTE170M      = 6;
+    public static final int AVCOL_PRI_SMPTE240M      = 7;
+    public static final int AVCOL_PRI_FILM           = 8;
+    public static final int AVCOL_PRI_BT2020         = 9;
+    public static final int AVCOL_PRI_SMPTEST428_1   = 10;
+    public static final int AVCOL_PRI_SMPTE428       = 10;
+    public static final int AVCOL_PRI_SMPTE431       = 11;
+    public static final int AVCOL_PRI_SMPTE432       = 12;
+    public static final int AVCOL_PRI_JEDEC_P22      = 22;
+    public static final int AVCOL_PRI_EBU3213        = 22;
+    public static final int AVCOL_PRI_V_GAMUT        = 256;
+    public static final int AVCOL_PRI_EXT_BASE       = 256;
+    public static final int AVCOL_PRI_EXT_NB         = 257;
+    public static final int AVCOL_PRI_NB             = 23;
+
+    public static final int AVCOL_TRC_RESERVED0      = 0;
+    public static final int AVCOL_TRC_BT709          = 1;
+    public static final int AVCOL_TRC_UNSPECIFIED    = 2;
+    public static final int AVCOL_TRC_RESERVED       = 3;
+    public static final int AVCOL_TRC_GAMMA22        = 4;
+    public static final int AVCOL_TRC_GAMMA28        = 5;
+    public static final int AVCOL_TRC_SMPTE170M      = 6;
+    public static final int AVCOL_TRC_SMPTE240M      = 7;
+    public static final int AVCOL_TRC_LINEAR         = 8;
+    public static final int AVCOL_TRC_LOG            = 9;
+    public static final int AVCOL_TRC_LOG_SQRT       = 10;
+    public static final int AVCOL_TRC_IEC61966_2_4   = 11;
+    public static final int AVCOL_TRC_BT1361_ECG     = 12;
+    public static final int AVCOL_TRC_IEC61966_2_1   = 13;
+    public static final int AVCOL_TRC_BT2020_10      = 14;
+    public static final int AVCOL_TRC_BT2020_12      = 15;
+    public static final int AVCOL_TRC_SMPTEST2084    = 16;
+    public static final int AVCOL_TRC_SMPTE2084      = 16;
+    public static final int AVCOL_TRC_SMPTEST428_1   = 17;
+    public static final int AVCOL_TRC_SMPTE428       = 17;
+    public static final int AVCOL_TRC_ARIB_STD_B67   = 18;
+    public static final int AVCOL_TRC_V_LOG          = 256;
+    public static final int AVCOL_TRC_EXT_BASE       = 256;
+    public static final int AVCOL_TRC_EXT_NB         = 257;
+    public static final int AVCOL_TRC_NB             = 19;
+
+    public static final int AV_PICTURE_TYPE_NONE  = 0;
+    public static final int AV_PICTURE_TYPE_I     = 1;
+    public static final int AV_PICTURE_TYPE_P     = 2;
+    public static final int AV_PICTURE_TYPE_B     = 3;
+    public static final int AV_PICTURE_TYPE_S     = 4;
+    public static final int AV_PICTURE_TYPE_SI    = 5;
+    public static final int AV_PICTURE_TYPE_SP    = 6;
+    public static final int AV_PICTURE_TYPE_BI    = 7;
+
+    public static final int AV_BUFFERSRC_FLAG_NO_CHECK_FORMAT  = 1;
+    public static final int AV_BUFFERSRC_FLAG_PUSH             = 4;
+    public static final int AV_BUFFERSRC_FLAG_KEEP_REF         = 8;
+
+    public static final int AV_BUFFERSINK_FLAG_PEEK        = 1;
+    public static final int AV_BUFFERSINK_FLAG_NO_REQUEST  = 2;
+
+    public static final int AVFILTER_CMD_FLAG_ONE   = 1;
+    public static final int AVFILTER_CMD_FLAG_FAST  = 2;
+
+    public static final int AV_HWFRAME_MAP_READ       = 1;
+    public static final int AV_HWFRAME_MAP_WRITE      = 2;
+    public static final int AV_HWFRAME_MAP_OVERWRITE  = 4;
+    public static final int AV_HWFRAME_MAP_DIRECT     = 8;
+
+    public static final int AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX  = 1;
+    public static final int AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX  = 2;
+    public static final int AV_CODEC_HW_CONFIG_METHOD_INTERNAL       = 4;
+    public static final int AV_CODEC_HW_CONFIG_METHOD_AD_HOC         = 8;
+
+    public static final int AV_CODEC_PROP_INTRA_ONLY   = 1;
+    public static final int AV_CODEC_PROP_LOSSY        = 2;
+    public static final int AV_CODEC_PROP_LOSSLESS     = 4;
+    public static final int AV_CODEC_PROP_REORDER      = 8;
+    public static final int AV_CODEC_PROP_FIELDS       = 16;
+    public static final int AV_CODEC_PROP_ENHANCEMENT  = 32;
+    public static final int AV_CODEC_PROP_BITMAP_SUB   = 65536;
+    public static final int AV_CODEC_PROP_TEXT_SUB     = 131072;
+
+    public static final int FF_LOSS_RESOLUTION       = 1;
+    public static final int FF_LOSS_DEPTH            = 2;
+    public static final int FF_LOSS_COLORSPACE       = 4;
+    public static final int FF_LOSS_ALPHA            = 8;
+    public static final int FF_LOSS_COLORQUANT       = 16;
+    public static final int FF_LOSS_CHROMA           = 32;
+    public static final int FF_LOSS_EXCESS_RESOLUTION = 64;
+    public static final int FF_LOSS_EXCESS_DEPTH     = 128;
+
+    public static final int AVALPHA_MODE_UNSPECIFIED    = 0;
+    public static final int AVALPHA_MODE_PREMULTIPLIED  = 1;
+    public static final int AVALPHA_MODE_STRAIGHT       = 2;
+    public static final int AVALPHA_MODE_NB             = 3;
 }

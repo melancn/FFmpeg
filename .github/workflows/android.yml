@@ -455,11 +455,74 @@ jobs:
           # FFMpegNative.java references android.view.Surface, so javac needs
           # android.jar on the classpath to resolve it.
           ANDROID_JAR="$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)"
-          javac --release 17 -encoding UTF-8 -classpath "$ANDROID_JAR" \
+          javac --release 17 -Xlint:all -encoding UTF-8 -classpath "$ANDROID_JAR" \
             -h "$JNI_DIR/generated" -d "$JNI_DIR/generated" \
             "$JNI_DIR/java/org/ffmpeg/FFMpegNative.java"
           # The header is named after the class: org_ffmpeg_FFMpegNative.h
           ls -l "$JNI_DIR/generated/"
+
+      - name: Verify exported Java constants against Android headers
+        env:
+          CC: ${{ steps.toolchain.outputs.cc }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import subprocess
+
+          generated = pathlib.Path("compat/android/jni/generated")
+          declarations = subprocess.check_output(
+              ["javap", "-constants", "-classpath", str(generated), "org.ffmpeg.FFMpegNative"],
+              text=True,
+          )
+          prefixes = (
+              "AV_PKT_DATA_", "AV_SIDE_DATA_PARAM_CHANGE_", "AVERROR_",
+              "AV_DISPOSITION_", "AVCOL_", "AV_PICTURE_TYPE_",
+              "AV_BUFFERSRC_FLAG_", "AV_BUFFERSINK_FLAG_", "AVFILTER_CMD_FLAG_",
+              "AV_HWFRAME_MAP_", "AV_CODEC_HW_CONFIG_METHOD_", "AV_CODEC_PROP_",
+              "AV_OPT_TYPE_", "FF_LOSS_", "AVALPHA_MODE_", "AV_SAMPLE_FMT_",
+              "AV_PIX_FMT_", "SWS_", "AV_DICT_",
+          )
+          aliases = {"AV_DICT_DONT_STRDUP": "AV_DICT_DONT_STRDUP_KEY"}
+          for errno in ("EAGAIN", "EINVAL", "ENOMEM", "ENOENT", "ENOSPC", "ENOSYS", "E2BIG"):
+              aliases["AVERROR_" + errno] = "AVERROR(" + errno + ")"
+          includes = (
+              "errno.h", "libavcodec/packet.h", "libavcodec/codec.h",
+              "libavcodec/codec_desc.h", "libavformat/avformat.h",
+              "libavutil/avutil.h", "libavutil/error.h", "libavutil/dict.h",
+              "libavutil/pixfmt.h", "libavutil/pixdesc.h", "libavutil/samplefmt.h",
+              "libavutil/hwcontext.h", "libavutil/opt.h",
+              "libavfilter/avfilter.h", "libavfilter/buffersrc.h",
+              "libavfilter/buffersink.h", "libswscale/swscale.h",
+          )
+          lines = ['#include "' + name + '"' for name in includes]
+          constants = dict(re.findall(
+              r"^\s*public static final int (\w+) = (-?\d+);$", declarations, re.M
+          ))
+          if not constants:
+              raise SystemExit("No compiled Java integer constants found in javap output")
+          selected = {name: value for name, value in constants.items() if name.startswith(prefixes)}
+          for prefix in prefixes:
+              if not any(name.startswith(prefix) for name in selected):
+                  raise SystemExit("Missing exported constant family: " + prefix)
+          required = (
+              "AV_PKT_DATA_PALETTE", "AV_PKT_DATA_GAIN_MAP_PARAMS",
+              "AV_SAMPLE_FMT_S64", "AV_SAMPLE_FMT_S64P", "SWS_LANCZOS",
+              "AV_OPT_TYPE_FLAG_ARRAY", "AV_DICT_DONT_STRDUP_KEY",
+              "AV_DICT_DONT_STRDUP_VAL", "AV_DICT_DEDUP",
+          ) + tuple(aliases)
+          for name in required:
+              if name not in selected:
+                  raise SystemExit("Missing exported constant: " + name)
+          for name, value in sorted(selected.items()):
+              native = aliases.get(name, name)
+              lines.append(f'_Static_assert(({native}) == ({value}), "Java constant mismatch: {name}");')
+          (generated / "constants_check.c").write_text("\n".join(lines) + "\n")
+          print(f"Checking {len(selected)} exported Java constants against native headers")
+          PY
+          "$CC" -std=c11 -Werror -fsyntax-only -I"$PWD" \
+            compat/android/jni/generated/constants_check.c
 
       - name: Verify every native declaration has a JNI implementation
         run: |

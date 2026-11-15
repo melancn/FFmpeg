@@ -1036,7 +1036,16 @@ typedef struct FFTestJniState {
     int   exception;                      /* a pending exception is set   */
     int   calls;                          /* completed Set*Region calls    */
     int   fail_publish;                   /* inject: Set*Region raises    */
+    int   string_calls;
+    int   fail_string_at;
+    int   string_releases;
+    int   release_null;
 } FFTestJniState;
+
+typedef struct FFTestJniString {
+    jsize length;
+    char  data[1];
+} FFTestJniString;
 
 /* Allocates a stub array holding `nelem` elements of `elem_size` bytes.
  * length is the element count, capacity is what fits in data[]. */
@@ -1062,6 +1071,62 @@ static void fftest_jni_reset(void)
     memset(&g_fftest_jni, 0, sizeof(g_fftest_jni));
     g_fftest_jni.last_byte_len = -1;
     g_fftest_jni.last_long_len = -1;
+}
+
+static FFTestJniString *fftest_string_new(const char *text)
+{
+    const size_t len = text ? strlen(text) : 0;
+    FFTestJniString *s = av_mallocz(sizeof(*s) + len + 1);
+
+    if (!s)
+        return NULL;
+    s->length = (jsize)len;
+    if (len)
+        memcpy(s->data, text, len);
+    return s;
+}
+
+static const char *fftest_string_text(jstring s)
+{
+    const FFTestJniString *str = (const FFTestJniString *)(const void *)s;
+
+    return str ? str->data : NULL;
+}
+
+static const char *fftest_get_string_utf_chars(JNIEnv *env, jstring s, jboolean *is_copy)
+{
+    const FFTestJniString *str = (const FFTestJniString *)(const void *)s;
+
+    (void)env;
+    g_fftest_jni.string_calls++;
+    if (g_fftest_jni.fail_string_at &&
+        g_fftest_jni.string_calls == g_fftest_jni.fail_string_at) {
+        g_fftest_jni.exception = 1;
+        return NULL;
+    }
+    if (is_copy)
+        *is_copy = JNI_FALSE;
+    return str ? str->data : NULL;
+}
+
+static void fftest_release_string_utf_chars(JNIEnv *env, jstring s, const char *utf)
+{
+    FFTestJniString *str = (FFTestJniString *)(void *)s;
+
+    (void)env;
+    if (!utf) {
+        g_fftest_jni.release_null++;
+        return;
+    }
+    g_fftest_jni.string_releases++;
+    if (str && utf == str->data && str->length > 0)
+        memset(str->data, '~', (size_t)str->length);
+}
+
+static jstring fftest_new_string_utf(JNIEnv *env, const char *utf)
+{
+    (void)env;
+    return (jstring)(void *)fftest_string_new(utf);
 }
 
 static int fftest_last_status(void)
@@ -1232,6 +1297,9 @@ static void fftest_init_functions(void)
     g_fftest_functions.SetByteArrayRegion = fftest_set_byte_region;
     g_fftest_functions.SetIntArrayRegion  = fftest_set_int_region;
     g_fftest_functions.SetLongArrayRegion = fftest_set_long_region;
+    g_fftest_functions.GetStringUTFChars     = fftest_get_string_utf_chars;
+    g_fftest_functions.ReleaseStringUTFChars = fftest_release_string_utf_chars;
+    g_fftest_functions.NewStringUTF          = fftest_new_string_utf;
 }
 
 /* JNIEnv is a pointer TYPE, not a struct: jni.h declares
@@ -3590,6 +3658,440 @@ static void test_normalize_mask_helper(void)
     CHECK(NORMALIZE_MASK(AV_CH_LAYOUT_5POINT1, 2) == AVERROR(EINVAL));
 }
 
+static jlong test_dict_create(JNIEnv *env)
+{
+    return Java_org_ffmpeg_FFMpegNative_dictCreate(env, NULL);
+}
+
+static AVDictionaryEntry *test_dict_entry(jlong box, const char *key)
+{
+    FFDictBox *holder = ff_dict_box_from_handle(box, "test");
+
+    return holder ? av_dict_get(holder->dict, key, NULL, 0) : NULL;
+}
+
+static void test_dict_set_transfer_flags_keep_keys_caller_owned(void)
+{
+    JNIEnv env = fftest_jni_env();
+    FFTestJniString *key = fftest_string_new("fftest-key");
+    FFTestJniString *val = fftest_string_new("fftest-value");
+    FFTestJniString *probe = fftest_string_new("fftest-key");
+    const AVDictionaryEntry *e = NULL;
+    FFDictBox *holder = NULL;
+    jstring got = NULL;
+    jlong box = 0;
+    int ret;
+
+    fftest_jni_reset();
+    CHECK(key && val && probe);
+    if (!key || !val || !probe)
+        goto out;
+
+    box = test_dict_create(&env);
+    CHECK(box != 0);
+    if (!box)
+        goto out;
+
+    ret = Java_org_ffmpeg_FFMpegNative_dictSet(
+              &env, NULL, box, (jstring)(void *)key, (jstring)(void *)val,
+              AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL);
+    CHECK_OK(ret);
+    CHECK(g_fftest_jni.release_null == 0);
+    CHECK(g_fftest_jni.string_releases == 2);
+    CHECK(key->data[0] == '~');
+    CHECK(val->data[0] == '~');
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictCount(&env, NULL, box) == 1);
+
+    holder = ff_dict_box_from_handle(box, "test");
+    CHECK(holder != NULL);
+    e = holder ? av_dict_iterate(holder->dict, NULL) : NULL;
+    CHECK(e != NULL);
+    if (e) {
+        CHECK(strcmp(e->key, "fftest-key") == 0);
+        CHECK(strcmp(e->value, "fftest-value") == 0);
+        CHECK(e->key != key->data);
+        CHECK(e->value != val->data);
+    }
+
+    got = Java_org_ffmpeg_FFMpegNative_dictGet(&env, NULL, box,
+                                              (jstring)(void *)probe, 0);
+    CHECK(got != NULL);
+    if (got)
+        CHECK(strcmp(fftest_string_text(got), "fftest-value") == 0);
+    av_free((void *)(intptr_t)got);
+
+    Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, box);
+    box = 0;
+out:
+    if (box)
+        Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, box);
+    av_free(key);
+    av_free(val);
+    av_free(probe);
+}
+
+static void test_dict_set_int_transfer_flag_keeps_key_caller_owned(void)
+{
+    JNIEnv env = fftest_jni_env();
+    FFTestJniString *key = fftest_string_new("fftest-int-key");
+    const AVDictionaryEntry *e;
+    jlong box = 0;
+    int ret;
+
+    fftest_jni_reset();
+    CHECK(key != NULL);
+    if (!key)
+        return;
+
+    box = test_dict_create(&env);
+    CHECK(box != 0);
+    if (!box) {
+        av_free(key);
+        return;
+    }
+
+    ret = Java_org_ffmpeg_FFMpegNative_dictSetInt(&env, NULL, box,
+                                                  (jstring)(void *)key, 4242,
+                                                  AV_DICT_DONT_STRDUP_KEY);
+    CHECK_OK(ret);
+    CHECK(g_fftest_jni.release_null == 0);
+    CHECK(key->data[0] == '~');
+
+    e = test_dict_entry(box, "fftest-int-key");
+    CHECK(e != NULL);
+    if (e) {
+        CHECK(strcmp(e->value, "4242") == 0);
+        CHECK(e->key != key->data);
+    }
+
+    Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, box);
+    av_free(key);
+}
+
+static void test_dict_string_lookup_failure_keeps_entry(void)
+{
+    JNIEnv env = fftest_jni_env();
+    FFTestJniString *key = fftest_string_new("fftest-k");
+    FFTestJniString *val = fftest_string_new("fftest-v");
+    FFTestJniString *key2 = fftest_string_new("fftest-k");
+    FFTestJniString *val2 = fftest_string_new("fftest-v2");
+    const AVDictionaryEntry *e;
+    jlong box = 0;
+    int ret;
+
+    fftest_jni_reset();
+    CHECK(key && val && key2 && val2);
+    if (!key || !val || !key2 || !val2)
+        goto out;
+
+    box = test_dict_create(&env);
+    CHECK(box != 0);
+    if (!box)
+        goto out;
+
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_dictSet(&env, NULL, box,
+                                                 (jstring)(void *)key,
+                                                 (jstring)(void *)val, 0));
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictCount(&env, NULL, box) == 1);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_string_at = 2;
+    ret = Java_org_ffmpeg_FFMpegNative_dictSet(&env, NULL, box,
+                                               (jstring)(void *)key2,
+                                               (jstring)(void *)val2, 0);
+    CHECK_AVERROR(ret, ENOMEM);
+    CHECK(g_fftest_jni.exception != 0);
+    CHECK(g_fftest_jni.release_null == 0);
+    CHECK(g_fftest_jni.string_releases == 1);
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictCount(&env, NULL, box) == 1);
+    e = test_dict_entry(box, "fftest-k");
+    CHECK(e != NULL);
+    if (e)
+        CHECK(strcmp(e->value, "fftest-v") == 0);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_string_at = 1;
+    ret = Java_org_ffmpeg_FFMpegNative_dictSet(&env, NULL, box,
+                                               (jstring)(void *)key2,
+                                               (jstring)(void *)val2,
+                                               AV_DICT_DONT_STRDUP_KEY);
+    CHECK_AVERROR(ret, ENOMEM);
+    CHECK(g_fftest_jni.exception != 0);
+    CHECK(g_fftest_jni.release_null == 0);
+    CHECK(g_fftest_jni.string_releases == 0);
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictCount(&env, NULL, box) == 1);
+    e = test_dict_entry(box, "fftest-k");
+    CHECK(e != NULL);
+    if (e)
+        CHECK(strcmp(e->value, "fftest-v") == 0);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_string_at = 1;
+    ret = Java_org_ffmpeg_FFMpegNative_dictSetInt(&env, NULL, box,
+                                                  (jstring)(void *)key2, 7,
+                                                  AV_DICT_DONT_STRDUP_KEY);
+    CHECK_AVERROR(ret, ENOMEM);
+    CHECK(g_fftest_jni.exception != 0);
+    CHECK(g_fftest_jni.release_null == 0);
+    CHECK(g_fftest_jni.string_releases == 0);
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictCount(&env, NULL, box) == 1);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_string_at = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictGet(&env, NULL, box,
+                                               (jstring)(void *)key2, 0) == NULL);
+    CHECK(g_fftest_jni.exception != 0);
+    CHECK(g_fftest_jni.release_null == 0);
+    CHECK(g_fftest_jni.string_releases == 0);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_string_at = 1;
+    ret = Java_org_ffmpeg_FFMpegNative_dictParseString(&env, NULL, box,
+                                                       (jstring)(void *)val2,
+                                                       NULL, NULL, 0);
+    CHECK_AVERROR(ret, ENOMEM);
+    CHECK(g_fftest_jni.exception != 0);
+    CHECK(g_fftest_jni.release_null == 0);
+    CHECK(g_fftest_jni.string_releases == 0);
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictCount(&env, NULL, box) == 1);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_string_at = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictGetString(&env, NULL, box,
+                                                     (jstring)(void *)key2,
+                                                     NULL) == NULL);
+    CHECK(g_fftest_jni.release_null == 0);
+    CHECK(g_fftest_jni.string_releases == 0);
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictCount(&env, NULL, box) == 1);
+
+    Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, box);
+    box = 0;
+out:
+    if (box)
+        Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, box);
+    av_free(key);
+    av_free(val);
+    av_free(key2);
+    av_free(val2);
+}
+
+static void test_dict_separator_lookup_short_circuits(void)
+{
+    JNIEnv env = fftest_jni_env();
+    FFTestJniString *pairsA = fftest_string_new("fftest-p=9");
+    FFTestJniString *pairsB = fftest_string_new("fftest-p=9");
+    FFTestJniString *kvA = fftest_string_new("=");
+    FFTestJniString *sepA = fftest_string_new(";");
+    FFTestJniString *kvB = fftest_string_new("=");
+    FFTestJniString *sepB = fftest_string_new(";");
+    FFTestJniString *kvC = fftest_string_new("=");
+    FFTestJniString *sepC = fftest_string_new(";");
+    FFTestJniString *kvD = fftest_string_new("=");
+    FFTestJniString *sepD = fftest_string_new(";");
+    jlong box = 0;
+    int ret;
+
+    fftest_jni_reset();
+    CHECK(pairsA && pairsB && kvA && sepA && kvB && sepB &&
+          kvC && sepC && kvD && sepD);
+    if (!pairsA || !pairsB || !kvA || !sepA || !kvB || !sepB ||
+        !kvC || !sepC || !kvD || !sepD)
+        goto out;
+
+    box = test_dict_create(&env);
+    CHECK(box != 0);
+    if (!box)
+        goto out;
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_string_at = 2;
+    ret = Java_org_ffmpeg_FFMpegNative_dictParseString(&env, NULL, box,
+                                                       (jstring)(void *)pairsA,
+                                                       (jstring)(void *)kvA,
+                                                       (jstring)(void *)sepA, 0);
+    CHECK_AVERROR(ret, ENOMEM);
+    CHECK(g_fftest_jni.string_calls == 2);
+    CHECK(g_fftest_jni.string_releases == 1);
+    CHECK(g_fftest_jni.release_null == 0);
+    CHECK(g_fftest_jni.exception != 0);
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictCount(&env, NULL, box) == 0);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_string_at = 3;
+    ret = Java_org_ffmpeg_FFMpegNative_dictParseString(&env, NULL, box,
+                                                       (jstring)(void *)pairsB,
+                                                       (jstring)(void *)kvB,
+                                                       (jstring)(void *)sepB, 0);
+    CHECK_AVERROR(ret, ENOMEM);
+    CHECK(g_fftest_jni.string_calls == 3);
+    CHECK(g_fftest_jni.string_releases == 2);
+    CHECK(g_fftest_jni.release_null == 0);
+    CHECK(g_fftest_jni.exception != 0);
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictCount(&env, NULL, box) == 0);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_string_at = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictGetString(&env, NULL, box,
+                                                     (jstring)(void *)kvC,
+                                                     (jstring)(void *)sepC) == NULL);
+    CHECK(g_fftest_jni.string_calls == 1);
+    CHECK(g_fftest_jni.string_releases == 0);
+    CHECK(g_fftest_jni.release_null == 0);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_string_at = 2;
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictGetString(&env, NULL, box,
+                                                     (jstring)(void *)kvD,
+                                                     (jstring)(void *)sepD) == NULL);
+    CHECK(g_fftest_jni.string_calls == 2);
+    CHECK(g_fftest_jni.string_releases == 1);
+    CHECK(g_fftest_jni.release_null == 0);
+
+    Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, box);
+    box = 0;
+out:
+    if (box)
+        Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, box);
+    av_free(pairsA);
+    av_free(pairsB);
+    av_free(kvA);
+    av_free(sepA);
+    av_free(kvB);
+    av_free(sepB);
+    av_free(kvC);
+    av_free(sepC);
+    av_free(kvD);
+    av_free(sepD);
+}
+
+static void test_dict_copy_transfer_flags_keep_source_owned(void)
+{
+    JNIEnv env = fftest_jni_env();
+    FFTestJniString *srcKey = fftest_string_new("fftest-src");
+    FFTestJniString *srcVal = fftest_string_new("fftest-src-val");
+    FFTestJniString *dstKey = fftest_string_new("fftest-dst");
+    FFTestJniString *dstVal = fftest_string_new("fftest-dst-val");
+    const AVDictionaryEntry *e;
+    jlong src = 0;
+    jlong dst = 0;
+    int ret;
+
+    fftest_jni_reset();
+    CHECK(srcKey && srcVal && dstKey && dstVal);
+    if (!srcKey || !srcVal || !dstKey || !dstVal)
+        goto out;
+
+    src = test_dict_create(&env);
+    dst = test_dict_create(&env);
+    CHECK(src != 0);
+    CHECK(dst != 0);
+    if (!src || !dst)
+        goto out;
+
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_dictSet(&env, NULL, src,
+                                                 (jstring)(void *)srcKey,
+                                                 (jstring)(void *)srcVal, 0));
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_dictSet(&env, NULL, dst,
+                                                 (jstring)(void *)dstKey,
+                                                 (jstring)(void *)dstVal, 0));
+
+    ret = Java_org_ffmpeg_FFMpegNative_dictCopy(
+              &env, NULL, dst, src,
+              AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL);
+    CHECK_OK(ret);
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictCount(&env, NULL, dst) == 2);
+
+    Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, dst);
+    dst = 0;
+
+    e = test_dict_entry(src, "fftest-src");
+    CHECK(e != NULL);
+    if (e)
+        CHECK(strcmp(e->value, "fftest-src-val") == 0);
+
+    Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, src);
+    src = 0;
+out:
+    if (src)
+        Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, src);
+    if (dst)
+        Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, dst);
+    av_free(srcKey);
+    av_free(srcVal);
+    av_free(dstKey);
+    av_free(dstVal);
+}
+
+static void test_dict_parse_and_format_roundtrip(void)
+{
+    JNIEnv env = fftest_jni_env();
+    FFTestJniString *pairs = fftest_string_new("fftest-a=1,fftest-b=2");
+    FFTestJniString *kv = fftest_string_new("=");
+    FFTestJniString *sep = fftest_string_new(",");
+    FFTestJniString *kv2 = fftest_string_new("=");
+    FFTestJniString *sep2 = fftest_string_new(",");
+    jlong entry = 0;
+    jstring kstr = NULL;
+    jstring vstr = NULL;
+    jstring text = NULL;
+    jlong box = 0;
+
+    fftest_jni_reset();
+    CHECK(pairs && kv && sep && kv2 && sep2);
+    if (!pairs || !kv || !sep || !kv2 || !sep2)
+        goto out;
+
+    box = test_dict_create(&env);
+    CHECK(box != 0);
+    if (!box)
+        goto out;
+
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_dictParseString(&env, NULL, box,
+                                                          (jstring)(void *)pairs,
+                                                          (jstring)(void *)kv,
+                                                          (jstring)(void *)sep, 0));
+    CHECK(g_fftest_jni.release_null == 0);
+    CHECK(pairs->data[0] == '~');
+    CHECK(kv->data[0] == '~');
+    CHECK(sep->data[0] == '~');
+    CHECK(Java_org_ffmpeg_FFMpegNative_dictCount(&env, NULL, box) == 2);
+
+    entry = Java_org_ffmpeg_FFMpegNative_dictIterate(&env, NULL, box, 0);
+    CHECK(entry != 0);
+    kstr = Java_org_ffmpeg_FFMpegNative_dictEntryGetKey(&env, NULL, entry);
+    vstr = Java_org_ffmpeg_FFMpegNative_dictEntryGetValue(&env, NULL, entry);
+    CHECK(kstr != NULL);
+    CHECK(vstr != NULL);
+    if (kstr && vstr) {
+        CHECK(strcmp(fftest_string_text(kstr), "fftest-a") == 0);
+        CHECK(strcmp(fftest_string_text(vstr), "1") == 0);
+    }
+    av_free((void *)(intptr_t)kstr);
+    av_free((void *)(intptr_t)vstr);
+
+    text = Java_org_ffmpeg_FFMpegNative_dictGetString(&env, NULL, box,
+                                                      (jstring)(void *)kv2,
+                                                      (jstring)(void *)sep2);
+    CHECK(text != NULL);
+    if (text) {
+        CHECK(strstr(fftest_string_text(text), "fftest-a=1") != NULL);
+        CHECK(strstr(fftest_string_text(text), "fftest-b=2") != NULL);
+    }
+    av_free((void *)(intptr_t)text);
+    CHECK(g_fftest_jni.release_null == 0);
+
+    Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, box);
+    box = 0;
+out:
+    if (box)
+        Java_org_ffmpeg_FFMpegNative_dictFree(&env, NULL, box);
+    av_free(pairs);
+    av_free(kv);
+    av_free(sep);
+    av_free(kv2);
+    av_free(sep2);
+}
+
 int main(void)
 {
     test_plain_payload();
@@ -3656,6 +4158,12 @@ int main(void)
     test_output_handle_registry();
     test_output_handle_generation_blocks_reuse();
     test_window_renderer_free_retains_while_busy();
+    test_dict_set_transfer_flags_keep_keys_caller_owned();
+    test_dict_set_int_transfer_flag_keeps_key_caller_owned();
+    test_dict_string_lookup_failure_keeps_entry();
+    test_dict_separator_lookup_short_circuits();
+    test_dict_copy_transfer_flags_keep_source_owned();
+    test_dict_parse_and_format_roundtrip();
 
     /* The audio format snapshot suite lives in its own translation unit (it
      * needs fixture builders that would only add noise here) but shares this
