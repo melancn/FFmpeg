@@ -139,7 +139,7 @@ public final class FFMpegNative {
      * caller is unaffected; gate on {@link #CAP_LIBASS_FONT_LOG} because a
      * non-libass build does not contain the entry points at all.
      */
-    public static final int BRIDGE_API_MINOR = 5;
+    public static final int BRIDGE_API_MINOR = 6;
 
     /** {@code major << 16 | minor}; first release is {@code 0x00010000}. */
     public static final int BRIDGE_API_VERSION = (BRIDGE_API_MAJOR << 16) | BRIDGE_API_MINOR;
@@ -279,6 +279,11 @@ public final class FFMpegNative {
      * calling them anyway throws {@link UnsatisfiedLinkError}.
      */
     public static final long CAP_LIBASS_FONT_LOG = 1L << 14;
+
+    public static final long CAP_STREAM_SIDE_DATA = 1L << 15;
+    public static final long CAP_FRAME_SIDE_DATA = 1L << 16;
+    public static final long CAP_SIDE_DATA_TYPES = 1L << 17;
+    public static final long CAP_VIDEO_METADATA_SNAPSHOT = 1L << 18;
 
     /* ================================================================== */
     /* Audio format snapshot (schema v1)                                   */
@@ -532,6 +537,83 @@ public final class FFMpegNative {
      */
     public native int packetCopySideDataExact(long pkt, int type,
                                               byte[] out, int offset, int capacity);
+
+    public static final int VIDEO_METADATA_SCHEMA_VERSION = 1;
+
+    public static final int DOVI_CONFIG_SLOTS                      = 9;
+    public static final int DOVI_CONFIG_VERSION_MAJOR              = 0;
+    public static final int DOVI_CONFIG_VERSION_MINOR              = 1;
+    public static final int DOVI_CONFIG_PROFILE                    = 2;
+    public static final int DOVI_CONFIG_LEVEL                      = 3;
+    public static final int DOVI_CONFIG_RPU_PRESENT                = 4;
+    public static final int DOVI_CONFIG_EL_PRESENT                 = 5;
+    public static final int DOVI_CONFIG_BL_PRESENT                 = 6;
+    public static final int DOVI_CONFIG_BL_SIGNAL_COMPATIBILITY_ID = 7;
+    public static final int DOVI_CONFIG_MD_COMPRESSION             = 8;
+
+    public static final int MASTERING_DISPLAY_SLOTS             = 22;
+    public static final int MASTERING_DISPLAY_HAS_PRIMARIES     = 0;
+    public static final int MASTERING_DISPLAY_HAS_LUMINANCE     = 1;
+    public static final int MASTERING_DISPLAY_RED_X_NUM         = 2;
+    public static final int MASTERING_DISPLAY_RED_X_DEN         = 3;
+    public static final int MASTERING_DISPLAY_RED_Y_NUM         = 4;
+    public static final int MASTERING_DISPLAY_RED_Y_DEN         = 5;
+    public static final int MASTERING_DISPLAY_GREEN_X_NUM       = 6;
+    public static final int MASTERING_DISPLAY_GREEN_X_DEN       = 7;
+    public static final int MASTERING_DISPLAY_GREEN_Y_NUM       = 8;
+    public static final int MASTERING_DISPLAY_GREEN_Y_DEN       = 9;
+    public static final int MASTERING_DISPLAY_BLUE_X_NUM        = 10;
+    public static final int MASTERING_DISPLAY_BLUE_X_DEN        = 11;
+    public static final int MASTERING_DISPLAY_BLUE_Y_NUM        = 12;
+    public static final int MASTERING_DISPLAY_BLUE_Y_DEN        = 13;
+    public static final int MASTERING_DISPLAY_WHITE_X_NUM       = 14;
+    public static final int MASTERING_DISPLAY_WHITE_X_DEN       = 15;
+    public static final int MASTERING_DISPLAY_WHITE_Y_NUM       = 16;
+    public static final int MASTERING_DISPLAY_WHITE_Y_DEN       = 17;
+    public static final int MASTERING_DISPLAY_MIN_LUMINANCE_NUM = 18;
+    public static final int MASTERING_DISPLAY_MIN_LUMINANCE_DEN = 19;
+    public static final int MASTERING_DISPLAY_MAX_LUMINANCE_NUM = 20;
+    public static final int MASTERING_DISPLAY_MAX_LUMINANCE_DEN = 21;
+
+    public static final int CONTENT_LIGHT_SLOTS    = 2;
+    public static final int CONTENT_LIGHT_MAX_CLL  = 0;
+    public static final int CONTENT_LIGHT_MAX_FALL = 1;
+
+    public static final int DISPLAY_MATRIX_SLOTS = 9;
+
+    public native int[] packetGetSideDataTypes(long pkt);
+
+    public native String packetSideDataName(int type);
+
+    public native int streamGetSideDataSize(long fmt, int index, int type);
+
+    public native int streamCopySideDataExact(long fmt, int index, int type,
+                                              byte[] out, int offset, int capacity);
+
+    public native int[] streamGetSideDataTypes(long fmt, int index);
+
+    public native int streamGetDoviConfig(long fmt, int index, long[] out);
+
+    public native int streamGetMasteringDisplayMetadata(long fmt, int index, long[] out);
+
+    public native int streamGetContentLightMetadata(long fmt, int index, long[] out);
+
+    public native int streamGetDisplayMatrix(long fmt, int index, long[] out);
+
+    public native int frameGetSideDataSize(long frame, int type);
+
+    public native int frameCopySideDataExact(long frame, int type,
+                                             byte[] out, int offset, int capacity);
+
+    public native int[] frameGetSideDataTypes(long frame);
+
+    public native String frameSideDataName(int type);
+
+    public native int frameGetMasteringDisplayMetadata(long frame, long[] out);
+
+    public native int frameGetContentLightMetadata(long frame, long[] out);
+
+    public native int frameGetDisplayMatrix(long frame, long[] out);
 
     /* ================================================================== */
     /* AVDictionary (key/value options)                                    */
@@ -3173,6 +3255,8 @@ public final class FFMpegNative {
     public static final int AV_SAMPLE_FMT_DBLP    = 9;
     public static final int AV_SAMPLE_FMT_S64     = 10;
     public static final int AV_SAMPLE_FMT_S64P    = 11;
+    public static final int AV_SAMPLE_FMT_DSD     = 12;
+    public static final int AV_SAMPLE_FMT_NB      = 13;
 
     /**
      * Channel constants mirrored from {@code libavutil/channel_layout.h}.
@@ -3300,11 +3384,11 @@ public final class FFMpegNative {
     public static final long AV_CH_LAYOUT_7POINT1POINT6     = 196159L;
     public static final long AV_CH_LAYOUT_7POINT2POINT3     = 34359825983L;
     public static final long AV_CH_LAYOUT_9POINT1POINT4     = 186111L;
-    public static final long AV_CH_LAYOUT_9POINT1POINT6     = 206344616319L;
+    public static final long AV_CH_LAYOUT_9POINT1POINT6     = 206158616319L;
     public static final long AV_CH_LAYOUT_HEXADECAGONAL     = 6442710839L;
     public static final long AV_CH_LAYOUT_BINAURAL          = 6917529027641081856L;
     public static final long AV_CH_LAYOUT_STEREO_DOWNMIX    = 1610612736L;
-    public static final long AV_CH_LAYOUT_22POINT2          = 2164849779327L;
+    public static final long AV_CH_LAYOUT_22POINT2          = 2164663779327L;
     /** @deprecated aliases kept for ABI compatibility (FF_API_CHANNEL_LAYOUT_BACK). */
     public static final long AV_CH_LAYOUT_5POINT1POINT4_BACK = 185871L;
     public static final long AV_CH_LAYOUT_7POINT1POINT4_BACK = 185919L;
@@ -4307,6 +4391,51 @@ public final class FFMpegNative {
     public static final int AV_PKT_DATA_GAIN_MAP_PARAMS               = 43;
     public static final int AV_PKT_DATA_NB                            = 44;
 
+    public static final int AV_FRAME_DATA_PANSCAN                     = 0;
+    public static final int AV_FRAME_DATA_A53_CC                      = 1;
+    public static final int AV_FRAME_DATA_STEREO3D                    = 2;
+    public static final int AV_FRAME_DATA_MATRIXENCODING              = 3;
+    public static final int AV_FRAME_DATA_DOWNMIX_INFO                = 4;
+    public static final int AV_FRAME_DATA_REPLAYGAIN                  = 5;
+    public static final int AV_FRAME_DATA_DISPLAYMATRIX               = 6;
+    public static final int AV_FRAME_DATA_AFD                         = 7;
+    public static final int AV_FRAME_DATA_MOTION_VECTORS              = 8;
+    public static final int AV_FRAME_DATA_SKIP_SAMPLES                = 9;
+    public static final int AV_FRAME_DATA_AUDIO_SERVICE_TYPE          = 10;
+    public static final int AV_FRAME_DATA_MASTERING_DISPLAY_METADATA  = 11;
+    public static final int AV_FRAME_DATA_GOP_TIMECODE                = 12;
+    public static final int AV_FRAME_DATA_SPHERICAL                   = 13;
+    public static final int AV_FRAME_DATA_CONTENT_LIGHT_LEVEL         = 14;
+    public static final int AV_FRAME_DATA_ICC_PROFILE                 = 15;
+    public static final int AV_FRAME_DATA_S12M_TIMECODE               = 16;
+    public static final int AV_FRAME_DATA_DYNAMIC_HDR_PLUS            = 17;
+    public static final int AV_FRAME_DATA_REGIONS_OF_INTEREST         = 18;
+    public static final int AV_FRAME_DATA_VIDEO_ENC_PARAMS            = 19;
+    public static final int AV_FRAME_DATA_SEI_UNREGISTERED            = 20;
+    public static final int AV_FRAME_DATA_FILM_GRAIN_PARAMS           = 21;
+    public static final int AV_FRAME_DATA_DETECTION_BBOXES            = 22;
+    public static final int AV_FRAME_DATA_DOVI_RPU_BUFFER             = 23;
+    public static final int AV_FRAME_DATA_DOVI_METADATA               = 24;
+    public static final int AV_FRAME_DATA_DYNAMIC_HDR_VIVID           = 25;
+    public static final int AV_FRAME_DATA_AMBIENT_VIEWING_ENVIRONMENT = 26;
+    public static final int AV_FRAME_DATA_VIDEO_HINT                  = 27;
+    public static final int AV_FRAME_DATA_LCEVC                       = 28;
+    public static final int AV_FRAME_DATA_VIEW_ID                     = 29;
+    public static final int AV_FRAME_DATA_3D_REFERENCE_DISPLAYS       = 30;
+    public static final int AV_FRAME_DATA_EXIF                        = 31;
+    public static final int AV_FRAME_DATA_DYNAMIC_HDR_SMPTE_2094_APP5 = 32;
+    public static final int AV_FRAME_DATA_IAMF_MIX_GAIN_PARAM         = 33;
+    public static final int AV_FRAME_DATA_IAMF_DEMIXING_INFO_PARAM    = 34;
+    public static final int AV_FRAME_DATA_IAMF_RECON_GAIN_INFO_PARAM  = 35;
+    public static final int AV_FRAME_DATA_RAW_COLOR_PARAMS            = 36;
+    public static final int AV_FRAME_DATA_DOWNMIX_MATRIX              = 37;
+    public static final int AV_FRAME_DATA_GAIN_MAP_PARAMS             = 38;
+
+    public static final int AV_DOVI_COMPRESSION_NONE     = 0;
+    public static final int AV_DOVI_COMPRESSION_LIMITED  = 1;
+    public static final int AV_DOVI_COMPRESSION_RESERVED = 2;
+    public static final int AV_DOVI_COMPRESSION_EXTENDED = 3;
+
     public static final int AV_SIDE_DATA_PARAM_CHANGE_SAMPLE_RATE  = 0x0004;
     public static final int AV_SIDE_DATA_PARAM_CHANGE_DIMENSIONS   = 0x0008;
 
@@ -4341,11 +4470,13 @@ public final class FFMpegNative {
 
     public static final int AVERROR_E2BIG   = -7;
     public static final int AVERROR_ENOENT  = -2;
+    public static final int AVERROR_EIO     = -5;
     public static final int AVERROR_EAGAIN  = -11;
     public static final int AVERROR_ENOMEM  = -12;
     public static final int AVERROR_EINVAL  = -22;
     public static final int AVERROR_ENOSPC  = -28;
     public static final int AVERROR_ENOSYS  = -38;
+    public static final int AVERROR_EOVERFLOW = -75;
 
     public static final int AV_DISPOSITION_DEFAULT            = 1;
     public static final int AV_DISPOSITION_DUB                = 2;

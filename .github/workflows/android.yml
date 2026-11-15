@@ -477,47 +477,100 @@ jobs:
               text=True,
           )
           prefixes = (
-              "AV_PKT_DATA_", "AV_SIDE_DATA_PARAM_CHANGE_", "AVERROR_",
+              "AV_PKT_DATA_", "AV_FRAME_DATA_", "AV_DOVI_COMPRESSION_",
+              "AV_SIDE_DATA_PARAM_CHANGE_", "AVERROR_",
               "AV_DISPOSITION_", "AVCOL_", "AV_PICTURE_TYPE_",
               "AV_BUFFERSRC_FLAG_", "AV_BUFFERSINK_FLAG_", "AVFILTER_CMD_FLAG_",
               "AV_HWFRAME_MAP_", "AV_CODEC_HW_CONFIG_METHOD_", "AV_CODEC_PROP_",
               "AV_OPT_TYPE_", "FF_LOSS_", "AVALPHA_MODE_", "AV_SAMPLE_FMT_",
-              "AV_PIX_FMT_", "SWS_", "AV_DICT_",
+              "AV_PIX_FMT_", "SWS_", "AV_DICT_", "AV_CODEC_ID_", "AV_PROFILE_",
+              "AV_CHAN_", "AV_CH_", "AVSEEK_FLAG_",
           )
           aliases = {"AV_DICT_DONT_STRDUP": "AV_DICT_DONT_STRDUP_KEY"}
-          for errno in ("EAGAIN", "EINVAL", "ENOMEM", "ENOENT", "ENOSPC", "ENOSYS", "E2BIG"):
+          for errno in ("EAGAIN", "EINVAL", "ENOMEM", "ENOENT", "ENOSPC", "ENOSYS", "E2BIG", "EIO", "EOVERFLOW"):
               aliases["AVERROR_" + errno] = "AVERROR(" + errno + ")"
           includes = (
               "errno.h", "libavcodec/packet.h", "libavcodec/codec.h",
               "libavcodec/codec_desc.h", "libavformat/avformat.h",
               "libavutil/avutil.h", "libavutil/error.h", "libavutil/dict.h",
               "libavutil/pixfmt.h", "libavutil/pixdesc.h", "libavutil/samplefmt.h",
-              "libavutil/hwcontext.h", "libavutil/opt.h",
+              "libavutil/hwcontext.h", "libavutil/opt.h", "libavutil/channel_layout.h",
+              "libavcodec/codec_id.h", "libavcodec/defs.h",
+              "libavutil/frame.h", "libavutil/dovi_meta.h",
               "libavfilter/avfilter.h", "libavfilter/buffersrc.h",
               "libavfilter/buffersink.h", "libswscale/swscale.h",
           )
           lines = ['#include "' + name + '"' for name in includes]
-          constants = dict(re.findall(
-              r"^\s*public static final int (\w+) = (-?\d+);$", declarations, re.M
+          bridge_source = pathlib.Path("compat/android/jni/ffmpeg_jni.c").read_text()
+          bridge_macros = dict(re.findall(
+              r"^#define (FF_JNI_(?:BRIDGE_API_(?:MAJOR|MINOR)|CAP_\w+|\w+_SLOTS)) ([^\r\n]+)$",
+              bridge_source, re.M,
           ))
+          for name, value in bridge_macros.items():
+              lines.append(f"#define {name} {value}")
+          constants = {
+              name: (kind, value)
+              for kind, name, value in re.findall(
+                  r"^\s*public static final (int|long) (\w+) = (-?\d+)[lL]?;$", declarations, re.M
+              )
+          }
           if not constants:
               raise SystemExit("No compiled Java integer constants found in javap output")
-          selected = {name: value for name, value in constants.items() if name.startswith(prefixes)}
+          bridge_names = (
+              "BRIDGE_API_MAJOR", "BRIDGE_API_MINOR", "CAP_STREAM_SIDE_DATA",
+              "CAP_FRAME_SIDE_DATA", "CAP_SIDE_DATA_TYPES", "CAP_VIDEO_METADATA_SNAPSHOT",
+              "DOVI_CONFIG_SLOTS", "MASTERING_DISPLAY_SLOTS",
+              "CONTENT_LIGHT_SLOTS", "DISPLAY_MATRIX_SLOTS",
+          )
+          for name in bridge_names:
+              native = "FF_JNI_" + name
+              if native not in bridge_macros or name not in constants:
+                  raise SystemExit("Missing bridge constant: " + name)
+              aliases[name] = native
+          selected = {
+              name: value for name, value in constants.items()
+              if name.startswith(prefixes) or name in bridge_names
+          }
           for prefix in prefixes:
               if not any(name.startswith(prefix) for name in selected):
                   raise SystemExit("Missing exported constant family: " + prefix)
           required = (
               "AV_PKT_DATA_PALETTE", "AV_PKT_DATA_GAIN_MAP_PARAMS",
-              "AV_SAMPLE_FMT_S64", "AV_SAMPLE_FMT_S64P", "SWS_LANCZOS",
+              "AV_FRAME_DATA_PANSCAN", "AV_FRAME_DATA_GAIN_MAP_PARAMS",
+              "AV_DOVI_COMPRESSION_NONE", "AV_DOVI_COMPRESSION_EXTENDED",
+              "AV_SAMPLE_FMT_S64", "AV_SAMPLE_FMT_S64P", "AV_SAMPLE_FMT_DSD", "AV_SAMPLE_FMT_NB",
+              "AV_CHAN_FRONT_LEFT", "AV_CH_LAYOUT_STEREO", "AV_CH_LAYOUT_BINAURAL", "SWS_LANCZOS",
               "AV_OPT_TYPE_FLAG_ARRAY", "AV_DICT_DONT_STRDUP_KEY",
               "AV_DICT_DONT_STRDUP_VAL", "AV_DICT_DEDUP",
           ) + tuple(aliases)
           for name in required:
               if name not in selected:
                   raise SystemExit("Missing exported constant: " + name)
-          for name, value in sorted(selected.items()):
+          layouts = {
+              "DOVI_CONFIG_": (
+                  "VERSION_MAJOR", "VERSION_MINOR", "PROFILE", "LEVEL", "RPU_PRESENT",
+                  "EL_PRESENT", "BL_PRESENT", "BL_SIGNAL_COMPATIBILITY_ID", "MD_COMPRESSION",
+              ),
+              "MASTERING_DISPLAY_": (
+                  "HAS_PRIMARIES", "HAS_LUMINANCE", "RED_X_NUM", "RED_X_DEN",
+                  "RED_Y_NUM", "RED_Y_DEN", "GREEN_X_NUM", "GREEN_X_DEN",
+                  "GREEN_Y_NUM", "GREEN_Y_DEN", "BLUE_X_NUM", "BLUE_X_DEN",
+                  "BLUE_Y_NUM", "BLUE_Y_DEN", "WHITE_X_NUM", "WHITE_X_DEN",
+                  "WHITE_Y_NUM", "WHITE_Y_DEN", "MIN_LUMINANCE_NUM", "MIN_LUMINANCE_DEN",
+                  "MAX_LUMINANCE_NUM", "MAX_LUMINANCE_DEN",
+              ),
+              "CONTENT_LIGHT_": ("MAX_CLL", "MAX_FALL"),
+          }
+          if constants.get("VIDEO_METADATA_SCHEMA_VERSION") != ("int", "1"):
+              raise SystemExit("Unexpected video metadata schema version")
+          for prefix, fields in layouts.items():
+              for index, field in enumerate(fields):
+                  if constants.get(prefix + field) != ("int", str(index)):
+                      raise SystemExit("Video metadata slot mismatch: " + prefix + field)
+          for name, (kind, value) in sorted(selected.items()):
               native = aliases.get(name, name)
-              lines.append(f'_Static_assert(({native}) == ({value}), "Java constant mismatch: {name}");')
+              literal = value + ("LL" if kind == "long" else "")
+              lines.append(f'_Static_assert(({native}) == ({literal}), "Java constant mismatch: {name}");')
           (generated / "constants_check.c").write_text("\n".join(lines) + "\n")
           print(f"Checking {len(selected)} exported Java constants against native headers")
           PY
@@ -566,7 +619,14 @@ jobs:
                      windowRendererRender windowRendererRevoke \
                      windowRendererFinish windowRendererQuarantine \
                      windowRendererGetState windowRendererFree \
-                     mediasurfaceGetOutstandingBuffers; do
+                      mediasurfaceGetOutstandingBuffers \
+                      streamGetSideDataSize streamCopySideDataExact \
+                      frameGetSideDataSize frameCopySideDataExact \
+                      packetGetSideDataTypes streamGetSideDataTypes frameGetSideDataTypes \
+                      packetSideDataName frameSideDataName streamGetDoviConfig \
+                      streamGetMasteringDisplayMetadata frameGetMasteringDisplayMetadata \
+                      streamGetContentLightMetadata frameGetContentLightMetadata \
+                      streamGetDisplayMatrix frameGetDisplayMatrix; do
             grep -qx "Java_org_ffmpeg_FFMpegNative_$sym" /tmp/implemented_jni.txt || {
               echo "::error::bridge contract entry point missing: $sym"
               exit 1
@@ -623,6 +683,7 @@ jobs:
           # Compile the JNI translation unit as C. Passing a .c file to clang++
           # makes NDK 29 treat FFmpeg's C headers and JNIEnv ABI as C++17.
           "$CC" -c -fPIC -O2 \
+            -include "$PWD/compat/android/jni/generated/org_ffmpeg_FFMpegNative.h" \
             -I"$PWD" -I"$PWD/compat/android/jni" -I"$PWD/compat/android/jni/generated" \
             -I"$PREFIX/include" -I"$DEPS_PREFIX/include" \
             -DFF_JNI_SOURCE_REVISION="\"$SRC_REV\"" \
@@ -753,6 +814,22 @@ jobs:
                      Java_org_ffmpeg_FFMpegNative_packetGetBudgetInfo \
                      Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize \
                      Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact \
+                     Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize \
+                     Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact \
+                     Java_org_ffmpeg_FFMpegNative_frameGetSideDataSize \
+                     Java_org_ffmpeg_FFMpegNative_frameCopySideDataExact \
+                     Java_org_ffmpeg_FFMpegNative_packetGetSideDataTypes \
+                     Java_org_ffmpeg_FFMpegNative_streamGetSideDataTypes \
+                     Java_org_ffmpeg_FFMpegNative_frameGetSideDataTypes \
+                     Java_org_ffmpeg_FFMpegNative_packetSideDataName \
+                     Java_org_ffmpeg_FFMpegNative_frameSideDataName \
+                     Java_org_ffmpeg_FFMpegNative_streamGetDoviConfig \
+                     Java_org_ffmpeg_FFMpegNative_streamGetMasteringDisplayMetadata \
+                     Java_org_ffmpeg_FFMpegNative_frameGetMasteringDisplayMetadata \
+                     Java_org_ffmpeg_FFMpegNative_streamGetContentLightMetadata \
+                     Java_org_ffmpeg_FFMpegNative_frameGetContentLightMetadata \
+                     Java_org_ffmpeg_FFMpegNative_streamGetDisplayMatrix \
+                     Java_org_ffmpeg_FFMpegNative_frameGetDisplayMatrix \
                      Java_org_ffmpeg_FFMpegNative_mediasurfaceHwdeviceCreate \
                      Java_org_ffmpeg_FFMpegNative_setContextHwDeviceCtx \
                      Java_org_ffmpeg_FFMpegNative_setContextPktTimebase \

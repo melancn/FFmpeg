@@ -40,10 +40,13 @@
 #include "libavcodec/mediacodecdec_common.h"
 #include "libavutil/buffer.h"
 #include "libavutil/channel_layout.h"
+#include "libavutil/dovi_meta.h"
 #include "libavutil/error.h"
 #include "libavutil/frame.h"
+#include "libavutil/mastering_display_metadata.h"
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
+#include "libavformat/avformat.h"
 #include "libswresample/swresample.h"
 
 /* Re-include the production translation unit for its file-static helpers.
@@ -1031,7 +1034,7 @@ typedef struct FFTestJniState {
     jbyte last_byte[FFTEST_OUT_CAP_MAX];  /* what SetByteArrayRegion wrote */
     int   last_byte_len;                  /* bytes written, -1 if never  */
     int   last_status;                    /* what SetIntArrayRegion wrote */
-    jlong last_long[16];                  /* what SetLongArrayRegion wrote */
+    jlong last_long[32];                  /* what SetLongArrayRegion wrote */
     int   last_long_len;                  /* elements written, -1 if never */
     int   exception;                      /* a pending exception is set   */
     int   calls;                          /* completed Set*Region calls    */
@@ -1040,6 +1043,7 @@ typedef struct FFTestJniState {
     int   fail_string_at;
     int   string_releases;
     int   release_null;
+    int   fail_new_string;
 } FFTestJniState;
 
 typedef struct FFTestJniString {
@@ -1126,6 +1130,10 @@ static void fftest_release_string_utf_chars(JNIEnv *env, jstring s, const char *
 static jstring fftest_new_string_utf(JNIEnv *env, const char *utf)
 {
     (void)env;
+    if (g_fftest_jni.fail_new_string) {
+        g_fftest_jni.exception = 1;
+        return NULL;
+    }
     return (jstring)(void *)fftest_string_new(utf);
 }
 
@@ -1216,8 +1224,11 @@ static void fftest_set_int_region(JNIEnv *env, jintArray a, jsize start,
         fftest_raise_exception(env);
         return;
     }
-    if (len > 0)
+    if (len > 0) {
+        memcpy(arr->data + (size_t)start * sizeof(jint), buf,
+               (size_t)len * sizeof(jint));
         g_fftest_jni.last_status = buf[0];
+    }
     g_fftest_jni.calls++;
 }
 
@@ -1239,6 +1250,8 @@ static void fftest_set_long_region(JNIEnv *env, jlongArray a, jsize start,
         return;
     }
     if (len > 0) {
+        memcpy(arr->data + (size_t)start * sizeof(jlong), buf,
+               (size_t)len * sizeof(jlong));
         n = (size_t)len;
         if (n > sizeof(g_fftest_jni.last_long) / sizeof(g_fftest_jni.last_long[0]))
             n = sizeof(g_fftest_jni.last_long) / sizeof(g_fftest_jni.last_long[0]);
@@ -1260,9 +1273,60 @@ static jintArray fftest_new_int_array(jsize len)
     return (jintArray)(void *)fftest_array_alloc(len, sizeof(jint));
 }
 
+static jintArray fftest_jni_new_int_array(JNIEnv *env, jsize len)
+{
+    (void)env;
+    return fftest_new_int_array(len);
+}
+
 static jlongArray fftest_new_long_array(jsize len)
 {
     return (jlongArray)(void *)fftest_array_alloc(len, sizeof(jlong));
+}
+
+static jsize fftest_byte_array_read(jbyteArray a, jbyte *out, jsize max)
+{
+    const FFTestJniArray *arr = (const FFTestJniArray *)(const void *)a;
+    jsize n;
+
+    if (!arr || max <= 0)
+        return 0;
+    n = arr->length < max ? arr->length : max;
+    if ((size_t)n > arr->capacity)
+        n = (jsize)arr->capacity;
+    if (n > 0)
+        memcpy(out, arr->data, (size_t)n);
+    return n;
+}
+
+static jsize fftest_int_array_read(jintArray a, jint *out, jsize max)
+{
+    const FFTestJniArray *arr = (const FFTestJniArray *)(const void *)a;
+    jsize n;
+
+    if (!arr || max <= 0)
+        return 0;
+    n = arr->length < max ? arr->length : max;
+    if ((size_t)n * sizeof(jint) > arr->capacity)
+        n = (jsize)(arr->capacity / sizeof(jint));
+    if (n > 0)
+        memcpy(out, arr->data, (size_t)n * sizeof(jint));
+    return n;
+}
+
+static jsize fftest_long_array_read(jlongArray a, jlong *out, jsize max)
+{
+    const FFTestJniArray *arr = (const FFTestJniArray *)(const void *)a;
+    jsize n;
+
+    if (!arr || max <= 0)
+        return 0;
+    n = arr->length < max ? arr->length : max;
+    if ((size_t)n * sizeof(jlong) > arr->capacity)
+        n = (jsize)(arr->capacity / sizeof(jlong));
+    if (n > 0)
+        memcpy(out, arr->data, (size_t)n * sizeof(jlong));
+    return n;
 }
 
 static jthrowable fftest_exception_occurred(JNIEnv *env)
@@ -1300,6 +1364,7 @@ static void fftest_init_functions(void)
     g_fftest_functions.GetStringUTFChars     = fftest_get_string_utf_chars;
     g_fftest_functions.ReleaseStringUTFChars = fftest_release_string_utf_chars;
     g_fftest_functions.NewStringUTF          = fftest_new_string_utf;
+    g_fftest_functions.NewIntArray           = fftest_jni_new_int_array;
 }
 
 /* JNIEnv is a pointer TYPE, not a struct: jni.h declares
@@ -2463,7 +2528,7 @@ static void test_release_capabilities(void)
     CHECK(Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(NULL, NULL) ==
           FF_JNI_BRIDGE_API_VERSION);
     CHECK(FF_JNI_BRIDGE_API_MAJOR == 1);
-    CHECK(FF_JNI_BRIDGE_API_MINOR == 5);
+    CHECK(FF_JNI_BRIDGE_API_MINOR == 6);
 
     /* Promised by this release, each with a test set behind it. */
     CHECK(caps & FF_JNI_CAP_PCM_SESSION_SAFE_V2);
@@ -2484,6 +2549,10 @@ static void test_release_capabilities(void)
      * driven there too (its positive path needs a live platform MediaCodec). */
     CHECK(caps & FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME);
     CHECK(caps & FF_JNI_CAP_VIDEO_DECODE_STATS);
+    CHECK(caps & FF_JNI_CAP_STREAM_SIDE_DATA);
+    CHECK(caps & FF_JNI_CAP_FRAME_SIDE_DATA);
+    CHECK(caps & FF_JNI_CAP_SIDE_DATA_TYPES);
+    CHECK(caps & FF_JNI_CAP_VIDEO_METADATA_SNAPSHOT);
 
     /* The 1.5 libass channel exists only where the libass section is compiled
      * in. This build enables it (the binary links -lass), so the bit must be
@@ -2523,7 +2592,11 @@ static void test_release_capabilities(void)
                       FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO |
                       FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO |
                       FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME |
-                      FF_JNI_CAP_VIDEO_DECODE_STATS;
+                      FF_JNI_CAP_VIDEO_DECODE_STATS |
+                      FF_JNI_CAP_STREAM_SIDE_DATA |
+                      FF_JNI_CAP_FRAME_SIDE_DATA |
+                      FF_JNI_CAP_SIDE_DATA_TYPES |
+                      FF_JNI_CAP_VIDEO_METADATA_SNAPSHOT;
 #if CONFIG_LIBASS
         known |= FF_JNI_CAP_LIBASS_FONT_LOG;
 #endif
@@ -2543,14 +2616,18 @@ static void test_release_capabilities(void)
     CHECK(FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME == (1LL << 12));
     CHECK(FF_JNI_CAP_VIDEO_DECODE_STATS == (1LL << 13));
     CHECK(FF_JNI_CAP_LIBASS_FONT_LOG == (1LL << 14));
+    CHECK(FF_JNI_CAP_STREAM_SIDE_DATA == (1LL << 15));
+    CHECK(FF_JNI_CAP_FRAME_SIDE_DATA == (1LL << 16));
+    CHECK(FF_JNI_CAP_SIDE_DATA_TYPES == (1LL << 17));
+    CHECK(FF_JNI_CAP_VIDEO_METADATA_SNAPSHOT == (1LL << 18));
 
     /* The whole mask for this release, written out once so an unannounced
      * bit is a test failure rather than a silent contract change. The 1.5
      * libass bit is present only in a libass build. */
 #if CONFIG_LIBASS
-    CHECK(caps == (jlong)0x737f);
+    CHECK(caps == (jlong)0x7f37f);
 #else
-    CHECK(caps == (jlong)0x337f);
+    CHECK(caps == (jlong)0x7b37f);
 #endif
 }
 
@@ -4092,6 +4169,1245 @@ out:
     av_free(sep2);
 }
 
+_Static_assert(FF_JNI_DOVI_CONFIG_SLOTS == 9, "dovi config slot count changed");
+_Static_assert(FF_JNI_MASTERING_DISPLAY_SLOTS == 22,
+               "mastering display slot count changed");
+_Static_assert(FF_JNI_CONTENT_LIGHT_SLOTS == 2,
+               "content light slot count changed");
+_Static_assert(FF_JNI_DISPLAY_MATRIX_SLOTS == 9,
+               "display matrix slot count changed");
+
+static AVPacketSideData *fftest_sd_array_alloc(int nb)
+{
+    return av_calloc((size_t)nb, sizeof(AVPacketSideData));
+}
+
+static int fftest_sd_entry_fill(AVPacketSideData *sd, int i, int type, size_t size)
+{
+    sd[i].type = (enum AVPacketSideDataType)type;
+    sd[i].size = size;
+    if (size > 0) {
+        sd[i].data = av_mallocz(size);
+        if (!sd[i].data) {
+            sd[i].size = 0;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int fftest_streams_new(AVFormatContext **out, int n)
+{
+    AVFormatContext *c = avformat_alloc_context();
+    int i;
+
+    if (!c)
+        return -1;
+    for (i = 0; i < n; i++) {
+        AVStream *st = avformat_new_stream(c, NULL);
+        if (!st) {
+            avformat_free_context(c);
+            return -1;
+        }
+        st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    }
+    *out = c;
+    return 0;
+}
+
+static AVPacketSideData *fftest_stream_sd_alloc(AVFormatContext *c, int index,
+                                                int nb)
+{
+    AVCodecParameters *p = c->streams[index]->codecpar;
+
+    p->coded_side_data = fftest_sd_array_alloc(nb);
+    if (!p->coded_side_data)
+        return NULL;
+    p->nb_coded_side_data = nb;
+    return p->coded_side_data;
+}
+
+static AVFrameSideData *fftest_frame_sd_oversized(AVFrame *f, int type,
+                                                  size_t size)
+{
+    AVFrameSideData **tmp;
+    AVFrameSideData *e;
+
+    tmp = av_realloc_array(f->side_data, (size_t)f->nb_side_data + 1,
+                           sizeof(*tmp));
+    if (!tmp)
+        return NULL;
+    f->side_data = tmp;
+    e = av_mallocz(sizeof(*e));
+    if (!e)
+        return NULL;
+    e->buf = av_buffer_alloc(4);
+    if (!e->buf) {
+        av_free(e);
+        return NULL;
+    }
+    e->type = (enum AVFrameSideDataType)type;
+    e->data = e->buf->data;
+    e->size = size;
+    f->side_data[f->nb_side_data++] = e;
+    return e;
+}
+
+static void fftest_mastering_fill(AVMasteringDisplayMetadata *m)
+{
+    memset(m, 0, sizeof(*m));
+    m->display_primaries[0][0] = (AVRational){ 34000, 50000 };
+    m->display_primaries[0][1] = (AVRational){ 16000, 50000 };
+    m->display_primaries[1][0] = (AVRational){ 13250, 50000 };
+    m->display_primaries[1][1] = (AVRational){ 34500, 50000 };
+    m->display_primaries[2][0] = (AVRational){ 7500, 50000 };
+    m->display_primaries[2][1] = (AVRational){ 3000, 50000 };
+    m->white_point[0] = (AVRational){ 15635, 50000 };
+    m->white_point[1] = (AVRational){ 16450, 50000 };
+    m->min_luminance = (AVRational){ 50, 1 };
+    m->max_luminance = (AVRational){ 10000000, 1 };
+    m->has_primaries = 1;
+    m->has_luminance = 1;
+}
+
+static void fftest_mastering_check(const jlong *v)
+{
+    CHECK(v[0] == 1);
+    CHECK(v[1] == 1);
+    CHECK(v[2] == 34000);
+    CHECK(v[3] == 50000);
+    CHECK(v[4] == 16000);
+    CHECK(v[5] == 50000);
+    CHECK(v[6] == 13250);
+    CHECK(v[7] == 50000);
+    CHECK(v[8] == 34500);
+    CHECK(v[9] == 50000);
+    CHECK(v[10] == 7500);
+    CHECK(v[11] == 50000);
+    CHECK(v[12] == 3000);
+    CHECK(v[13] == 50000);
+    CHECK(v[14] == 15635);
+    CHECK(v[15] == 50000);
+    CHECK(v[16] == 16450);
+    CHECK(v[17] == 50000);
+    CHECK(v[18] == 50);
+    CHECK(v[19] == 1);
+    CHECK(v[20] == 10000000);
+    CHECK(v[21] == 1);
+}
+
+static void fftest_display_matrix_fill(int32_t *m)
+{
+    m[0] = -1;
+    m[1] = 0;
+    m[2] = 65536;
+    m[3] = -65536;
+    m[4] = 1;
+    m[5] = 2;
+    m[6] = 3;
+    m[7] = 4;
+    m[8] = INT32_MIN;
+}
+
+static void fftest_display_matrix_check(const jlong *v)
+{
+    CHECK(v[0] == -1);
+    CHECK(v[1] == 0);
+    CHECK(v[2] == 65536);
+    CHECK(v[3] == -65536);
+    CHECK(v[4] == 1);
+    CHECK(v[5] == 2);
+    CHECK(v[6] == 3);
+    CHECK(v[7] == 4);
+    CHECK(v[8] == (jlong)INT32_MIN);
+}
+
+static void fftest_content_light_check(const jlong *v)
+{
+    CHECK(v[0] == (jlong)0xFFFFFFFFu);
+    CHECK(v[1] == (jlong)0x80000000u);
+}
+
+static void test_packet_side_data_exact_contract(void)
+{
+    JNIEnv env = fftest_jni_env();
+    AVPacket *p = av_packet_alloc();
+    AVPacket bad;
+    AVPacketSideData bsd[2];
+    jbyteArray out = NULL;
+    jbyte buf[64];
+    uint8_t huge = 0;
+    int i, ret;
+
+    CHECK(p != NULL);
+    if (!p)
+        return;
+
+    CHECK_OK(add_side_data(p, AV_PKT_DATA_SKIP_SAMPLES, 0));
+    CHECK_OK(add_side_data(p, AV_PKT_DATA_NEW_EXTRADATA, 16));
+    if (p->side_data_elems != 2) {
+        av_packet_free(&p);
+        return;
+    }
+    memset(p->side_data[1].data, 0x5A, 16);
+
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize(
+              &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_SKIP_SAMPLES) == 0);
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize(
+              &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_NEW_EXTRADATA) == 16);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_PARAM_CHANGE),
+                  ENOENT);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)p, -1), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_NB), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize(
+                      &env, NULL, 0, AV_PKT_DATA_SKIP_SAMPLES), EINVAL);
+
+    fftest_jni_reset();
+    out = fftest_new_byte_array(32);
+    CHECK(out != NULL);
+    if (!out) {
+        av_packet_free(&p);
+        return;
+    }
+
+    ret = Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+              &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_NEW_EXTRADATA,
+              out, 8, 16);
+    CHECK(ret == 16);
+    CHECK(g_fftest_jni.last_byte_len == 16);
+    CHECK(fftest_byte_array_read(out, buf, 64) == 32);
+    for (i = 0; i < 8; i++)
+        CHECK(buf[i] == 0);
+    for (i = 8; i < 24; i++)
+        CHECK(buf[i] == 0x5A);
+    for (i = 24; i < 32; i++)
+        CHECK(buf[i] == 0);
+
+    fftest_jni_reset();
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_NEW_EXTRADATA,
+                      out, 8, 15), ENOSPC);
+    CHECK(g_fftest_jni.last_byte_len == -1);
+    CHECK(fftest_byte_array_read(out, buf, 64) == 32);
+    CHECK(buf[8] == 0x5A && buf[23] == 0x5A);
+
+    fftest_jni_reset();
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_NEW_EXTRADATA,
+                      out, 24, 9), EINVAL);
+    CHECK(g_fftest_jni.last_byte_len == -1);
+
+    fftest_jni_reset();
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_NEW_EXTRADATA,
+                      out, 32, 0), ENOSPC);
+    CHECK(g_fftest_jni.last_byte_len == -1);
+
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_NEW_EXTRADATA,
+                      out, INT32_MAX, 1), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_NEW_EXTRADATA,
+                      out, -1, 16), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_NEW_EXTRADATA,
+                      out, 0, -1), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_NEW_EXTRADATA,
+                      NULL, 0, 16), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_PARAM_CHANGE,
+                      out, 0, 16), ENOENT);
+
+    fftest_jni_reset();
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+              &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_SKIP_SAMPLES,
+              out, 4, 4) == 0);
+    CHECK(g_fftest_jni.calls == 0);
+    CHECK(g_fftest_jni.last_byte_len == -1);
+
+    fftest_jni_reset();
+    g_fftest_jni.exception = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+              &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_SKIP_SAMPLES,
+              out, 0, 0) == AVERROR_EXTERNAL);
+    CHECK(g_fftest_jni.calls == 0);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_publish = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+              &env, NULL, (jlong)(intptr_t)p, AV_PKT_DATA_NEW_EXTRADATA,
+              out, 0, 16) == AVERROR_EXTERNAL);
+    fftest_jni_reset();
+
+    memset(&bad, 0, sizeof(bad));
+    memset(bsd, 0, sizeof(bsd));
+    bad.side_data_elems = 1;
+    bad.side_data = NULL;
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)&bad, AV_PKT_DATA_PALETTE),
+                  EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)&bad, AV_PKT_DATA_PALETTE,
+                      out, 0, 16), EINVAL);
+
+    bsd[0].type = AV_PKT_DATA_NEW_EXTRADATA;
+    bsd[0].size = 8;
+    bsd[0].data = NULL;
+    bad.side_data = bsd;
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)&bad,
+                      AV_PKT_DATA_NEW_EXTRADATA), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)&bad,
+                      AV_PKT_DATA_NEW_EXTRADATA, out, 0, 16), EINVAL);
+
+    bsd[0].data = &huge;
+    bsd[0].size = (size_t)INT32_MAX + 1;
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)&bad,
+                      AV_PKT_DATA_NEW_EXTRADATA), EOVERFLOW);
+    fftest_jni_reset();
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)&bad,
+                      AV_PKT_DATA_NEW_EXTRADATA, out, 0, 16), EOVERFLOW);
+    CHECK(g_fftest_jni.last_byte_len == -1);
+
+    av_free((void *)(intptr_t)out);
+    av_packet_free(&p);
+}
+
+static void test_packet_side_data_types_and_names(void)
+{
+    JNIEnv env = fftest_jni_env();
+    AVPacket *p = av_packet_alloc();
+    AVPacket *empty = av_packet_alloc();
+    AVPacket bad;
+    AVPacketSideData *sd;
+    AVPacketSideData bsd[1];
+    jintArray types = NULL;
+    jint vals[8];
+    jstring name = NULL;
+
+    CHECK(p != NULL && empty != NULL);
+    if (!p || !empty) {
+        av_packet_free(&p);
+        av_packet_free(&empty);
+        return;
+    }
+
+    sd = fftest_sd_array_alloc(3);
+    CHECK(sd != NULL);
+    if (!sd) {
+        av_packet_free(&p);
+        av_packet_free(&empty);
+        return;
+    }
+    CHECK_OK(fftest_sd_entry_fill(sd, 0, AV_PKT_DATA_PALETTE, 4));
+    CHECK_OK(fftest_sd_entry_fill(sd, 1, AV_PKT_DATA_DISPLAYMATRIX, 36));
+    CHECK_OK(fftest_sd_entry_fill(sd, 2, AV_PKT_DATA_PALETTE, 4));
+    p->side_data = sd;
+    p->side_data_elems = 3;
+
+    fftest_jni_reset();
+    types = Java_org_ffmpeg_FFMpegNative_packetGetSideDataTypes(
+                &env, NULL, (jlong)(intptr_t)p);
+    CHECK(types != NULL);
+    CHECK(fftest_int_array_read(types, vals, 8) == 3);
+    CHECK(vals[0] == AV_PKT_DATA_PALETTE);
+    CHECK(vals[1] == AV_PKT_DATA_DISPLAYMATRIX);
+    CHECK(vals[2] == AV_PKT_DATA_PALETTE);
+    av_free((void *)(intptr_t)types);
+    types = NULL;
+
+    fftest_jni_reset();
+    types = Java_org_ffmpeg_FFMpegNative_packetGetSideDataTypes(
+                &env, NULL, (jlong)(intptr_t)empty);
+    CHECK(types != NULL);
+    CHECK(fftest_int_array_read(types, vals, 8) == 0);
+    av_free((void *)(intptr_t)types);
+    types = NULL;
+
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetGetSideDataTypes(
+              &env, NULL, 0) == NULL);
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetGetSideDataTypes(
+              NULL, NULL, (jlong)(intptr_t)p) == NULL);
+
+    memset(&bad, 0, sizeof(bad));
+    memset(bsd, 0, sizeof(bsd));
+    bad.side_data_elems = 1;
+    bad.side_data = NULL;
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetGetSideDataTypes(
+              &env, NULL, (jlong)(intptr_t)&bad) == NULL);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_publish = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetGetSideDataTypes(
+              &env, NULL, (jlong)(intptr_t)p) == NULL);
+    fftest_jni_reset();
+
+    name = Java_org_ffmpeg_FFMpegNative_packetSideDataName(
+               &env, NULL, AV_PKT_DATA_DISPLAYMATRIX);
+    CHECK(name != NULL);
+    if (name)
+        CHECK(strcmp(fftest_string_text(name),
+                     av_packet_side_data_name(AV_PKT_DATA_DISPLAYMATRIX)) == 0);
+    av_free((void *)(intptr_t)name);
+    name = NULL;
+
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetSideDataName(
+              &env, NULL, AV_PKT_DATA_NB) == NULL);
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetSideDataName(
+              &env, NULL, -1) == NULL);
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetSideDataName(
+              NULL, NULL, AV_PKT_DATA_PALETTE) == NULL);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_new_string = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_packetSideDataName(
+              &env, NULL, AV_PKT_DATA_PALETTE) == NULL);
+    fftest_jni_reset();
+
+    av_packet_free(&p);
+    av_packet_free(&empty);
+}
+
+static void test_stream_side_data_exact_contract(void)
+{
+    JNIEnv env = fftest_jni_env();
+    AVFormatContext *c = NULL;
+    AVPacketSideData *sd;
+    AVPacketSideData *before;
+    jbyteArray out = NULL;
+    jbyte buf[64];
+    int i, ret;
+
+    if (fftest_streams_new(&c, 3) < 0) {
+        CHECK(!"stream context allocation failed");
+        return;
+    }
+
+    {
+        AVStream **streams = c->streams;
+        c->streams = NULL;
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(
+                          &env, NULL, (jlong)(intptr_t)c, 0,
+                          AV_PKT_DATA_DISPLAYMATRIX), EINVAL);
+        CHECK(Java_org_ffmpeg_FFMpegNative_streamGetSideDataTypes(
+                  &env, NULL, (jlong)(intptr_t)c, 0) == NULL);
+        c->streams = streams;
+    }
+
+    sd = fftest_stream_sd_alloc(c, 0, 3);
+    CHECK(sd != NULL);
+    if (!sd) {
+        avformat_free_context(c);
+        return;
+    }
+    CHECK_OK(fftest_sd_entry_fill(sd, 0, AV_PKT_DATA_DISPLAYMATRIX, 36));
+    CHECK_OK(fftest_sd_entry_fill(sd, 1, AV_PKT_DATA_S12M_TIMECODE, 0));
+    CHECK_OK(fftest_sd_entry_fill(sd, 2, AV_PKT_DATA_CONTENT_LIGHT_LEVEL,
+                                 sizeof(AVContentLightMetadata)));
+    if (sd[0].size == 36)
+        memset(sd[0].data, 0x77, 36);
+    if (sd[2].size == sizeof(AVContentLightMetadata))
+        memset(sd[2].data, 0x33, sizeof(AVContentLightMetadata));
+
+    sd = fftest_stream_sd_alloc(c, 2, 1);
+    CHECK(sd != NULL);
+    if (sd) {
+        CHECK_OK(fftest_sd_entry_fill(sd, 0, AV_PKT_DATA_S12M_TIMECODE, 4));
+        sd[0].size = (size_t)INT32_MAX + 1;
+    }
+
+    before = c->streams[0]->codecpar->coded_side_data;
+
+    CHECK(Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(
+              &env, NULL, (jlong)(intptr_t)c, 0, AV_PKT_DATA_DISPLAYMATRIX) == 36);
+    CHECK(Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(
+              &env, NULL, (jlong)(intptr_t)c, 0, AV_PKT_DATA_S12M_TIMECODE) == 0);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)c, 0,
+                      AV_PKT_DATA_MASTERING_DISPLAY_METADATA), ENOENT);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)c, 1, AV_PKT_DATA_PALETTE),
+                  ENOENT);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)c, 3, AV_PKT_DATA_PALETTE),
+                  EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)c, -1, AV_PKT_DATA_PALETTE),
+                  EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(
+                      &env, NULL, 0, 0, AV_PKT_DATA_PALETTE), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)c, 0, -1), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)c, 0, AV_PKT_DATA_NB), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)c, 2,
+                      AV_PKT_DATA_S12M_TIMECODE), EOVERFLOW);
+
+    fftest_jni_reset();
+    out = fftest_new_byte_array(48);
+    CHECK(out != NULL);
+    if (!out) {
+        avformat_free_context(c);
+        return;
+    }
+
+    ret = Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(
+              &env, NULL, (jlong)(intptr_t)c, 0, AV_PKT_DATA_DISPLAYMATRIX,
+              out, 4, 36);
+    CHECK(ret == 36);
+    CHECK(g_fftest_jni.last_byte_len == 36);
+    CHECK(fftest_byte_array_read(out, buf, 64) == 48);
+    for (i = 0; i < 4; i++)
+        CHECK(buf[i] == 0);
+    for (i = 4; i < 40; i++)
+        CHECK(buf[i] == 0x77);
+    for (i = 40; i < 48; i++)
+        CHECK(buf[i] == 0);
+
+    fftest_jni_reset();
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)c, 0,
+                      AV_PKT_DATA_DISPLAYMATRIX, out, 4, 35), ENOSPC);
+    CHECK(g_fftest_jni.last_byte_len == -1);
+
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)c, 0,
+                      AV_PKT_DATA_DISPLAYMATRIX, out, 32, 17), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)c, 0,
+                      AV_PKT_DATA_DISPLAYMATRIX, out, INT32_MAX, 1), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)c, 0,
+                      AV_PKT_DATA_DISPLAYMATRIX, out, 0, -1), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)c, 0,
+                      AV_PKT_DATA_DISPLAYMATRIX, NULL, 0, 36), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)c, 0,
+                      AV_PKT_DATA_MASTERING_DISPLAY_METADATA, out, 0, 36),
+                  ENOENT);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)c, 5,
+                      AV_PKT_DATA_DISPLAYMATRIX, out, 0, 36), EINVAL);
+
+    fftest_jni_reset();
+    CHECK(Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(
+              &env, NULL, (jlong)(intptr_t)c, 0, AV_PKT_DATA_S12M_TIMECODE,
+              out, 8, 8) == 0);
+    CHECK(g_fftest_jni.calls == 0);
+    CHECK(g_fftest_jni.last_byte_len == -1);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_publish = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(
+              &env, NULL, (jlong)(intptr_t)c, 0,
+              AV_PKT_DATA_DISPLAYMATRIX, out, 0, 36) == AVERROR_EXTERNAL);
+    fftest_jni_reset();
+
+    fftest_jni_reset();
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)c, 2,
+                      AV_PKT_DATA_S12M_TIMECODE, out, 0, 8), EOVERFLOW);
+    CHECK(g_fftest_jni.last_byte_len == -1);
+
+    CHECK(c->streams[0]->codecpar->coded_side_data == before);
+    CHECK(c->streams[0]->codecpar->nb_coded_side_data == 3);
+    CHECK(before[0].type == AV_PKT_DATA_DISPLAYMATRIX);
+    CHECK(before[0].size == 36);
+    CHECK(before[0].data[0] == 0x77 && before[0].data[35] == 0x77);
+    CHECK(before[1].type == AV_PKT_DATA_S12M_TIMECODE);
+    CHECK(before[1].size == 0);
+    CHECK(before[2].type == AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+    CHECK(before[2].size == sizeof(AVContentLightMetadata));
+
+    av_free((void *)(intptr_t)out);
+    avformat_free_context(c);
+}
+
+static void test_stream_side_data_types(void)
+{
+    JNIEnv env = fftest_jni_env();
+    AVFormatContext *c = NULL;
+    AVPacketSideData *sd;
+    jintArray types = NULL;
+    jint vals[8];
+
+    if (fftest_streams_new(&c, 2) < 0) {
+        CHECK(!"stream context allocation failed");
+        return;
+    }
+
+    sd = fftest_stream_sd_alloc(c, 0, 3);
+    CHECK(sd != NULL);
+    if (!sd) {
+        avformat_free_context(c);
+        return;
+    }
+    CHECK_OK(fftest_sd_entry_fill(sd, 0, AV_PKT_DATA_DISPLAYMATRIX, 36));
+    CHECK_OK(fftest_sd_entry_fill(sd, 1, AV_PKT_DATA_S12M_TIMECODE, 4));
+    CHECK_OK(fftest_sd_entry_fill(sd, 2, AV_PKT_DATA_DISPLAYMATRIX, 36));
+
+    fftest_jni_reset();
+    types = Java_org_ffmpeg_FFMpegNative_streamGetSideDataTypes(
+                &env, NULL, (jlong)(intptr_t)c, 0);
+    CHECK(types != NULL);
+    CHECK(fftest_int_array_read(types, vals, 8) == 3);
+    CHECK(vals[0] == AV_PKT_DATA_DISPLAYMATRIX);
+    CHECK(vals[1] == AV_PKT_DATA_S12M_TIMECODE);
+    CHECK(vals[2] == AV_PKT_DATA_DISPLAYMATRIX);
+    av_free((void *)(intptr_t)types);
+    types = NULL;
+
+    fftest_jni_reset();
+    types = Java_org_ffmpeg_FFMpegNative_streamGetSideDataTypes(
+                &env, NULL, (jlong)(intptr_t)c, 1);
+    CHECK(types != NULL);
+    CHECK(fftest_int_array_read(types, vals, 8) == 0);
+    av_free((void *)(intptr_t)types);
+    types = NULL;
+
+    CHECK(Java_org_ffmpeg_FFMpegNative_streamGetSideDataTypes(
+              &env, NULL, (jlong)(intptr_t)c, 2) == NULL);
+    CHECK(Java_org_ffmpeg_FFMpegNative_streamGetSideDataTypes(
+              &env, NULL, (jlong)(intptr_t)c, -1) == NULL);
+    CHECK(Java_org_ffmpeg_FFMpegNative_streamGetSideDataTypes(
+              &env, NULL, 0, 0) == NULL);
+    CHECK(Java_org_ffmpeg_FFMpegNative_streamGetSideDataTypes(
+              NULL, NULL, (jlong)(intptr_t)c, 0) == NULL);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_publish = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_streamGetSideDataTypes(
+              &env, NULL, (jlong)(intptr_t)c, 0) == NULL);
+    fftest_jni_reset();
+
+    avformat_free_context(c);
+}
+
+static void test_stream_video_metadata_snapshot(void)
+{
+    JNIEnv env = fftest_jni_env();
+    AVFormatContext *c = NULL;
+    AVPacketSideData *sd;
+    jlongArray out = NULL;
+    jlong *values = g_fftest_jni.last_long;
+    AVDOVIDecoderConfigurationRecord dovi;
+    AVMasteringDisplayMetadata md;
+    AVContentLightMetadata cl;
+    int32_t matrix[9];
+
+    if (fftest_streams_new(&c, 4) < 0) {
+        CHECK(!"stream context allocation failed");
+        return;
+    }
+
+    sd = fftest_stream_sd_alloc(c, 0, 1);
+    CHECK(sd != NULL);
+    if (!sd)
+        goto done;
+    CHECK_OK(fftest_sd_entry_fill(sd, 0, AV_PKT_DATA_DISPLAYMATRIX,
+                                 sizeof(matrix)));
+    fftest_display_matrix_fill(matrix);
+    if (sd[0].size == sizeof(matrix))
+        memcpy(sd[0].data, matrix, sizeof(matrix));
+
+    sd = fftest_stream_sd_alloc(c, 1, 1);
+    CHECK(sd != NULL);
+    if (!sd)
+        goto done;
+    CHECK_OK(fftest_sd_entry_fill(sd, 0, AV_PKT_DATA_DOVI_CONF,
+                                 sizeof(dovi) + 1));
+    memset(&dovi, 0, sizeof(dovi));
+    dovi.dv_version_major = 1;
+    dovi.dv_version_minor = 2;
+    dovi.dv_profile = 8;
+    dovi.dv_level = 6;
+    dovi.rpu_present_flag = 1;
+    dovi.el_present_flag = 0;
+    dovi.bl_present_flag = 1;
+    dovi.dv_bl_signal_compatibility_id = 4;
+    dovi.dv_md_compression = 1;
+    if (sd[0].size == sizeof(dovi) + 1)
+        memcpy(sd[0].data, &dovi, sizeof(dovi));
+
+    sd = fftest_stream_sd_alloc(c, 2, 2);
+    CHECK(sd != NULL);
+    if (!sd)
+        goto done;
+    CHECK_OK(fftest_sd_entry_fill(sd, 0, AV_PKT_DATA_MASTERING_DISPLAY_METADATA,
+                                 sizeof(md)));
+    fftest_mastering_fill(&md);
+    if (sd[0].size == sizeof(md))
+        memcpy(sd[0].data, &md, sizeof(md));
+    CHECK_OK(fftest_sd_entry_fill(sd, 1, AV_PKT_DATA_CONTENT_LIGHT_LEVEL,
+                                 sizeof(cl)));
+    memset(&cl, 0, sizeof(cl));
+    cl.MaxCLL = 0xFFFFFFFFu;
+    cl.MaxFALL = 0x80000000u;
+    if (sd[1].size == sizeof(cl))
+        memcpy(sd[1].data, &cl, sizeof(cl));
+
+    sd = fftest_stream_sd_alloc(c, 3, 4);
+    CHECK(sd != NULL);
+    if (!sd)
+        goto done;
+    CHECK_OK(fftest_sd_entry_fill(sd, 0, AV_PKT_DATA_DOVI_CONF,
+                                 sizeof(dovi) - 1));
+    CHECK_OK(fftest_sd_entry_fill(sd, 1, AV_PKT_DATA_MASTERING_DISPLAY_METADATA,
+                                 sizeof(md) - 1));
+    CHECK_OK(fftest_sd_entry_fill(sd, 2, AV_PKT_DATA_CONTENT_LIGHT_LEVEL,
+                                 sizeof(cl) - 1));
+    CHECK_OK(fftest_sd_entry_fill(sd, 3, AV_PKT_DATA_DISPLAYMATRIX,
+                                 sizeof(matrix) - 1));
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_DISPLAY_MATRIX_SLOTS);
+    CHECK(out != NULL);
+    if (!out)
+        goto done;
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_streamGetDisplayMatrix(
+                 &env, NULL, (jlong)(intptr_t)c, 0, out));
+    CHECK(g_fftest_jni.last_long_len == FF_JNI_DISPLAY_MATRIX_SLOTS);
+    fftest_display_matrix_check(values);
+    av_free((void *)(intptr_t)out);
+    out = NULL;
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_DOVI_CONFIG_SLOTS);
+    CHECK(out != NULL);
+    if (!out)
+        goto done;
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_streamGetDoviConfig(
+                 &env, NULL, (jlong)(intptr_t)c, 1, out));
+    CHECK(g_fftest_jni.last_long_len == FF_JNI_DOVI_CONFIG_SLOTS);
+    CHECK(values[0] == 1);
+    CHECK(values[1] == 2);
+    CHECK(values[2] == 8);
+    CHECK(values[3] == 6);
+    CHECK(values[4] == 1);
+    CHECK(values[5] == 0);
+    CHECK(values[6] == 1);
+    CHECK(values[7] == 4);
+    CHECK(values[8] == 1);
+    av_free((void *)(intptr_t)out);
+    out = NULL;
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_MASTERING_DISPLAY_SLOTS);
+    CHECK(out != NULL);
+    if (!out)
+        goto done;
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_streamGetMasteringDisplayMetadata(
+                 &env, NULL, (jlong)(intptr_t)c, 2, out));
+    CHECK(g_fftest_jni.last_long_len == FF_JNI_MASTERING_DISPLAY_SLOTS);
+    fftest_mastering_check(values);
+    av_free((void *)(intptr_t)out);
+    out = NULL;
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_CONTENT_LIGHT_SLOTS);
+    CHECK(out != NULL);
+    if (!out)
+        goto done;
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_streamGetContentLightMetadata(
+                 &env, NULL, (jlong)(intptr_t)c, 2, out));
+    CHECK(g_fftest_jni.last_long_len == FF_JNI_CONTENT_LIGHT_SLOTS);
+    fftest_content_light_check(values);
+    av_free((void *)(intptr_t)out);
+    out = NULL;
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_MASTERING_DISPLAY_SLOTS);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetDoviConfig(
+                          &env, NULL, (jlong)(intptr_t)c, 2, out), ENOENT);
+        CHECK_AVERROR(
+            Java_org_ffmpeg_FFMpegNative_streamGetMasteringDisplayMetadata(
+                &env, NULL, (jlong)(intptr_t)c, 0, out), ENOENT);
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetContentLightMetadata(
+                          &env, NULL, (jlong)(intptr_t)c, 0, out), ENOENT);
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetDisplayMatrix(
+                          &env, NULL, (jlong)(intptr_t)c, 2, out), ENOENT);
+
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetDoviConfig(
+                          &env, NULL, (jlong)(intptr_t)c, 3, out), EINVAL);
+        CHECK_AVERROR(
+            Java_org_ffmpeg_FFMpegNative_streamGetMasteringDisplayMetadata(
+                &env, NULL, (jlong)(intptr_t)c, 3, out), EINVAL);
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetContentLightMetadata(
+                          &env, NULL, (jlong)(intptr_t)c, 3, out), EINVAL);
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetDisplayMatrix(
+                          &env, NULL, (jlong)(intptr_t)c, 3, out), EINVAL);
+        CHECK(g_fftest_jni.last_long_len == -1);
+        av_free((void *)(intptr_t)out);
+        out = NULL;
+    }
+
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetDoviConfig(
+                      &env, NULL, (jlong)(intptr_t)c, 1, NULL), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetMasteringDisplayMetadata(
+                      &env, NULL, (jlong)(intptr_t)c, 2, NULL), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetContentLightMetadata(
+                      &env, NULL, (jlong)(intptr_t)c, 2, NULL), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetDisplayMatrix(
+                      &env, NULL, (jlong)(intptr_t)c, 0, NULL), EINVAL);
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_DOVI_CONFIG_SLOTS - 1);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetDoviConfig(
+                          &env, NULL, (jlong)(intptr_t)c, 1, out), ENOSPC);
+        CHECK(g_fftest_jni.last_long_len == -1);
+        av_free((void *)(intptr_t)out);
+    }
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_MASTERING_DISPLAY_SLOTS - 1);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK_AVERROR(
+            Java_org_ffmpeg_FFMpegNative_streamGetMasteringDisplayMetadata(
+                &env, NULL, (jlong)(intptr_t)c, 2, out), ENOSPC);
+        CHECK(g_fftest_jni.last_long_len == -1);
+        av_free((void *)(intptr_t)out);
+    }
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_CONTENT_LIGHT_SLOTS - 1);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetContentLightMetadata(
+                          &env, NULL, (jlong)(intptr_t)c, 2, out), ENOSPC);
+        CHECK(g_fftest_jni.last_long_len == -1);
+        av_free((void *)(intptr_t)out);
+    }
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_DISPLAY_MATRIX_SLOTS - 1);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_streamGetDisplayMatrix(
+                          &env, NULL, (jlong)(intptr_t)c, 0, out), ENOSPC);
+        CHECK(g_fftest_jni.last_long_len == -1);
+        av_free((void *)(intptr_t)out);
+    }
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_publish = 1;
+    out = fftest_new_long_array(FF_JNI_DISPLAY_MATRIX_SLOTS);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK(Java_org_ffmpeg_FFMpegNative_streamGetDisplayMatrix(
+                  &env, NULL, (jlong)(intptr_t)c, 0, out) == AVERROR_EXTERNAL);
+        av_free((void *)(intptr_t)out);
+        out = NULL;
+    }
+    fftest_jni_reset();
+
+    out = fftest_new_long_array(FF_JNI_CONTENT_LIGHT_SLOTS);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK_OK(Java_org_ffmpeg_FFMpegNative_streamGetContentLightMetadata(
+                     &env, NULL, (jlong)(intptr_t)c, 2, out));
+        fftest_content_light_check(values);
+        av_free((void *)(intptr_t)out);
+        out = NULL;
+    }
+
+    CHECK(c->streams[1]->codecpar->nb_coded_side_data == 1);
+    CHECK(c->streams[1]->codecpar->coded_side_data[0].size == sizeof(dovi) + 1);
+
+done:
+    if (out)
+        av_free((void *)(intptr_t)out);
+    avformat_free_context(c);
+}
+
+static void test_frame_side_data_contract(void)
+{
+    JNIEnv env = fftest_jni_env();
+    AVFrame *f = av_frame_alloc();
+    AVFrame *empty = av_frame_alloc();
+    AVFrame *big = av_frame_alloc();
+    AVFrame *bad = av_frame_alloc();
+    AVFrameSideData *e;
+    jbyteArray out = NULL;
+    jintArray types = NULL;
+    jint vals[8];
+    jbyte buf[64];
+    jstring name = NULL;
+    int i, ret;
+
+    CHECK(f != NULL && empty != NULL && big != NULL && bad != NULL);
+    if (!f || !empty || !big || !bad)
+        goto out_early;
+
+    e = av_frame_new_side_data(f, AV_FRAME_DATA_SEI_UNREGISTERED, 5);
+    CHECK(e != NULL);
+    if (e)
+        memset(e->data, 0x3C, 5);
+    e = av_frame_new_side_data(f, AV_FRAME_DATA_A53_CC, 0);
+    CHECK(e != NULL);
+    e = av_frame_new_side_data(f, AV_FRAME_DATA_SEI_UNREGISTERED, 7);
+    CHECK(e != NULL);
+    if (e)
+        memset(e->data, 0x4D, 7);
+    CHECK(f->nb_side_data == 3);
+
+    CHECK(Java_org_ffmpeg_FFMpegNative_frameGetSideDataSize(
+              &env, NULL, (jlong)(intptr_t)f, AV_FRAME_DATA_SEI_UNREGISTERED) == 5);
+    CHECK(Java_org_ffmpeg_FFMpegNative_frameGetSideDataSize(
+              &env, NULL, (jlong)(intptr_t)f, AV_FRAME_DATA_A53_CC) == 0);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)f,
+                      AV_FRAME_DATA_MASTERING_DISPLAY_METADATA), ENOENT);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)f, -1), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetSideDataSize(
+                      &env, NULL, 0, AV_FRAME_DATA_A53_CC), EINVAL);
+
+    fftest_jni_reset();
+    out = fftest_new_byte_array(32);
+    CHECK(out != NULL);
+    if (!out)
+        goto out_all;
+
+    ret = Java_org_ffmpeg_FFMpegNative_frameCopySideDataExact(
+              &env, NULL, (jlong)(intptr_t)f, AV_FRAME_DATA_SEI_UNREGISTERED,
+              out, 8, 16);
+    CHECK(ret == 5);
+    CHECK(g_fftest_jni.last_byte_len == 5);
+    CHECK(fftest_byte_array_read(out, buf, 64) == 32);
+    for (i = 0; i < 8; i++)
+        CHECK(buf[i] == 0);
+    for (i = 8; i < 13; i++)
+        CHECK(buf[i] == 0x3C);
+    for (i = 13; i < 32; i++)
+        CHECK(buf[i] == 0);
+
+    fftest_jni_reset();
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)f,
+                      AV_FRAME_DATA_SEI_UNREGISTERED, out, 8, 4), ENOSPC);
+    CHECK(g_fftest_jni.last_byte_len == -1);
+    CHECK(fftest_byte_array_read(out, buf, 64) == 32);
+    CHECK(buf[8] == 0x3C && buf[12] == 0x3C);
+
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)f,
+                      AV_FRAME_DATA_SEI_UNREGISTERED, out, 32, 0), ENOSPC);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)f,
+                      AV_FRAME_DATA_SEI_UNREGISTERED, out, INT32_MAX, 1),
+                  EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)f,
+                      AV_FRAME_DATA_SEI_UNREGISTERED, NULL, 0, 16), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)f,
+                      AV_FRAME_DATA_MASTERING_DISPLAY_METADATA, out, 0, 16),
+                  ENOENT);
+
+    fftest_jni_reset();
+    CHECK(Java_org_ffmpeg_FFMpegNative_frameCopySideDataExact(
+              &env, NULL, (jlong)(intptr_t)f, AV_FRAME_DATA_A53_CC,
+              out, 4, 8) == 0);
+    CHECK(g_fftest_jni.calls == 0);
+    CHECK(g_fftest_jni.last_byte_len == -1);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_publish = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_frameCopySideDataExact(
+              &env, NULL, (jlong)(intptr_t)f,
+              AV_FRAME_DATA_SEI_UNREGISTERED, out, 0, 16) == AVERROR_EXTERNAL);
+    fftest_jni_reset();
+
+    fftest_jni_reset();
+    types = Java_org_ffmpeg_FFMpegNative_frameGetSideDataTypes(
+                &env, NULL, (jlong)(intptr_t)f);
+    CHECK(types != NULL);
+    CHECK(fftest_int_array_read(types, vals, 8) == 3);
+    CHECK(vals[0] == AV_FRAME_DATA_SEI_UNREGISTERED);
+    CHECK(vals[1] == AV_FRAME_DATA_A53_CC);
+    CHECK(vals[2] == AV_FRAME_DATA_SEI_UNREGISTERED);
+    av_free((void *)(intptr_t)types);
+    types = NULL;
+
+    fftest_jni_reset();
+    types = Java_org_ffmpeg_FFMpegNative_frameGetSideDataTypes(
+                &env, NULL, (jlong)(intptr_t)empty);
+    CHECK(types != NULL);
+    CHECK(fftest_int_array_read(types, vals, 8) == 0);
+    av_free((void *)(intptr_t)types);
+    types = NULL;
+
+    bad->side_data = NULL;
+    bad->nb_side_data = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_frameGetSideDataTypes(
+              &env, NULL, (jlong)(intptr_t)bad) == NULL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)bad, AV_FRAME_DATA_A53_CC),
+                  EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)bad, AV_FRAME_DATA_A53_CC,
+                      out, 0, 16), EINVAL);
+    bad->nb_side_data = 0;
+
+    CHECK(Java_org_ffmpeg_FFMpegNative_frameGetSideDataTypes(
+              &env, NULL, 0) == NULL);
+    CHECK(Java_org_ffmpeg_FFMpegNative_frameGetSideDataTypes(
+              NULL, NULL, (jlong)(intptr_t)f) == NULL);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_publish = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_frameGetSideDataTypes(
+              &env, NULL, (jlong)(intptr_t)f) == NULL);
+    fftest_jni_reset();
+
+    e = fftest_frame_sd_oversized(big, AV_FRAME_DATA_SEI_UNREGISTERED,
+                                  (size_t)INT32_MAX + 1);
+    CHECK(e != NULL);
+    CHECK(big->nb_side_data == 1);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetSideDataSize(
+                      &env, NULL, (jlong)(intptr_t)big,
+                      AV_FRAME_DATA_SEI_UNREGISTERED), EOVERFLOW);
+    fftest_jni_reset();
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameCopySideDataExact(
+                      &env, NULL, (jlong)(intptr_t)big,
+                      AV_FRAME_DATA_SEI_UNREGISTERED, out, 0, 16), EOVERFLOW);
+    CHECK(g_fftest_jni.last_byte_len == -1);
+
+    name = Java_org_ffmpeg_FFMpegNative_frameSideDataName(
+               &env, NULL, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    CHECK(name != NULL);
+    if (name)
+        CHECK(strcmp(fftest_string_text(name),
+                     av_frame_side_data_name(
+                         AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)) == 0);
+    av_free((void *)(intptr_t)name);
+    name = NULL;
+
+    CHECK(Java_org_ffmpeg_FFMpegNative_frameSideDataName(
+              &env, NULL, 1000) == NULL);
+    CHECK(Java_org_ffmpeg_FFMpegNative_frameSideDataName(
+              &env, NULL, -1) == NULL);
+    CHECK(Java_org_ffmpeg_FFMpegNative_frameSideDataName(
+              NULL, NULL, AV_FRAME_DATA_A53_CC) == NULL);
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_new_string = 1;
+    CHECK(Java_org_ffmpeg_FFMpegNative_frameSideDataName(
+              &env, NULL, AV_FRAME_DATA_A53_CC) == NULL);
+    fftest_jni_reset();
+
+out_all:
+    if (out)
+        av_free((void *)(intptr_t)out);
+out_early:
+    av_frame_free(&f);
+    av_frame_free(&empty);
+    av_frame_free(&big);
+    av_frame_free(&bad);
+}
+
+static void test_frame_video_metadata_snapshot(void)
+{
+    JNIEnv env = fftest_jni_env();
+    AVFrame *f = av_frame_alloc();
+    AVFrame *shortf = av_frame_alloc();
+    AVMasteringDisplayMetadata *md;
+    AVContentLightMetadata *cl;
+    AVFrameSideData *e;
+    jlongArray out = NULL;
+    jlong *values = g_fftest_jni.last_long;
+    jlong slots[FF_JNI_MASTERING_DISPLAY_SLOTS];
+    int32_t matrix[9];
+
+    CHECK(f != NULL && shortf != NULL);
+    if (!f || !shortf)
+        goto done;
+
+    md = av_mastering_display_metadata_create_side_data(f);
+    CHECK(md != NULL);
+    if (md)
+        fftest_mastering_fill(md);
+    cl = av_content_light_metadata_create_side_data(f);
+    CHECK(cl != NULL);
+    if (cl) {
+        cl->MaxCLL = 0xFFFFFFFFu;
+        cl->MaxFALL = 0x80000000u;
+    }
+    e = av_frame_new_side_data(f, AV_FRAME_DATA_DISPLAYMATRIX,
+                               sizeof(matrix) + 2);
+    CHECK(e != NULL);
+    fftest_display_matrix_fill(matrix);
+    if (e) {
+        e->data += 2;
+        e->size -= 2;
+        memcpy(e->data, matrix, sizeof(matrix));
+    }
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_MASTERING_DISPLAY_SLOTS);
+    CHECK(out != NULL);
+    if (!out)
+        goto done;
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_frameGetMasteringDisplayMetadata(
+                 &env, NULL, (jlong)(intptr_t)f, out));
+    CHECK(g_fftest_jni.last_long_len == FF_JNI_MASTERING_DISPLAY_SLOTS);
+    CHECK(fftest_long_array_read(out, slots, FF_JNI_MASTERING_DISPLAY_SLOTS) ==
+          FF_JNI_MASTERING_DISPLAY_SLOTS);
+    fftest_mastering_check(slots);
+    fftest_mastering_check(values);
+    av_free((void *)(intptr_t)out);
+    out = NULL;
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_CONTENT_LIGHT_SLOTS);
+    CHECK(out != NULL);
+    if (!out)
+        goto done;
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_frameGetContentLightMetadata(
+                 &env, NULL, (jlong)(intptr_t)f, out));
+    CHECK(g_fftest_jni.last_long_len == FF_JNI_CONTENT_LIGHT_SLOTS);
+    fftest_content_light_check(values);
+    av_free((void *)(intptr_t)out);
+    out = NULL;
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_DISPLAY_MATRIX_SLOTS);
+    CHECK(out != NULL);
+    if (!out)
+        goto done;
+    CHECK_OK(Java_org_ffmpeg_FFMpegNative_frameGetDisplayMatrix(
+                 &env, NULL, (jlong)(intptr_t)f, out));
+    CHECK(g_fftest_jni.last_long_len == FF_JNI_DISPLAY_MATRIX_SLOTS);
+    fftest_display_matrix_check(values);
+    av_free((void *)(intptr_t)out);
+    out = NULL;
+
+    e = av_frame_new_side_data(shortf, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA,
+                               sizeof(AVMasteringDisplayMetadata) - 1);
+    CHECK(e != NULL);
+    e = av_frame_new_side_data(shortf, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL,
+                               sizeof(AVContentLightMetadata) - 1);
+    CHECK(e != NULL);
+    e = av_frame_new_side_data(shortf, AV_FRAME_DATA_DISPLAYMATRIX,
+                               sizeof(matrix) - 1);
+    CHECK(e != NULL);
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_MASTERING_DISPLAY_SLOTS);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK_AVERROR(
+            Java_org_ffmpeg_FFMpegNative_frameGetMasteringDisplayMetadata(
+                &env, NULL, (jlong)(intptr_t)shortf, out), EINVAL);
+        CHECK_AVERROR(
+            Java_org_ffmpeg_FFMpegNative_frameGetContentLightMetadata(
+                &env, NULL, (jlong)(intptr_t)shortf, out), EINVAL);
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetDisplayMatrix(
+                          &env, NULL, (jlong)(intptr_t)shortf, out), EINVAL);
+        CHECK(g_fftest_jni.last_long_len == -1);
+        av_free((void *)(intptr_t)out);
+        out = NULL;
+    }
+
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetMasteringDisplayMetadata(
+                      &env, NULL, (jlong)(intptr_t)f, NULL), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetContentLightMetadata(
+                      &env, NULL, (jlong)(intptr_t)f, NULL), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetDisplayMatrix(
+                      &env, NULL, (jlong)(intptr_t)f, NULL), EINVAL);
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_DISPLAY_MATRIX_SLOTS);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetMasteringDisplayMetadata(
+                          &env, NULL, 0, out), EINVAL);
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetContentLightMetadata(
+                          &env, NULL, 0, out), EINVAL);
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetDisplayMatrix(
+                          &env, NULL, 0, out), EINVAL);
+        CHECK(g_fftest_jni.last_long_len == -1);
+        av_free((void *)(intptr_t)out);
+        out = NULL;
+    }
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_MASTERING_DISPLAY_SLOTS - 1);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK_AVERROR(
+            Java_org_ffmpeg_FFMpegNative_frameGetMasteringDisplayMetadata(
+                &env, NULL, (jlong)(intptr_t)f, out), ENOSPC);
+        CHECK(g_fftest_jni.last_long_len == -1);
+        av_free((void *)(intptr_t)out);
+    }
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_CONTENT_LIGHT_SLOTS - 1);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetContentLightMetadata(
+                          &env, NULL, (jlong)(intptr_t)f, out), ENOSPC);
+        CHECK(g_fftest_jni.last_long_len == -1);
+        av_free((void *)(intptr_t)out);
+    }
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_DISPLAY_MATRIX_SLOTS - 1);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_frameGetDisplayMatrix(
+                          &env, NULL, (jlong)(intptr_t)f, out), ENOSPC);
+        CHECK(g_fftest_jni.last_long_len == -1);
+        av_free((void *)(intptr_t)out);
+    }
+
+    fftest_jni_reset();
+    g_fftest_jni.fail_publish = 1;
+    out = fftest_new_long_array(FF_JNI_DISPLAY_MATRIX_SLOTS);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK(Java_org_ffmpeg_FFMpegNative_frameGetDisplayMatrix(
+                  &env, NULL, (jlong)(intptr_t)f, out) == AVERROR_EXTERNAL);
+        av_free((void *)(intptr_t)out);
+        out = NULL;
+    }
+    fftest_jni_reset();
+
+    out = fftest_new_long_array(FF_JNI_CONTENT_LIGHT_SLOTS);
+    CHECK(out != NULL);
+    if (out) {
+        CHECK_OK(Java_org_ffmpeg_FFMpegNative_frameGetContentLightMetadata(
+                     &env, NULL, (jlong)(intptr_t)f, out));
+        fftest_content_light_check(values);
+        av_free((void *)(intptr_t)out);
+        out = NULL;
+    }
+
+    CHECK(f->nb_side_data == 3);
+    CHECK(av_frame_get_side_data(f, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL) != NULL);
+
+done:
+    if (out)
+        av_free((void *)(intptr_t)out);
+    av_frame_free(&f);
+    av_frame_free(&shortf);
+}
+
 int main(void)
 {
     test_plain_payload();
@@ -4164,6 +5480,13 @@ int main(void)
     test_dict_separator_lookup_short_circuits();
     test_dict_copy_transfer_flags_keep_source_owned();
     test_dict_parse_and_format_roundtrip();
+    test_packet_side_data_exact_contract();
+    test_packet_side_data_types_and_names();
+    test_stream_side_data_exact_contract();
+    test_stream_side_data_types();
+    test_stream_video_metadata_snapshot();
+    test_frame_side_data_contract();
+    test_frame_video_metadata_snapshot();
 
     /* The audio format snapshot suite lives in its own translation unit (it
      * needs fixture builders that would only add noise here) but shares this

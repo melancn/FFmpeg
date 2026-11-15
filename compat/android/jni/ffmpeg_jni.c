@@ -65,6 +65,8 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/samplefmt.h"
 #include "libavutil/channel_layout.h"
+#include "libavutil/dovi_meta.h"
+#include "libavutil/mastering_display_metadata.h"
 
 #include "libavcodec/avcodec.h"
 #include "libavcodec/mediacodec.h"
@@ -552,7 +554,7 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  * Android. The entries only append, so a 1.4 caller is unaffected; a 1.5
  * caller gates on FF_JNI_CAP_LIBASS_FONT_LOG because the whole libass section
  * is absent from a non-libass build. */
-#define FF_JNI_BRIDGE_API_MINOR 5
+#define FF_JNI_BRIDGE_API_MINOR 6
 #define FF_JNI_BRIDGE_API_VERSION \
     ((FF_JNI_BRIDGE_API_MAJOR << 16) | FF_JNI_BRIDGE_API_MINOR)
 
@@ -620,6 +622,11 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  * the libass public API, and Kotlin-side logging cannot see it. Only set when
  * CONFIG_LIBASS is on, because the entry points do not exist otherwise. */
 #define FF_JNI_CAP_LIBASS_FONT_LOG          (1LL << 14)
+
+#define FF_JNI_CAP_STREAM_SIDE_DATA         (1LL << 15)
+#define FF_JNI_CAP_FRAME_SIDE_DATA          (1LL << 16)
+#define FF_JNI_CAP_SIDE_DATA_TYPES          (1LL << 17)
+#define FF_JNI_CAP_VIDEO_METADATA_SNAPSHOT  (1LL << 18)
 
 /* Bumped whenever the packet budget accounting rules change, so a stored
  * charge value can be attributed to the policy that produced it. */
@@ -792,7 +799,11 @@ Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
                          FF_JNI_CAP_AUDIO_STREAM_FORMAT_INFO |
                          FF_JNI_CAP_AUDIO_FRAME_FORMAT_INFO |
                          FF_JNI_CAP_VIDEO_CODEC_COMPONENT_NAME |
-                         FF_JNI_CAP_VIDEO_DECODE_STATS);
+                         FF_JNI_CAP_VIDEO_DECODE_STATS |
+                         FF_JNI_CAP_STREAM_SIDE_DATA |
+                         FF_JNI_CAP_FRAME_SIDE_DATA |
+                         FF_JNI_CAP_SIDE_DATA_TYPES |
+                         FF_JNI_CAP_VIDEO_METADATA_SNAPSHOT);
 #if CONFIG_LIBASS
     caps |= (jlong)FF_JNI_CAP_LIBASS_FONT_LOG;
 #endif
@@ -1901,19 +1912,170 @@ static const AVPacketSideData *ff_jni_find_side_data(const AVPacket *p, int type
     return NULL;
 }
 
+static int ff_jni_packet_sd_entries(const AVPacket *p,
+                                    const AVPacketSideData **sd, int *nb)
+{
+    if (!p || p->side_data_elems < 0 ||
+        (p->side_data_elems > 0 && !p->side_data))
+        return AVERROR(EINVAL);
+    *sd = p->side_data;
+    *nb = p->side_data_elems;
+    return 0;
+}
+
+static int ff_jni_packet_sd_lookup(const AVPacket *p, int type,
+                                   const AVPacketSideData **out)
+{
+    const AVPacketSideData *sd;
+    int nb, i, ret;
+
+    if (type < 0 || type >= AV_PKT_DATA_NB)
+        return AVERROR(EINVAL);
+    ret = ff_jni_packet_sd_entries(p, &sd, &nb);
+    if (ret < 0)
+        return ret;
+
+    *out = ff_jni_find_side_data(p, type);
+    if (*out)
+        return 0;
+
+    for (i = 0; i < nb; i++)
+        if ((int)sd[i].type == type)
+            return AVERROR(EINVAL);
+    return AVERROR(ENOENT);
+}
+
+static int ff_jni_stream_sd_entries(AVFormatContext *c, jint index,
+                                    const AVPacketSideData **sd, int *nb)
+{
+    AVCodecParameters *p;
+
+    if (!c || index < 0 || index >= (jint)c->nb_streams)
+        return AVERROR(EINVAL);
+    if (!c->streams || !c->streams[index])
+        return AVERROR(EINVAL);
+    p = c->streams[index]->codecpar;
+    if (!p || p->nb_coded_side_data < 0 ||
+        (p->nb_coded_side_data > 0 && !p->coded_side_data))
+        return AVERROR(EINVAL);
+    *sd = p->coded_side_data;
+    *nb = p->nb_coded_side_data;
+    return 0;
+}
+
+static int ff_jni_stream_sd_lookup(AVFormatContext *c, jint index, int type,
+                                   const AVPacketSideData **out)
+{
+    const AVPacketSideData *sd;
+    int nb, i, ret;
+
+    if (type < 0 || type >= AV_PKT_DATA_NB)
+        return AVERROR(EINVAL);
+    ret = ff_jni_stream_sd_entries(c, index, &sd, &nb);
+    if (ret < 0)
+        return ret;
+
+    for (i = 0; i < nb; i++) {
+        if ((int)sd[i].type != type)
+            continue;
+        if (sd[i].size > 0 && !sd[i].data)
+            return AVERROR(EINVAL);
+        *out = &sd[i];
+        return 0;
+    }
+    return AVERROR(ENOENT);
+}
+
+static int ff_jni_frame_sd_entries(const AVFrame *f)
+{
+    int i;
+
+    if (!f || f->nb_side_data < 0 ||
+        (f->nb_side_data > 0 && !f->side_data))
+        return AVERROR(EINVAL);
+    for (i = 0; i < f->nb_side_data; i++)
+        if (!f->side_data[i])
+            return AVERROR(EINVAL);
+    return 0;
+}
+
+static int ff_jni_frame_sd_lookup(const AVFrame *f, int type,
+                                  const AVFrameSideData **out)
+{
+    int i, ret;
+
+    if (type < 0)
+        return AVERROR(EINVAL);
+    ret = ff_jni_frame_sd_entries(f);
+    if (ret < 0)
+        return ret;
+
+    for (i = 0; i < f->nb_side_data; i++) {
+        if ((int)f->side_data[i]->type != type)
+            continue;
+        if (f->side_data[i]->size > 0 && !f->side_data[i]->data)
+            return AVERROR(EINVAL);
+        *out = f->side_data[i];
+        return 0;
+    }
+    return AVERROR(ENOENT);
+}
+
+static int ff_jni_sd_size_to_jint(size_t size, jint *out)
+{
+    if (size > (size_t)INT32_MAX)
+        return AVERROR(EOVERFLOW);
+    *out = (jint)size;
+    return 0;
+}
+
+static jint ff_jni_sd_copy(JNIEnv *env, const uint8_t *data, size_t size,
+                           jbyteArray out, jint offset, jint capacity)
+{
+    jsize out_len;
+
+    if (!env || !out || offset < 0 || capacity < 0)
+        return AVERROR(EINVAL);
+    if ((*env)->ExceptionCheck(env))
+        return AVERROR_EXTERNAL;
+
+    out_len = (*env)->GetArrayLength(env, out);
+    if ((*env)->ExceptionCheck(env))
+        return AVERROR_EXTERNAL;
+    if (offset > out_len || capacity > out_len - offset)
+        return AVERROR(EINVAL);
+
+    if (size > (size_t)INT32_MAX)
+        return AVERROR(EOVERFLOW);
+    if ((uint64_t)size > (uint64_t)capacity)
+        return AVERROR(ENOSPC);
+
+    if (size > 0) {
+        if (!data)
+            return AVERROR(EINVAL);
+        (*env)->SetByteArrayRegion(env, out, offset, (jsize)size,
+                                   (const jbyte *)data);
+        if ((*env)->ExceptionCheck(env))
+            return AVERROR_EXTERNAL;
+    }
+    return (jint)size;
+}
+
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_packetGetSideDataSize(JNIEnv *env, jobject thiz,
                                                    jlong pkt, jint type)
 {
-    AVPacket *p = PTR(AVPacket *, pkt);
     const AVPacketSideData *sd;
+    jint size;
+    int ret;
 
-    if (!p)
-        return AVERROR(EINVAL);
-    sd = ff_jni_find_side_data(p, type);
-    if (!sd)
-        return AVERROR(ENOENT);
-    return (jint)sd->size;
+    ret = ff_jni_packet_sd_lookup(PTR(AVPacket *, pkt), type, &sd);
+    if (ret < 0)
+        return ret;
+    ret = ff_jni_sd_size_to_jint(sd->size, &size);
+    if (ret < 0)
+        return ret;
+    return size;
 }
 
 JNIEXPORT jint JNICALL
@@ -1922,35 +2084,457 @@ Java_org_ffmpeg_FFMpegNative_packetCopySideDataExact(JNIEnv *env, jobject thiz,
                                                      jbyteArray out,
                                                      jint offset, jint capacity)
 {
-    AVPacket *p = PTR(AVPacket *, pkt);
     const AVPacketSideData *sd;
-    jsize out_len;
+    int ret;
 
-    if (!p || !out || offset < 0 || capacity < 0)
+    if (!env || !out || offset < 0 || capacity < 0)
         return AVERROR(EINVAL);
+    ret = ff_jni_packet_sd_lookup(PTR(AVPacket *, pkt), type, &sd);
+    if (ret < 0)
+        return ret;
+    return ff_jni_sd_copy(env, sd->data, sd->size, out, offset, capacity);
+}
 
-    /* Subtraction form: offset + capacity could overflow. */
-    out_len = (*env)->GetArrayLength(env, out);
-    if (offset > out_len || capacity > out_len - offset)
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(JNIEnv *env, jobject thiz,
+                                                   jlong fmt, jint index,
+                                                   jint type)
+{
+    const AVPacketSideData *sd;
+    jint size;
+    int ret;
+
+    ret = ff_jni_stream_sd_lookup(PTR(AVFormatContext *, fmt), index, type, &sd);
+    if (ret < 0)
+        return ret;
+    ret = ff_jni_sd_size_to_jint(sd->size, &size);
+    if (ret < 0)
+        return ret;
+    return size;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(JNIEnv *env, jobject thiz,
+                                                     jlong fmt, jint index,
+                                                     jint type, jbyteArray out,
+                                                     jint offset, jint capacity)
+{
+    const AVPacketSideData *sd;
+    int ret;
+
+    if (!env || !out || offset < 0 || capacity < 0)
         return AVERROR(EINVAL);
+    ret = ff_jni_stream_sd_lookup(PTR(AVFormatContext *, fmt), index, type, &sd);
+    if (ret < 0)
+        return ret;
+    return ff_jni_sd_copy(env, sd->data, sd->size, out, offset, capacity);
+}
 
-    sd = ff_jni_find_side_data(p, type);
-    if (!sd)
-        return AVERROR(ENOENT);
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_frameGetSideDataSize(JNIEnv *env, jobject thiz,
+                                                  jlong frame, jint type)
+{
+    const AVFrameSideData *sd;
+    jint size;
+    int ret;
 
-    /* Never truncate: refuse instead of copying a prefix and reporting it
-     * as the whole entry. */
-    if ((uint64_t)sd->size > (uint64_t)capacity)
+    ret = ff_jni_frame_sd_lookup(PTR(AVFrame *, frame), type, &sd);
+    if (ret < 0)
+        return ret;
+    ret = ff_jni_sd_size_to_jint(sd->size, &size);
+    if (ret < 0)
+        return ret;
+    return size;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_frameCopySideDataExact(JNIEnv *env, jobject thiz,
+                                                    jlong frame, jint type,
+                                                    jbyteArray out,
+                                                    jint offset, jint capacity)
+{
+    const AVFrameSideData *sd;
+    int ret;
+
+    if (!env || !out || offset < 0 || capacity < 0)
+        return AVERROR(EINVAL);
+    ret = ff_jni_frame_sd_lookup(PTR(AVFrame *, frame), type, &sd);
+    if (ret < 0)
+        return ret;
+    return ff_jni_sd_copy(env, sd->data, sd->size, out, offset, capacity);
+}
+
+JNIEXPORT jintArray JNICALL
+Java_org_ffmpeg_FFMpegNative_packetGetSideDataTypes(JNIEnv *env, jobject thiz,
+                                                    jlong pkt)
+{
+    const AVPacketSideData *sd;
+    jintArray arr;
+    jint value;
+    int nb, i;
+
+    if (!env)
+        return NULL;
+    if ((*env)->ExceptionCheck(env))
+        return NULL;
+    if (ff_jni_packet_sd_entries(PTR(AVPacket *, pkt), &sd, &nb) < 0)
+        return NULL;
+
+    arr = (*env)->NewIntArray(env, (jsize)nb);
+    if (!arr)
+        return NULL;
+    for (i = 0; i < nb; i++) {
+        value = (jint)sd[i].type;
+        (*env)->SetIntArrayRegion(env, arr, i, 1, &value);
+        if ((*env)->ExceptionCheck(env))
+            return NULL;
+    }
+    return arr;
+}
+
+JNIEXPORT jintArray JNICALL
+Java_org_ffmpeg_FFMpegNative_streamGetSideDataTypes(JNIEnv *env, jobject thiz,
+                                                    jlong fmt, jint index)
+{
+    const AVPacketSideData *sd;
+    jintArray arr;
+    jint value;
+    int nb, i;
+
+    if (!env)
+        return NULL;
+    if ((*env)->ExceptionCheck(env))
+        return NULL;
+    if (ff_jni_stream_sd_entries(PTR(AVFormatContext *, fmt), index,
+                                 &sd, &nb) < 0)
+        return NULL;
+
+    arr = (*env)->NewIntArray(env, (jsize)nb);
+    if (!arr)
+        return NULL;
+    for (i = 0; i < nb; i++) {
+        value = (jint)sd[i].type;
+        (*env)->SetIntArrayRegion(env, arr, i, 1, &value);
+        if ((*env)->ExceptionCheck(env))
+            return NULL;
+    }
+    return arr;
+}
+
+JNIEXPORT jintArray JNICALL
+Java_org_ffmpeg_FFMpegNative_frameGetSideDataTypes(JNIEnv *env, jobject thiz,
+                                                   jlong frame)
+{
+    AVFrame *f = PTR(AVFrame *, frame);
+    jintArray arr;
+    jint value;
+    int i;
+
+    if (!env)
+        return NULL;
+    if ((*env)->ExceptionCheck(env))
+        return NULL;
+    if (ff_jni_frame_sd_entries(f) < 0)
+        return NULL;
+
+    arr = (*env)->NewIntArray(env, (jsize)f->nb_side_data);
+    if (!arr)
+        return NULL;
+    for (i = 0; i < f->nb_side_data; i++) {
+        value = (jint)f->side_data[i]->type;
+        (*env)->SetIntArrayRegion(env, arr, i, 1, &value);
+        if ((*env)->ExceptionCheck(env))
+            return NULL;
+    }
+    return arr;
+}
+
+JNIEXPORT jstring JNICALL
+Java_org_ffmpeg_FFMpegNative_packetSideDataName(JNIEnv *env, jobject thiz,
+                                                jint type)
+{
+    const char *name;
+
+    if (!env || type < 0 || type >= AV_PKT_DATA_NB)
+        return NULL;
+    if ((*env)->ExceptionCheck(env))
+        return NULL;
+    name = av_packet_side_data_name((enum AVPacketSideDataType)type);
+    return name ? (*env)->NewStringUTF(env, name) : NULL;
+}
+
+JNIEXPORT jstring JNICALL
+Java_org_ffmpeg_FFMpegNative_frameSideDataName(JNIEnv *env, jobject thiz,
+                                               jint type)
+{
+    const char *name;
+
+    if (!env || type < 0)
+        return NULL;
+    if ((*env)->ExceptionCheck(env))
+        return NULL;
+    name = av_frame_side_data_name((enum AVFrameSideDataType)type);
+    return name ? (*env)->NewStringUTF(env, name) : NULL;
+}
+
+#define FF_JNI_DOVI_CONFIG_SLOTS        9
+#define FF_JNI_MASTERING_DISPLAY_SLOTS 22
+#define FF_JNI_CONTENT_LIGHT_SLOTS      2
+#define FF_JNI_DISPLAY_MATRIX_SLOTS     9
+
+static jint ff_jni_publish_longs(JNIEnv *env, jlongArray out, jint slots,
+                                 const jlong *values)
+{
+    jsize length;
+
+    if (!env || !out)
+        return AVERROR(EINVAL);
+    if ((*env)->ExceptionCheck(env))
+        return AVERROR_EXTERNAL;
+
+    length = (*env)->GetArrayLength(env, (jarray)out);
+    if ((*env)->ExceptionCheck(env))
+        return AVERROR_EXTERNAL;
+    if (length < slots)
         return AVERROR(ENOSPC);
 
-    if (sd->size > 0) {
-        (*env)->SetByteArrayRegion(env, out, offset,
-                                   (jsize)sd->size,
-                                   (const jbyte *)sd->data);
-        if ((*env)->ExceptionCheck(env))
-            return AVERROR(ENOMEM);
+    (*env)->SetLongArrayRegion(env, out, 0, slots, values);
+    if ((*env)->ExceptionCheck(env))
+        return AVERROR_EXTERNAL;
+    return 0;
+}
+
+static jint ff_jni_dovi_slots(const uint8_t *data, size_t size,
+                              jlong out[FF_JNI_DOVI_CONFIG_SLOTS])
+{
+    AVDOVIDecoderConfigurationRecord rec;
+
+    if (!data || size < sizeof(rec))
+        return AVERROR(EINVAL);
+    memcpy(&rec, data, sizeof(rec));
+
+    out[0] = (jlong)rec.dv_version_major;
+    out[1] = (jlong)rec.dv_version_minor;
+    out[2] = (jlong)rec.dv_profile;
+    out[3] = (jlong)rec.dv_level;
+    out[4] = (jlong)rec.rpu_present_flag;
+    out[5] = (jlong)rec.el_present_flag;
+    out[6] = (jlong)rec.bl_present_flag;
+    out[7] = (jlong)rec.dv_bl_signal_compatibility_id;
+    out[8] = (jlong)rec.dv_md_compression;
+    return 0;
+}
+
+static jint ff_jni_mastering_slots(const uint8_t *data, size_t size,
+                                   jlong out[FF_JNI_MASTERING_DISPLAY_SLOTS])
+{
+    AVMasteringDisplayMetadata m;
+    int i;
+
+    if (!data || size < sizeof(m))
+        return AVERROR(EINVAL);
+    memcpy(&m, data, sizeof(m));
+
+    out[0] = (jlong)m.has_primaries;
+    out[1] = (jlong)m.has_luminance;
+    for (i = 0; i < 3; i++) {
+        jlong *p = &out[2 + i * 4];
+        p[0] = (jlong)m.display_primaries[i][0].num;
+        p[1] = (jlong)m.display_primaries[i][0].den;
+        p[2] = (jlong)m.display_primaries[i][1].num;
+        p[3] = (jlong)m.display_primaries[i][1].den;
     }
-    return (jint)sd->size;
+    out[14] = (jlong)m.white_point[0].num;
+    out[15] = (jlong)m.white_point[0].den;
+    out[16] = (jlong)m.white_point[1].num;
+    out[17] = (jlong)m.white_point[1].den;
+    out[18] = (jlong)m.min_luminance.num;
+    out[19] = (jlong)m.min_luminance.den;
+    out[20] = (jlong)m.max_luminance.num;
+    out[21] = (jlong)m.max_luminance.den;
+    return 0;
+}
+
+static jint ff_jni_content_light_slots(const uint8_t *data, size_t size,
+                                       jlong out[FF_JNI_CONTENT_LIGHT_SLOTS])
+{
+    AVContentLightMetadata m;
+
+    if (!data || size < sizeof(m))
+        return AVERROR(EINVAL);
+    memcpy(&m, data, sizeof(m));
+
+    out[0] = (jlong)(uint64_t)m.MaxCLL;
+    out[1] = (jlong)(uint64_t)m.MaxFALL;
+    return 0;
+}
+
+static jint ff_jni_display_matrix_slots(const uint8_t *data, size_t size,
+                                        jlong out[FF_JNI_DISPLAY_MATRIX_SLOTS])
+{
+    int32_t matrix[FF_JNI_DISPLAY_MATRIX_SLOTS];
+    int i;
+
+    if (!data || size < sizeof(matrix))
+        return AVERROR(EINVAL);
+    memcpy(matrix, data, sizeof(matrix));
+
+    for (i = 0; i < FF_JNI_DISPLAY_MATRIX_SLOTS; i++)
+        out[i] = (jlong)matrix[i];
+    return 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_streamGetDoviConfig(JNIEnv *env, jobject thiz,
+                                                 jlong fmt, jint index,
+                                                 jlongArray out)
+{
+    const AVPacketSideData *sd;
+    jlong values[FF_JNI_DOVI_CONFIG_SLOTS];
+    int ret;
+
+    if (!env || !out)
+        return AVERROR(EINVAL);
+    ret = ff_jni_stream_sd_lookup(PTR(AVFormatContext *, fmt), index,
+                                  AV_PKT_DATA_DOVI_CONF, &sd);
+    if (ret < 0)
+        return ret;
+    ret = ff_jni_dovi_slots(sd->data, sd->size, values);
+    if (ret < 0)
+        return ret;
+    return ff_jni_publish_longs(env, out, FF_JNI_DOVI_CONFIG_SLOTS, values);
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_streamGetMasteringDisplayMetadata(JNIEnv *env,
+                                                              jobject thiz,
+                                                              jlong fmt,
+                                                              jint index,
+                                                              jlongArray out)
+{
+    const AVPacketSideData *sd;
+    jlong values[FF_JNI_MASTERING_DISPLAY_SLOTS];
+    int ret;
+
+    if (!env || !out)
+        return AVERROR(EINVAL);
+    ret = ff_jni_stream_sd_lookup(PTR(AVFormatContext *, fmt), index,
+                                  AV_PKT_DATA_MASTERING_DISPLAY_METADATA, &sd);
+    if (ret < 0)
+        return ret;
+    ret = ff_jni_mastering_slots(sd->data, sd->size, values);
+    if (ret < 0)
+        return ret;
+    return ff_jni_publish_longs(env, out, FF_JNI_MASTERING_DISPLAY_SLOTS,
+                                values);
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_frameGetMasteringDisplayMetadata(JNIEnv *env,
+                                                             jobject thiz,
+                                                             jlong frame,
+                                                             jlongArray out)
+{
+    const AVFrameSideData *sd;
+    jlong values[FF_JNI_MASTERING_DISPLAY_SLOTS];
+    int ret;
+
+    if (!env || !out)
+        return AVERROR(EINVAL);
+    ret = ff_jni_frame_sd_lookup(PTR(AVFrame *, frame),
+                                 AV_FRAME_DATA_MASTERING_DISPLAY_METADATA, &sd);
+    if (ret < 0)
+        return ret;
+    ret = ff_jni_mastering_slots(sd->data, sd->size, values);
+    if (ret < 0)
+        return ret;
+    return ff_jni_publish_longs(env, out, FF_JNI_MASTERING_DISPLAY_SLOTS,
+                                values);
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_streamGetContentLightMetadata(JNIEnv *env,
+                                                          jobject thiz,
+                                                          jlong fmt, jint index,
+                                                          jlongArray out)
+{
+    const AVPacketSideData *sd;
+    jlong values[FF_JNI_CONTENT_LIGHT_SLOTS];
+    int ret;
+
+    if (!env || !out)
+        return AVERROR(EINVAL);
+    ret = ff_jni_stream_sd_lookup(PTR(AVFormatContext *, fmt), index,
+                                  AV_PKT_DATA_CONTENT_LIGHT_LEVEL, &sd);
+    if (ret < 0)
+        return ret;
+    ret = ff_jni_content_light_slots(sd->data, sd->size, values);
+    if (ret < 0)
+        return ret;
+    return ff_jni_publish_longs(env, out, FF_JNI_CONTENT_LIGHT_SLOTS, values);
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_frameGetContentLightMetadata(JNIEnv *env,
+                                                         jobject thiz,
+                                                         jlong frame,
+                                                         jlongArray out)
+{
+    const AVFrameSideData *sd;
+    jlong values[FF_JNI_CONTENT_LIGHT_SLOTS];
+    int ret;
+
+    if (!env || !out)
+        return AVERROR(EINVAL);
+    ret = ff_jni_frame_sd_lookup(PTR(AVFrame *, frame),
+                                 AV_FRAME_DATA_CONTENT_LIGHT_LEVEL, &sd);
+    if (ret < 0)
+        return ret;
+    ret = ff_jni_content_light_slots(sd->data, sd->size, values);
+    if (ret < 0)
+        return ret;
+    return ff_jni_publish_longs(env, out, FF_JNI_CONTENT_LIGHT_SLOTS, values);
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_streamGetDisplayMatrix(JNIEnv *env, jobject thiz,
+                                                    jlong fmt, jint index,
+                                                    jlongArray out)
+{
+    const AVPacketSideData *sd;
+    jlong values[FF_JNI_DISPLAY_MATRIX_SLOTS];
+    int ret;
+
+    if (!env || !out)
+        return AVERROR(EINVAL);
+    ret = ff_jni_stream_sd_lookup(PTR(AVFormatContext *, fmt), index,
+                                  AV_PKT_DATA_DISPLAYMATRIX, &sd);
+    if (ret < 0)
+        return ret;
+    ret = ff_jni_display_matrix_slots(sd->data, sd->size, values);
+    if (ret < 0)
+        return ret;
+    return ff_jni_publish_longs(env, out, FF_JNI_DISPLAY_MATRIX_SLOTS, values);
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_frameGetDisplayMatrix(JNIEnv *env, jobject thiz,
+                                                   jlong frame, jlongArray out)
+{
+    const AVFrameSideData *sd;
+    jlong values[FF_JNI_DISPLAY_MATRIX_SLOTS];
+    int ret;
+
+    if (!env || !out)
+        return AVERROR(EINVAL);
+    ret = ff_jni_frame_sd_lookup(PTR(AVFrame *, frame),
+                                 AV_FRAME_DATA_DISPLAYMATRIX, &sd);
+    if (ret < 0)
+        return ret;
+    ret = ff_jni_display_matrix_slots(sd->data, sd->size, values);
+    if (ret < 0)
+        return ret;
+    return ff_jni_publish_longs(env, out, FF_JNI_DISPLAY_MATRIX_SLOTS, values);
 }
 
 /* ------------------------------------------------------------------ */
