@@ -65,10 +65,10 @@ static int checks;
 
 /* The budget snapshot layout is part of the bridge contract. Assert the slot
  * count here so a C-side change cannot silently change the array the JAR
- * fills; FFMpegNative.PACKET_BUDGET_INFO_SLOTS must stay equal to this. */
+ * fills; PacketBudget.PACKET_BUDGET_INFO_SLOTS must stay equal to this. */
 _Static_assert(FF_JNI_PACKET_BUDGET_SLOTS == 6,
                "packet budget layout changed; bump the bridge API major version "
-               "and update FFMpegNative.PACKET_BUDGET_INFO_SLOTS");
+               "and update PacketBudget.PACKET_BUDGET_INFO_SLOTS");
 
 #define CHECK(cond) do {                                                    \
     checks++;                                                               \
@@ -84,7 +84,7 @@ _Static_assert(FF_JNI_PACKET_BUDGET_SLOTS == 6,
 extern void audio_snapshot_run(void);
 
 /* The codec id suite (tests/codec_id_bridge_test.c) pins the AVCodecID
- * literals FFMpegNative.java repeats to the real enum. It needs libavcodec's
+ * literals AvCodecId repeats to the real enum. It needs libavcodec's
  * codec_id.h and nothing from the bridge, so it is its own translation unit
  * for the same reason: no second copy of the implementation. */
 extern void codec_id_bridge_run(void);
@@ -5471,7 +5471,7 @@ int main(void)
      * binary so that one build proves every capability bit that is set. */
     audio_snapshot_run();
 
-    /* The codec id suite pins the AVCodecID values FFMpegNative.java repeats
+    /* The codec id suite pins the AVCodecID values AvCodecId repeats
      * against the real enum, in a translation unit that can see both. */
     codec_id_bridge_run();
 

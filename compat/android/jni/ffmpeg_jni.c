@@ -761,7 +761,7 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
 /*                                                                     */
 /* Both snapshot entry points fill the same 13-slot long[] so a caller  */
 /* has one decoder for "what audio format is this". The layout is part  */
-/* of the bridge contract: FFMpegNative.java repeats every slot index,  */
+/* of the bridge contract: AudioFormatInfo repeats every slot index,    */
 /* and tests/audio_format_snapshot_test.c pins them.                    */
 /*                                                                     */
 /* The contract in one sentence: a slot either carries a value read     */
@@ -1783,7 +1783,7 @@ Java_org_ffmpeg_FFMpegNative_videoCodecComponentName(JNIEnv *env, jobject thiz,
 
 _Static_assert(FF_JNI_VIDEO_STATS_CURRENT_BITRATE ==
                FF_JNI_VIDEO_DECODE_STATS_SLOTS - 1,
-               "videoDecodeStats slot layout changed; update FFMpegNative.java "
+               "videoDecodeStats slot layout changed; update VideoDecodeStats "
                "and the contract test");
 
 /**
@@ -2030,7 +2030,7 @@ static int ff_jni_budget_add(uint64_t *total, uint64_t value)
 }
 
 /* Number of values written by ff_jni_packet_budget(); frozen for API major 1
- * and mirrored by FFMpegNative.PACKET_BUDGET_INFO_SLOTS. */
+ * and mirrored by org.ffmpeg.consts.PacketBudget.PACKET_BUDGET_INFO_SLOTS. */
 #define FF_JNI_PACKET_BUDGET_SLOTS 6
 
 /* Bytes occupied by count samples of the given format and channel count.

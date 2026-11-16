@@ -11,7 +11,7 @@
  * the suite the contract without the implementation.
  *
  * Anything that changes here changes the wire format between the .so and the
- * JAR, so FFMpegNative.java repeats every value and
+ * JAR, so AudioFormatInfo repeats every value and
  * tests/audio_format_snapshot_test.c pins them.
  *
  * This file is part of FFmpeg.

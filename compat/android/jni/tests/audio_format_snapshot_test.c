@@ -19,7 +19,7 @@
  * The functions it calls are therefore the real exported ones, still
  * exercised through their real argument checks and publication path.
  *
- * Schema v1 slot layout (see FFMpegNative.java, which repeats every index):
+ * Schema v1 slot layout (see AudioFormatInfo, which repeats every index):
  *   0 schemaVersion        7 codecId
  *   1 knownFields          8 profile
  *   2 sampleFormat         9 bitsPerCodedSample

@@ -1,7 +1,7 @@
 /*
  * Pins the AVCodecID constants that the JAR repeats, against the real enum.
  *
- * Why this suite exists: FFMpegNative.java mirrors a handful of
+ * Why this suite exists: AvCodecId mirrors a handful of
  * enum AVCodecID values because Java code needs them for routing decisions
  * (which bitstream filter to insert, which ENCODING_* sink accepts the
  * stream). Those Java literals cannot include libavcodec/codec_id.h, so
@@ -16,7 +16,7 @@
  * asserts the enum values directly and then repeats every Java literal next
  * to them. A translation unit here sees the real enum; the JAR cannot.
  *
- * Adding a mirrored constant to FFMpegNative.java means adding it here too:
+ * Adding a mirrored constant to AvCodecId means adding it here too:
  * a literal nobody pins is a literal that can drift again.
  *
  * This file is part of FFmpeg.
@@ -41,7 +41,7 @@
 
 #include "libavcodec/codec_id.h"
 
-/* The literals below are copies of FFMpegNative.java, not of codec_id.h.
+/* The literals below are copies of AvCodecId, not of codec_id.h.
  * They are written in the Java source's own hex form so that a transcription
  * slip in either direction shows up as a failed comparison rather than as
  * two copies of one shared mistake. */
@@ -92,10 +92,10 @@ static int g_failures;
  * well as at run time: a drift in codec_id.h then cannot reach a device, and
  * the failure names the constant. */
 _Static_assert(AV_CODEC_ID_EAC3 == 0x15028,
-               "AV_CODEC_ID_EAC3 moved: update FFMpegNative.AV_CODEC_ID_EAC3 "
+               "AV_CODEC_ID_EAC3 moved: update AvCodecId.AV_CODEC_ID_EAC3 "
                "and the Java literals pinned in this file");
 _Static_assert(AV_CODEC_ID_OPUS == 0x1503C,
-               "AV_CODEC_ID_OPUS moved: update FFMpegNative.AV_CODEC_ID_OPUS "
+               "AV_CODEC_ID_OPUS moved: update AvCodecId.AV_CODEC_ID_OPUS "
                "and the Java literals pinned in this file");
 
 static void test_audio_block_base(void)
@@ -156,7 +156,7 @@ static void test_java_literals_match_enum(void)
 
 static void test_decimal_comment_agrees(void)
 {
-    /* What FFMpegNative.java writes in the trailing comment, and what a
+    /* What AvCodecId writes in the trailing comment, and what a
      * caller sees when it prints the id in base 10. */
     CHECK(AV_CODEC_ID_EAC3 == DEC_EAC3);
     CHECK(AV_CODEC_ID_OPUS == DEC_OPUS);

@@ -1050,7 +1050,7 @@ jobs:
             "$PWD/compat/android/jni/tests/audio_format_snapshot_test.c" \
             -o "$OUT/audio_format_snapshot_test.o"
 
-          # Pins the AVCodecID literals FFMpegNative.java repeats to the real
+          # Pins the AVCodecID literals org.ffmpeg.consts.AvCodecId repeats to the real
           # enum. It is the only translation unit that can see both sides, so
           # without it a mistranscribed codec id reaches the JAR silently.
           "$CC" "${COMMON_CFLAGS[@]}" -c \
