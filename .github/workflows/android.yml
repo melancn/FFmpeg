@@ -455,9 +455,10 @@ jobs:
           # FFMpegNative.java references android.view.Surface, so javac needs
           # android.jar on the classpath to resolve it.
           ANDROID_JAR="$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)"
+          find "$JNI_DIR/java/org/ffmpeg" -name '*.java' > /tmp/java_sources.txt
           javac --release 17 -Xlint:all -encoding UTF-8 -classpath "$ANDROID_JAR" \
             -h "$JNI_DIR/generated" -d "$JNI_DIR/generated" \
-            "$JNI_DIR/java/org/ffmpeg/FFMpegNative.java"
+            @/tmp/java_sources.txt
           # The header is named after the class: org_ffmpeg_FFMpegNative.h
           ls -l "$JNI_DIR/generated/"
 
@@ -472,8 +473,14 @@ jobs:
           import subprocess
 
           generated = pathlib.Path("compat/android/jni/generated")
+          classes = ["org.ffmpeg.FFMpegNative"] + [
+              "org.ffmpeg.consts." + path.stem
+              for path in sorted(
+                  pathlib.Path("compat/android/jni/java/org/ffmpeg/consts").glob("*.java")
+              )
+          ]
           declarations = subprocess.check_output(
-              ["javap", "-constants", "-classpath", str(generated), "org.ffmpeg.FFMpegNative"],
+              ["javap", "-constants", "-classpath", str(generated)] + classes,
               text=True,
           )
           prefixes = (
@@ -682,6 +689,12 @@ jobs:
 
           # Compile the JNI translation unit as C. Passing a .c file to clang++
           # makes NDK 29 treat FFmpeg's C headers and JNIEnv ABI as C++17.
+          #
+          # The managed-handle units are separate translation units: the
+          # registry depends on nothing but pthreads (so it is testable on a
+          # host), and the format unit owns AVFormatContext lifetime. They must
+          # be listed here as well as in the test link below; a missing object
+          # here fails at link time, not at runtime.
           "$CC" -c -fPIC -O2 \
             -include "$PWD/compat/android/jni/generated/org_ffmpeg_FFMpegNative.h" \
             -I"$PWD" -I"$PWD/compat/android/jni" -I"$PWD/compat/android/jni/generated" \
@@ -691,6 +704,17 @@ jobs:
             -DFF_JNI_BUILD_ID="\"$BUILD_ID\"" \
             "$PWD/compat/android/jni/ffmpeg_jni.c" \
             -o "$JNI_OBJ"
+
+          "$CC" -c -fPIC -O2 \
+            -I"$PWD" -I"$PWD/compat/android/jni" \
+            "$PWD/compat/android/jni/ffmpeg_jni_handle_registry.c" \
+            -o "$PWD/$BUILD_DIR/ffmpeg_jni_handle_registry-$ABI.o"
+
+          "$CC" -c -fPIC -O2 \
+            -I"$PWD" -I"$PWD/compat/android/jni" \
+            -I"$PREFIX/include" -I"$DEPS_PREFIX/include" \
+            "$PWD/compat/android/jni/ffmpeg_jni_format_handle.c" \
+            -o "$PWD/$BUILD_DIR/ffmpeg_jni_format_handle-$ABI.o"
 
           # Record what was embedded, so the bundle manifest can be checked
           # against the binary instead of against a hand-written claim.
@@ -739,6 +763,8 @@ jobs:
           # All three are available from API 21+ at the chosen API 24 driver.
           "$CXX" -shared -fPIC \
             "$JNI_OBJ" \
+            "$PWD/$BUILD_DIR/ffmpeg_jni_handle_registry-$ABI.o" \
+            "$PWD/$BUILD_DIR/ffmpeg_jni_format_handle-$ABI.o" \
             -L"$PREFIX/lib" -L"$MBEDTLS_PREFIX/lib" -L"$DEPS_PREFIX/lib" \
             -Wl,--start-group \
             -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
@@ -1031,8 +1057,30 @@ jobs:
             "$PWD/compat/android/jni/tests/codec_id_bridge_test.c" \
             -o "$OUT/codec_id_bridge_test.o"
 
+          # Managed-handle lifecycle suite. The registry and format units are
+          # compiled here too, because packet_contract_test.c includes only
+          # ffmpeg_jni.c; the two new units are linked alongside it so the test
+          # exercises the same objects the .so ships.
+          "$CC" "${COMMON_CFLAGS[@]}" -c \
+            "$PWD/compat/android/jni/ffmpeg_jni_handle_registry.c" \
+            -o "$OUT/ffmpeg_jni_handle_registry.o"
+
+          "$CC" "${COMMON_CFLAGS[@]}" -c \
+            "$PWD/compat/android/jni/ffmpeg_jni_format_handle.c" \
+            -o "$OUT/ffmpeg_jni_format_handle.o"
+
+          "$CC" "${COMMON_CFLAGS[@]}" -c \
+            "$PWD/compat/android/jni/tests/handle_registry_test.c" \
+            -o "$OUT/handle_registry_test.o"
+
+          "$CC" "${COMMON_CFLAGS[@]}" -c \
+            "$PWD/compat/android/jni/tests/format_lifecycle_test.c" \
+            -o "$OUT/format_lifecycle_test.o"
+
           "$CXX" "$OUT/packet_contract_test.o" "$OUT/audio_format_snapshot_test.o" \
-            "$OUT/codec_id_bridge_test.o" \
+            "$OUT/codec_id_bridge_test.o" "$OUT/handle_registry_test.o" \
+            "$OUT/format_lifecycle_test.o" \
+            "$OUT/ffmpeg_jni_handle_registry.o" "$OUT/ffmpeg_jni_format_handle.o" \
             -L"$PREFIX/lib" -L"$MBEDTLS_PREFIX/lib" -L"$DEPS_PREFIX/lib" \
             -Wl,--start-group \
             -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
@@ -1070,7 +1118,8 @@ jobs:
           # FFMpegNative.java references android.view.Surface, so javac needs
           # android.jar on the classpath to resolve it.
           ANDROID_JAR="$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)"
-          javac -classpath "$ANDROID_JAR" -d "$CLS" compat/android/jni/java/org/ffmpeg/FFMpegNative.java
+          find compat/android/jni/java/org/ffmpeg -name '*.java' > /tmp/java_sources.txt
+          javac -classpath "$ANDROID_JAR" -d "$CLS" @/tmp/java_sources.txt
           find "$CLS" -name '*.class' -print
 
       - name: Stage artifact

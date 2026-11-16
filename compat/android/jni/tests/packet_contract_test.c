@@ -88,6 +88,12 @@ extern void audio_snapshot_run(void);
  * codec_id.h and nothing from the bridge, so it is its own translation unit
  * for the same reason: no second copy of the implementation. */
 extern void codec_id_bridge_run(void);
+
+/* Managed-handle suites. The registry suite needs only pthreads, so it runs the
+ * real threaded behaviour on both ABIs; the format suite drives the
+ * AVFormatContext lifetime, close protocol and interrupt-flag dependency. */
+extern void handle_registry_run(void);
+extern void format_lifecycle_run(void);
 int fftest_check_total(void);
 int fftest_check_failures(void);
 void fftest_add_checks(int n, int f);
@@ -1177,6 +1183,22 @@ static jint fftest_throw_new(JNIEnv *env, jclass c, const char *msg)
     return 0;
 }
 
+/* The bridge reports a stale handle by throwing, so it calls FindClass and
+ * DeleteLocalRef. They are stubbed because the 2.0 error contract makes them
+ * part of the set of JNI calls an entry point may make. */
+static jclass fftest_find_class(JNIEnv *env, const char *name)
+{
+    (void)env;
+    (void)name;
+    return (jclass)(intptr_t)1;     /* non-NULL: the throw path only checks it */
+}
+
+static void fftest_delete_local_ref(JNIEnv *env, jobject obj)
+{
+    (void)env;
+    (void)obj;
+}
+
 static void fftest_set_byte_region(JNIEnv *env, jbyteArray a, jsize start,
                                    jsize len, const jbyte *buf)
 {
@@ -1358,6 +1380,8 @@ static void fftest_init_functions(void)
     g_fftest_functions.ExceptionOccurred  = fftest_exception_occurred;
     g_fftest_functions.ExceptionClear     = fftest_exception_clear;
     g_fftest_functions.ThrowNew           = fftest_throw_new;
+    g_fftest_functions.FindClass          = fftest_find_class;
+    g_fftest_functions.DeleteLocalRef     = fftest_delete_local_ref;
     g_fftest_functions.SetByteArrayRegion = fftest_set_byte_region;
     g_fftest_functions.SetIntArrayRegion  = fftest_set_int_region;
     g_fftest_functions.SetLongArrayRegion = fftest_set_long_region;
@@ -2527,12 +2551,20 @@ static void test_release_capabilities(void)
     /* The version the JAR and the .so must agree on. */
     CHECK(Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(NULL, NULL) ==
           FF_JNI_BRIDGE_API_VERSION);
-    CHECK(FF_JNI_BRIDGE_API_MAJOR == 1);
-    CHECK(FF_JNI_BRIDGE_API_MINOR == 6);
+    CHECK(FF_JNI_BRIDGE_API_MAJOR == 2);
+    CHECK(FF_JNI_BRIDGE_API_MINOR == 0);
 
     /* Promised by this release, each with a test set behind it. */
     CHECK(caps & FF_JNI_CAP_PCM_SESSION_SAFE_V2);
     CHECK(caps & FF_JNI_CAP_RENDERER_SAFE_CLOSE);
+    /* 2.0 handle protection. Each bit is backed by a suite that runs in this
+     * binary: handle_registry_run() for the token/generation/refcount rules,
+     * format_lifecycle_run() for the close protocol and the interrupt flag. */
+    CHECK(caps & FF_JNI_CAP_FORMAT_HANDLE_GUARD);
+    CHECK(caps & FF_JNI_CAP_DICT_HANDLE_GENERATION);
+    CHECK(caps & FF_JNI_CAP_DICT_ITERATION_CURSOR);
+    CHECK(caps & FF_JNI_CAP_INTERRUPT_LIFETIME);
+    CHECK(caps & FF_JNI_CAP_RENDERER_SLOT_RECYCLE);
     CHECK(caps & FF_JNI_CAP_PACKET_BUDGET_INFO);
     CHECK(caps & FF_JNI_CAP_SIDE_DATA_EXACT_COPY);
     CHECK(caps & FF_JNI_CAP_BRIDGE_BUILD_INFO);
@@ -3599,89 +3631,18 @@ static void test_pcm_convert_status_initialised_on_refusal(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* Output handle registry: staleness, generations, double release      */
+/* Output session state machine                                        */
 /*                                                                     */
-/* These can run without a Surface because the registry and the session */
-/* state machine are independent of the platform window.               */
+/* The token/registry half of this used to be tested here against the  */
+/* renderer's private table. That table is gone: every managed object  */
+/* now uses ffmpeg_jni_handle_registry, and tests/handle_registry_test.c */
+/* pins its staleness, generation, exhaustion and slot-reuse rules -   */
+/* including the renderer's deferred finaliser - without needing a     */
+/* Surface. What remains here is the session state machine, which is   */
+/* independent of both the registry and the platform window.           */
 /* ------------------------------------------------------------------ */
 
-static void test_output_handle_registry(void)
-{
-    FFOutputHandle *a, *b;
-    void *obj = NULL;
-    FFOutputHandle *got;
-    jlong ha;
-
-    ff_output_registry_init();
-    a = ff_output_handle_new();
-    b = ff_output_handle_new();
-    CHECK(a != NULL && b != NULL);
-    if (!a || !b)
-        return;
-
-    /* Two live handles never encode to the same value. */
-    CHECK(ff_output_handle_encode(a) != ff_output_handle_encode(b));
-    CHECK(ff_output_handle_encode(a) != 0);
-
-    ha = ff_output_handle_encode(a);
-    got = ff_output_handle_acquire(ha, &obj);
-    CHECK(got == a);
-    CHECK(obj == NULL);                 /* not bound to an object yet */
-    ff_output_handle_put(got);
-
-    /* A value this process never issued is refused, not dereferenced. */
-    CHECK(ff_output_handle_acquire(0, &obj) == NULL);
-    CHECK(ff_output_handle_acquire((jlong)0x10, &obj) == NULL);
-    CHECK(ff_output_handle_acquire((jlong)0x7fffffff0000LL, &obj) == NULL);
-
-    /* Retiring makes the token unusable even though the memory is live. */
-    pthread_mutex_lock(&g_output_registry.lock);
-    a->obj = (void *)&obj;
-    pthread_mutex_unlock(&g_output_registry.lock);
-    CHECK(ff_output_handle_retire(a) == 0);
-    CHECK(ff_output_handle_acquire(ha, &obj) == NULL);
-    CHECK(obj == NULL);
-
-    /* A second retire is a no-op, and the token is still refused. */
-    CHECK(ff_output_handle_retire(a) >= 0);
-    CHECK(ff_output_handle_acquire(ha, &obj) == NULL);
-
-    /* The other token is unaffected. */
-    CHECK(ff_output_handle_acquire(ff_output_handle_encode(b), &obj) != NULL);
-
-    ff_output_handle_put(a);
-    ff_output_handle_put(b);
-}
-
-static void test_output_handle_generation_blocks_reuse(void)
-{
-    FFOutputHandle *first, *second;
-    jlong h_first;
-
-    first = ff_output_handle_new();
-    CHECK(first != NULL);
-    if (!first)
-        return;
-    h_first = ff_output_handle_encode(first);
-
-    ff_output_handle_put(first);
-    ff_output_handle_retire(first);
-
-    /* A new token taken afterwards must not answer to the old value, even
-     * if it happens to live at the same address. */
-    second = ff_output_handle_new();
-    CHECK(second != NULL);
-    if (!second)
-        return;
-    CHECK(ff_output_handle_encode(second) != h_first);
-    {
-        void *obj = NULL;
-        CHECK(ff_output_handle_acquire(h_first, &obj) == NULL);
-    }
-    ff_output_handle_put(second);
-}
-
-/* The renderer-specific claim: while an operation is admitted, Free() must
+/* The renderer-specific claim: while an operation is admitted, teardown must
  * not release the scaler, the window or the locks. Exercised on a bare
  * renderer (no Surface) because the ordering, not the driver, is what can
  * regress. */
@@ -3716,7 +3677,8 @@ static void test_window_renderer_free_retains_while_busy(void)
     ret = ff_output_session_enter(&r->session);
     CHECK(ret < 0);                     /* no admission after detach */
 
-    ff_window_renderer_destroy(r);
+    /* The registry finaliser is the only destroyer now. */
+    ff_window_renderer_finalize(r);
 }
 
 /* Same normalisation decision without a frame, for pre-flight checks. */
@@ -3740,11 +3702,21 @@ static jlong test_dict_create(JNIEnv *env)
     return Java_org_ffmpeg_FFMpegNative_dictCreate(env, NULL);
 }
 
+/* Test-only peek at one entry. The dictionary is not mutated concurrently in
+ * these suites, so holding the returned alias briefly is fine here; the
+ * production path never returns an entry pointer (dictIterate hands out a
+ * cursor whose key/value are copies). */
 static AVDictionaryEntry *test_dict_entry(jlong box, const char *key)
 {
-    FFDictBox *holder = ff_dict_box_from_handle(box, "test");
+    FFDictOp op = { NULL, 0 };
+    FFDictHandle *holder = ff_dict_op_begin(box, &op);
+    AVDictionaryEntry *e = NULL;
 
-    return holder ? av_dict_get(holder->dict, key, NULL, 0) : NULL;
+    if (holder)
+        e = av_dict_get(holder->dict, key, NULL, 0);
+    if (holder)
+        ff_dict_op_end(&op);
+    return e;
 }
 
 static void test_dict_set_transfer_flags_keep_keys_caller_owned(void)
@@ -3754,7 +3726,6 @@ static void test_dict_set_transfer_flags_keep_keys_caller_owned(void)
     FFTestJniString *val = fftest_string_new("fftest-value");
     FFTestJniString *probe = fftest_string_new("fftest-key");
     const AVDictionaryEntry *e = NULL;
-    FFDictBox *holder = NULL;
     jstring got = NULL;
     jlong box = 0;
     int ret;
@@ -3779,15 +3750,21 @@ static void test_dict_set_transfer_flags_keep_keys_caller_owned(void)
     CHECK(val->data[0] == '~');
     CHECK(Java_org_ffmpeg_FFMpegNative_dictCount(&env, NULL, box) == 1);
 
-    holder = ff_dict_box_from_handle(box, "test");
-    CHECK(holder != NULL);
-    e = holder ? av_dict_iterate(holder->dict, NULL) : NULL;
-    CHECK(e != NULL);
-    if (e) {
-        CHECK(strcmp(e->key, "fftest-key") == 0);
-        CHECK(strcmp(e->value, "fftest-value") == 0);
-        CHECK(e->key != key->data);
-        CHECK(e->value != val->data);
+    {
+        FFDictOp dop = { NULL, 0 };
+        FFDictHandle *dh = ff_dict_op_begin(box, &dop);
+
+        CHECK(dh != NULL);
+        e = dh ? av_dict_iterate(dh->dict, NULL) : NULL;
+        CHECK(e != NULL);
+        if (e) {
+            CHECK(strcmp(e->key, "fftest-key") == 0);
+            CHECK(strcmp(e->value, "fftest-value") == 0);
+            CHECK(e->key != key->data);
+            CHECK(e->value != val->data);
+        }
+        if (dh)
+            ff_dict_op_end(&dop);
     }
 
     got = Java_org_ffmpeg_FFMpegNative_dictGet(&env, NULL, box,
@@ -4145,6 +4122,9 @@ static void test_dict_parse_and_format_roundtrip(void)
     }
     av_free((void *)(intptr_t)kstr);
     av_free((void *)(intptr_t)vstr);
+    /* The iteration handle is a cursor now; release it explicitly rather than
+     * leaving it for the slot cap. */
+    Java_org_ffmpeg_FFMpegNative_dictCursorFree(&env, NULL, entry);
 
     text = Java_org_ffmpeg_FFMpegNative_dictGetString(&env, NULL, box,
                                                       (jstring)(void *)kv2,
@@ -5471,8 +5451,6 @@ int main(void)
     test_output_session_quarantine();
     test_output_session_concurrent_enter_exit();
     test_output_session_revoke_race();
-    test_output_handle_registry();
-    test_output_handle_generation_blocks_reuse();
     test_window_renderer_free_retains_while_busy();
     test_dict_set_transfer_flags_keep_keys_caller_owned();
     test_dict_set_int_transfer_flag_keeps_key_caller_owned();
@@ -5496,6 +5474,14 @@ int main(void)
     /* The codec id suite pins the AVCodecID values FFMpegNative.java repeats
      * against the real enum, in a translation unit that can see both. */
     codec_id_bridge_run();
+
+    /* Handle registry: token layout, generations, reference counts, slot
+     * reuse and the generation ceiling. */
+    handle_registry_run();
+
+    /* Format context: operation guard, close protocol, destructor selection
+     * and the interrupt flag's dependency reference. */
+    format_lifecycle_run();
 
     printf("%d checks, %d failures\n", checks, failures);
     if (failures) {

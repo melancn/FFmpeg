@@ -22,13 +22,17 @@ package org.ffmpeg;
  *
  * <p><b>Error codes.</b> Most methods return an FFmpeg error code (negative on
  * failure). Translate it with {@link #strerror}.
+ *
+ * <p><b>Constants.</b> The FFmpeg constants mirrored by this bridge (codec
+ * ids, pixel formats, channel layouts, error codes, capability bits, ...) live
+ * in {@code org.ffmpeg.consts} and its classes, not in this class.
  */
 public final class FFMpegNative {
 
     /**
      * Register a native log callback that forwards FFmpeg logs to Android Logcat.
      * Forwarding honours the level set by {@link #logSetLevel} (default
-     * {@code AV_LOG_INFO}); raise it to {@link #AV_LOG_TRACE} to see the
+     * {@code AV_LOG_INFO}); raise it to {@link org.ffmpeg.consts.AvLogLevel#AV_LOG_TRACE} to see the
      * per-buffer codec chatter.
      */
     public native void logSetCallback();
@@ -97,302 +101,6 @@ public final class FFMpegNative {
     /** @return human-readable description of an FFmpeg error code. */
     public native String strerror(int errnum);
 
-    /* ================================================================== */
-    /* JNI bridge contract                                                 */
-    /*                                                                     */
-    /* These describe the *wrapper* ABI, not FFmpeg. {@link #getVersion}   */
-    /* reports the FFmpeg build and says nothing about which native entry  */
-    /* points this .so implements, so a JAR and a .so can disagree while   */
-    /* both look healthy. Callers must gate every bridge-version-          */
-    /* dependent feature on these three queries.                           */
-    /* ================================================================== */
-
-    /** Bridge contract major version implemented by this JAR. */
-    public static final int BRIDGE_API_MAJOR = 1;
-
-    /**
-     * Bridge contract minor version implemented by this JAR.
-     *
-     * <p>1.2 changes no signature, parameter width, return type or AVERROR
-     * convention. It fixes error paths in the PCM session and the window
-     * renderer and adds {@link #CAP_PCM_SESSION_SAFE_V2} /
-     * {@link #CAP_RENDERER_SAFE_CLOSE}. One safety narrowing is worth
-     * repeating here: {@link #pcmSessionCreate} now refuses a planar output
-     * sample format instead of writing it as if it were interleaved.
-     *
-     * <p>1.3 only appends the two read-only audio format snapshot entry
-     * points and their schema. A 1.2 caller is unaffected; a 1.3 caller
-     * should detect {@link #CAP_AUDIO_STREAM_FORMAT_INFO} /
-     * {@link #CAP_AUDIO_FRAME_FORMAT_INFO} rather than comparing versions.
-     *
-     * <p>1.4 appends two read-only video diagnostics,
-     * {@link #videoCodecComponentName} and {@link #videoDecodeStats}. A 1.3
-     * caller is unaffected; a 1.4 caller must gate each feature on
-     * {@link #CAP_VIDEO_CODEC_COMPONENT_NAME} /
-     * {@link #CAP_VIDEO_DECODE_STATS} rather than comparing versions.
-     *
-     * <p>1.5 appends the libass message channel,
-     * {@link #assSetLogLevel} / {@link #assGetLogLevel}. libass already
-     * computes the font decision (requested family/bold/italic, selected
-     * file, TTC face index, every missing-glyph fallback); the bridge now
-     * forwards its messages to logcat under {@code MediaHub/Libass}. A 1.4
-     * caller is unaffected; gate on {@link #CAP_LIBASS_FONT_LOG} because a
-     * non-libass build does not contain the entry points at all.
-     */
-    public static final int BRIDGE_API_MINOR = 6;
-
-    /** {@code major << 16 | minor}; first release is {@code 0x00010000}. */
-    public static final int BRIDGE_API_VERSION = (BRIDGE_API_MAJOR << 16) | BRIDGE_API_MINOR;
-
-    /** {@link #packetGetBudgetInfo} is implemented and returns the fixed 6-slot layout. */
-    public static final long CAP_PACKET_BUDGET_INFO = 1L << 0;
-
-    /** {@link #packetGetSideDataSize} and {@link #packetCopySideDataExact} are implemented. */
-    public static final long CAP_SIDE_DATA_EXACT_COPY = 1L << 1;
-
-    /** {@link #getBridgeBuildInfo} returns a non-empty description. */
-    public static final long CAP_BRIDGE_BUILD_INFO = 1L << 2;
-
-    /**
-     * {@link #frameNormalizeChannelLayout} and {@link #channelLayoutNormalizeMask}
-     * are implemented. Gate every layout-normalisation call on this bit: a
-     * library built before them answers 0 here, and calling the entry point
-     * anyway would throw {@link UnsatisfiedLinkError} instead of degrading.
-     */
-    public static final long CAP_FRAME_LAYOUT_NORMALIZE = 1L << 3;
-
-    /**
-     * {@code pcmSessionCreate/Convert/Drain/Reset/Free} are implemented, with
-     * all limits enforced before any allocation or input consumption.
-     *
-     * <p>Gate every bounded-resampling call on this bit. A library built
-     * before 1.1 answers 0 here; calling the session methods anyway throws
-     * {@link UnsatisfiedLinkError} rather than degrading.
-     *
-     * @see #pcmSessionCreate
-     */
-    public static final long CAP_BOUNDED_PCM_RESAMPLE = 1L << 4;
-
-    /**
-     * The PCM session obeys its 1.2 contract: input planes are read through
-     * the frame's full plane list, {@link #PCM_DRAINED} is only reported after
-     * a completed flush (never derived from a non-zero internal delay), a
-     * format change is refused until the old tail is drained and then commits
-     * exactly once, and bytes are copied into {@code out} only after the
-     * conversion has succeeded.
-     *
-     * <p>Check this bit before relying on any of that; a 1.1 library still
-     * answers {@link #CAP_BOUNDED_PCM_RESAMPLE} but can answer
-     * {@link #PCM_NEED_DRAIN} forever on an undersized block.
-     */
-    public static final long CAP_PCM_SESSION_SAFE_V2 = 1L << 5;
-
-    /**
-     * The window renderer obeys its 1.2 close contract: {@link
-     * #windowRendererFree} retains the whole renderer (scaler, window and
-     * locks) while an operation is admitted instead of freeing part of it,
-     * handles are registry-checked and become unusable after Free, and
-     * {@link #windowRendererFinish} reports {@link #OUTPUT_SESSION_DETACHED}
-     * only after the platform window has been released exactly once.
-     */
-    public static final long CAP_RENDERER_SAFE_CLOSE = 1L << 6;
-
-    /**
-     * Reserved for per-output-instance hardware buffer accounting. Not
-     * implemented by this build and deliberately never returned:
-     * {@link #mediasurfaceGetOutstandingBuffers} is a process-wide counter
-     * and is not evidence about a single output session.
-     *
-     * <p>Deferred by decision, not by omission. Closing it needs two things
-     * this bridge cannot provide on its own: a way to read the decoder's
-     * own hardware-frame count (private to libavcodec, with no exported
-     * accessor) and sole ownership of the codec's lifetime (which
-     * {@link #codecFreeContext} on a raw pointer cannot enforce). Until both
-     * exist, the parallel hardware-decode restriction stands: do not run two
-     * FFmpeg MediaCodec outputs at once, and do not read a zero outstanding
-     * count as proof that every underlying reference is gone.
-     */
-    public static final long CAP_CODEC_SCOPED_BUFFER_ACCOUNTING = 1L << 7;
-
-    /**
-     * {@link #streamGetAudioFormatInfo} is implemented and fills the schema v1
-     * layout described by {@code AUDIO_INFO_*}.
-     */
-    public static final long CAP_AUDIO_STREAM_FORMAT_INFO = 1L << 8;
-
-    /**
-     * {@link #frameGetAudioFormatInfo} is implemented and fills the same
-     * schema v1 layout, with {@code AUDIO_SOURCE_FRAME} as the source kind.
-     */
-    public static final long CAP_AUDIO_FRAME_FORMAT_INFO = 1L << 9;
-
-    /**
-     * Reserved for a probe that refuses to open an audio decoder. The bit
-     * position is allocated so it can never be reused for something else, but
-     * this build never returns it: there is no entry point behind it yet.
-     *
-     * <p>Do not branch on it. A library that answers 0 must be treated as
-     * having no such capability at all, never as "fall back to ordinary
-     * probing".
-     */
-    public static final long CAP_AUDIO_PROBE_POLICY = 1L << 10;
-
-    /**
-     * Reserved for per-session probe statistics. Allocated, never returned by
-     * this build, for the same reason as {@link #CAP_AUDIO_PROBE_POLICY}.
-     */
-    public static final long CAP_AUDIO_PROBE_STATS = 1L << 11;
-
-    /**
-     * {@link #videoCodecComponentName} is implemented and returns the
-     * MediaCodec component the platform actually selected.
-     *
-     * <p>Gate every call on this bit: a library built before 1.4 has no such
-     * entry point, and calling it anyway throws
-     * {@link UnsatisfiedLinkError} instead of returning {@code null}.
-     */
-    public static final long CAP_VIDEO_CODEC_COMPONENT_NAME = 1L << 12;
-
-    /**
-     * {@link #videoDecodeStats} is implemented and fills the schema v1
-     * counter layout described by {@code VIDEO_DECODE_STATS_*}.
-     *
-     * <p>Gate on this bit for the same reason as
-     * {@link #CAP_VIDEO_CODEC_COMPONENT_NAME}. The counters describe what
-     * this bridge observed; output the platform codec drops internally is not
-     * visible and is not counted.
-     */
-    public static final long CAP_VIDEO_DECODE_STATS = 1L << 13;
-
-    /**
-     * libass messages are forwarded to logcat under the {@code MediaHub/Libass}
-     * tag, and {@link #assSetLogLevel} / {@link #assGetLogLevel} control that
-     * channel.
-     *
-     * <p>This is the only observable record of the font libass actually
-     * chose: the requested family/bold/italic, the selected file, the TTC
-     * face index, each missing-glyph fallback and the final "not found"
-     * verdict. None of it is exposed by the libass public API, so Kotlin-side
-     * logging cannot substitute.
-     *
-     * <p>Gate on this bit: a non-libass build has no such entry points, and
-     * calling them anyway throws {@link UnsatisfiedLinkError}.
-     */
-    public static final long CAP_LIBASS_FONT_LOG = 1L << 14;
-
-    public static final long CAP_STREAM_SIDE_DATA = 1L << 15;
-    public static final long CAP_FRAME_SIDE_DATA = 1L << 16;
-    public static final long CAP_SIDE_DATA_TYPES = 1L << 17;
-    public static final long CAP_VIDEO_METADATA_SNAPSHOT = 1L << 18;
-
-    /* ================================================================== */
-    /* Audio format snapshot (schema v1)                                   */
-    /*                                                                     */
-    /* streamGetAudioFormatInfo() and frameGetAudioFormatInfo() fill the    */
-    /* same 13-slot long[] so one decoder serves both. A slot either holds  */
-    /* a value read verbatim from FFmpeg or has its knownFields bit clear.  */
-    /* knownFields means "this slot is defined" -- never "the value is 0"   */
-    /* and never "a decoder or sink can handle it".                         */
-    /*                                                                     */
-    /* Slots are long so a full 64-bit AVChannelLayout mask survives        */
-    /* intact: the sign bit must not turn it into a negative or a 0.       */
-    /* ================================================================== */
-
-    /** Value of {@link #AUDIO_INFO_SCHEMA_VERSION} that this JAR understands. */
-    public static final int AUDIO_FORMAT_SCHEMA_VERSION = 1;
-
-    /** Elements required in {@code outInfo}. */
-    public static final int AUDIO_FORMAT_INFO_SLOTS = 13;
-
-    /**
-     * Ceiling of this bridge's bounded policy -- not a statement about
-     * FFmpeg. A layout with more channels is refused with {@code E2BIG},
-     * never clamped to 64 or to stereo.
-     */
-    public static final int AUDIO_FORMAT_MAX_CHANNELS = 64;
-
-    /**
-     * Value written into a slot whose known bit is clear. It is a
-     * placeholder, not a signal: 0 is a legal value for the mask, both bit
-     * depths and the id count, so only the known bit may be used to decide
-     * whether a slot is defined.
-     */
-    public static final long AUDIO_FORMAT_UNKNOWN_VALUE = 0L;
-
-    /* Fixed indices into the snapshot array. */
-    /** Always 1 for this schema. */
-    public static final int AUDIO_INFO_SCHEMA_VERSION        = 0;
-    /** Bit N set iff slot N is defined (see {@code AUDIO_KL_*}). */
-    public static final int AUDIO_INFO_KNOWN_FIELDS          = 1;
-    /** {@code AVSampleFormat}; NONE/unknown is not filled in as S16. */
-    public static final int AUDIO_INFO_SAMPLE_FORMAT         = 2;
-    /** Hz; never filled in as 48000. */
-    public static final int AUDIO_INFO_SAMPLE_RATE           = 3;
-    /** Declared/frame channel count; never filled in as stereo. */
-    public static final int AUDIO_INFO_CHANNEL_COUNT         = 4;
-    /**
-     * One of the {@code AUDIO_ORDER_*} codes, reported verbatim. UNSPEC is
-     * a defined answer ("layout type not specified") -- not stereo, and not
-     * an unknown.
-     */
-    public static final int AUDIO_INFO_CHANNEL_LAYOUT_ORDER  = 5;
-    /**
-     * FFmpeg {@code AVChannelLayout} mask, NOT an Android channel mask.
-     * Defined only for a NATIVE order (or AMBISONIC with a non-diegetic
-     * mask); for UNSPEC and CUSTOM the union holds something else, so the
-     * known bit is clear. Never map this to {@code AudioFormat} directly.
-     */
-    public static final int AUDIO_INFO_NATIVE_CHANNEL_MASK   = 6;
-    /** {@code AVCodecParameters.codec_id}. Stream only. */
-    public static final int AUDIO_INFO_CODEC_ID              = 7;
-    /** {@code AVCodecParameters.profile}; unknown stays unknown. Stream only. */
-    public static final int AUDIO_INFO_PROFILE               = 8;
-    /**
-     * {@code bits_per_coded_sample} as declared. Not a generic PCM storage
-     * width. Stream only.
-     */
-    public static final int AUDIO_INFO_BITS_PER_CODED_SAMPLE = 9;
-    /**
-     * {@code bits_per_raw_sample} as declared: source metadata evidence,
-     * not proof that the decoder's output keeps that precision. Stream only.
-     * S32 with 24 raw bits is a real combination.
-     */
-    public static final int AUDIO_INFO_BITS_PER_RAW_SAMPLE   = 10;
-    /**
-     * {@code AVFrame.nb_samples}. Frame only. A 0-sample frame is a defined
-     * answer, distinguished from unknown by its known bit.
-     */
-    public static final int AUDIO_INFO_SAMPLES_PER_CHANNEL   = 11;
-    /**
-     * Number of valid elements written to {@code outChannelIds}; elements
-     * past this count are not part of the snapshot. 0 for UNSPEC.
-     */
-    public static final int AUDIO_INFO_CHANNEL_IDS_COUNT     = 12;
-
-    /** Only a channel count is specified; no order, no ids. */
-    public static final int AUDIO_ORDER_UNSPEC    = 0;
-    /** Channels in ascending {@code AVChannel} order; a mask is defined. */
-    public static final int AUDIO_ORDER_NATIVE    = 1;
-    /** An explicit per-channel map; ids are in stream order, never sorted. */
-    public static final int AUDIO_ORDER_CUSTOM    = 2;
-    /** ACN components, ordered by index. */
-    public static final int AUDIO_ORDER_AMBISONIC = 3;
-
-    /* knownFields bits, one per slot. */
-    public static final long AUDIO_KL_SCHEMA_VERSION        = 1L << 0;
-    public static final long AUDIO_KL_KNOWN_FIELDS          = 1L << 1;
-    public static final long AUDIO_KL_SAMPLE_FORMAT         = 1L << 2;
-    public static final long AUDIO_KL_SAMPLE_RATE           = 1L << 3;
-    public static final long AUDIO_KL_CHANNEL_COUNT         = 1L << 4;
-    public static final long AUDIO_KL_CHANNEL_LAYOUT_ORDER  = 1L << 5;
-    public static final long AUDIO_KL_NATIVE_CHANNEL_MASK   = 1L << 6;
-    public static final long AUDIO_KL_CODEC_ID              = 1L << 7;
-    public static final long AUDIO_KL_PROFILE               = 1L << 8;
-    public static final long AUDIO_KL_BITS_PER_CODED_SAMPLE = 1L << 9;
-    public static final long AUDIO_KL_BITS_PER_RAW_SAMPLE   = 1L << 10;
-    public static final long AUDIO_KL_SAMPLES_PER_CHANNEL   = 1L << 11;
-    public static final long AUDIO_KL_CHANNEL_IDS_COUNT     = 1L << 12;
-
     /**
      * Read the complete audio format of a stream's declared parameters.
      *
@@ -401,19 +109,19 @@ public final class FFMpegNative {
      * UNSPEC stream therefore reports UNSPEC, not a plausible-looking stereo
      * default.
      *
-     * <p>Gate on {@link #CAP_AUDIO_STREAM_FORMAT_INFO}. A library that
+     * <p>Gate on {@link org.ffmpeg.consts.BridgeApi#CAP_AUDIO_STREAM_FORMAT_INFO}. A library that
      * answers 0 there has no such capability: the feature must be refused,
      * never re-implemented from {@link #streamGetParChannelLayout} (whose 0
      * for non-NATIVE layouts cannot be told apart from "no layout").
      *
      * @param formatCtx   format context handle
      * @param streamIndex audio stream to describe
-     * @param outInfo     at least {@link #AUDIO_FORMAT_INFO_SLOTS} elements;
+     * @param outInfo     at least {@link org.ffmpeg.consts.AudioFormatInfo#AUDIO_FORMAT_INFO_SLOTS} elements;
      *                    unknown slots are written as
-     *                    {@link #AUDIO_FORMAT_UNKNOWN_VALUE}
-     * @param outChannelIds at least {@link #AUDIO_FORMAT_MAX_CHANNELS}
+     *                    {@link org.ffmpeg.consts.AudioFormatInfo#AUDIO_FORMAT_UNKNOWN_VALUE}
+     * @param outChannelIds at least {@link org.ffmpeg.consts.AudioFormatInfo#AUDIO_FORMAT_MAX_CHANNELS}
      *                    elements; the first
-     *                    {@link #AUDIO_INFO_CHANNEL_IDS_COUNT} are part of
+     *                    {@link org.ffmpeg.consts.AudioFormatInfo#AUDIO_INFO_CHANNEL_IDS_COUNT} are part of
      *                    the snapshot
      * @return 0 on success, or a negative {@code AVERROR}:
      *         {@code EINVAL} (null handle, bad index, non-audio stream, short
@@ -436,11 +144,11 @@ public final class FFMpegNative {
      * epoch.
      *
      * <p>The frame is not modified. Gate on
-     * {@link #CAP_AUDIO_FRAME_FORMAT_INFO}.
+     * {@link org.ffmpeg.consts.BridgeApi#CAP_AUDIO_FRAME_FORMAT_INFO}.
      *
      * @param frame     decoded frame handle
-     * @param outInfo   at least {@link #AUDIO_FORMAT_INFO_SLOTS} elements
-     * @param outChannelIds at least {@link #AUDIO_FORMAT_MAX_CHANNELS}
+     * @param outInfo   at least {@link org.ffmpeg.consts.AudioFormatInfo#AUDIO_FORMAT_INFO_SLOTS} elements
+     * @param outChannelIds at least {@link org.ffmpeg.consts.AudioFormatInfo#AUDIO_FORMAT_MAX_CHANNELS}
      * @return 0 on success, or a negative {@code AVERROR} as for
      *         {@link #streamGetAudioFormatInfo}; nothing is written on
      *         failure
@@ -449,29 +157,9 @@ public final class FFMpegNative {
                                               long[] outInfo, int[] outChannelIds);
 
     /**
-     * Number of elements {@link #packetGetBudgetInfo} requires in its output
-     * array. Part of the contract: the layout below is frozen for major 1.
-     */
-    public static final int PACKET_BUDGET_INFO_SLOTS = 6;
-
-    /* Fixed indices into the packetGetBudgetInfo() output array. */
-    /** {@code AVPacket.size}. */
-    public static final int PACKET_BUDGET_PAYLOAD_BYTES         = 0;
-    /** Capacity of the referenced payload buffer (conservative estimate if none). */
-    public static final int PACKET_BUDGET_PAYLOAD_CAPACITY     = 1;
-    /** Sum of all side data content lengths, excluding padding. */
-    public static final int PACKET_BUDGET_SIDE_DATA_BYTES      = 2;
-    /** Number of side data entries, of any type. */
-    public static final int PACKET_BUDGET_SIDE_DATA_COUNT      = 3;
-    /** Capacity of the buffer referenced by {@code opaque_ref}. */
-    public static final int PACKET_BUDGET_OPAQUE_REF_CAPACITY  = 4;
-    /** Conservative accounting charge for this packet (see method docs). */
-    public static final int PACKET_BUDGET_CHARGE_BYTES         = 5;
-
-    /**
      * @return the bridge contract version implemented by the loaded library,
      *         {@code major << 16 | minor}, or 0 if the library predates this
-     *         query. Compare with {@link #BRIDGE_API_VERSION}.
+     *         query. Compare with {@link org.ffmpeg.consts.BridgeApi#BRIDGE_API_VERSION}.
      */
     public native int getBridgeApiVersion();
 
@@ -502,7 +190,7 @@ public final class FFMpegNative {
      * two different states.
      *
      * @param pkt   packet handle
-     * @param out   at least {@link #PACKET_BUDGET_INFO_SLOTS} elements; written
+     * @param out   at least {@link org.ffmpeg.consts.PacketBudget#PACKET_BUDGET_INFO_SLOTS} elements; written
      *              only on success. Indices are the
      *              {@code PACKET_BUDGET_*} constants.
      * @return 0 on success, negative {@code AVERROR} otherwise. On failure the
@@ -537,49 +225,6 @@ public final class FFMpegNative {
      */
     public native int packetCopySideDataExact(long pkt, int type,
                                               byte[] out, int offset, int capacity);
-
-    public static final int VIDEO_METADATA_SCHEMA_VERSION = 1;
-
-    public static final int DOVI_CONFIG_SLOTS                      = 9;
-    public static final int DOVI_CONFIG_VERSION_MAJOR              = 0;
-    public static final int DOVI_CONFIG_VERSION_MINOR              = 1;
-    public static final int DOVI_CONFIG_PROFILE                    = 2;
-    public static final int DOVI_CONFIG_LEVEL                      = 3;
-    public static final int DOVI_CONFIG_RPU_PRESENT                = 4;
-    public static final int DOVI_CONFIG_EL_PRESENT                 = 5;
-    public static final int DOVI_CONFIG_BL_PRESENT                 = 6;
-    public static final int DOVI_CONFIG_BL_SIGNAL_COMPATIBILITY_ID = 7;
-    public static final int DOVI_CONFIG_MD_COMPRESSION             = 8;
-
-    public static final int MASTERING_DISPLAY_SLOTS             = 22;
-    public static final int MASTERING_DISPLAY_HAS_PRIMARIES     = 0;
-    public static final int MASTERING_DISPLAY_HAS_LUMINANCE     = 1;
-    public static final int MASTERING_DISPLAY_RED_X_NUM         = 2;
-    public static final int MASTERING_DISPLAY_RED_X_DEN         = 3;
-    public static final int MASTERING_DISPLAY_RED_Y_NUM         = 4;
-    public static final int MASTERING_DISPLAY_RED_Y_DEN         = 5;
-    public static final int MASTERING_DISPLAY_GREEN_X_NUM       = 6;
-    public static final int MASTERING_DISPLAY_GREEN_X_DEN       = 7;
-    public static final int MASTERING_DISPLAY_GREEN_Y_NUM       = 8;
-    public static final int MASTERING_DISPLAY_GREEN_Y_DEN       = 9;
-    public static final int MASTERING_DISPLAY_BLUE_X_NUM        = 10;
-    public static final int MASTERING_DISPLAY_BLUE_X_DEN        = 11;
-    public static final int MASTERING_DISPLAY_BLUE_Y_NUM        = 12;
-    public static final int MASTERING_DISPLAY_BLUE_Y_DEN        = 13;
-    public static final int MASTERING_DISPLAY_WHITE_X_NUM       = 14;
-    public static final int MASTERING_DISPLAY_WHITE_X_DEN       = 15;
-    public static final int MASTERING_DISPLAY_WHITE_Y_NUM       = 16;
-    public static final int MASTERING_DISPLAY_WHITE_Y_DEN       = 17;
-    public static final int MASTERING_DISPLAY_MIN_LUMINANCE_NUM = 18;
-    public static final int MASTERING_DISPLAY_MIN_LUMINANCE_DEN = 19;
-    public static final int MASTERING_DISPLAY_MAX_LUMINANCE_NUM = 20;
-    public static final int MASTERING_DISPLAY_MAX_LUMINANCE_DEN = 21;
-
-    public static final int CONTENT_LIGHT_SLOTS    = 2;
-    public static final int CONTENT_LIGHT_MAX_CLL  = 0;
-    public static final int CONTENT_LIGHT_MAX_FALL = 1;
-
-    public static final int DISPLAY_MATRIX_SLOTS = 9;
 
     public native int[] packetGetSideDataTypes(long pkt);
 
@@ -620,10 +265,16 @@ public final class FFMpegNative {
     /* ================================================================== */
 
     /**
-     * Allocate an empty options dictionary box. The returned handle backs a
-     * pointer-to-pointer and must be freed with {@link #dictFree}.
+     * Allocate an empty options dictionary. The returned handle is an opaque
+     * token (type + slot + generation), not a pointer, and must be released
+     * with {@link #dictFree}.
      *
-     * @return a dictionary-box handle (0 on failure)
+     * <p>2.0: the handle carries a generation, so a dictionary that reuses a
+     * freed slot can never be reached through the old handle. Every method
+     * that takes a dictionary handle holds it and its lock for the duration of
+     * the call, including the ones that pass it to FFmpeg as options.
+     *
+     * @return a dictionary handle (0 on failure)
      */
     public native long dictCreate();
 
@@ -644,7 +295,13 @@ public final class FFMpegNative {
     /** @return number of entries in the dictionary. */
     public native int dictCount(long box);
 
-    /** Free the dictionary box and its contents. */
+    /**
+     * Release the dictionary and its contents.
+     *
+     * <p>2.0: this revokes the handle; the dictionary is destroyed when the
+     * last call using it has returned. Freeing twice, or freeing 0, is a no-op
+     * and cannot affect a newer dictionary that reused the slot.
+     */
     public native void dictFree(long box);
 
     /** Parse a "key=val,key2=val2" string into the dictionary. */
@@ -654,17 +311,41 @@ public final class FFMpegNative {
     public native String dictGetString(long box, String keyValSep, String pairsSep);
 
     /**
-     * Iterate dictionary entries. Pass 0 for the first call to retrieve the
-     * first entry handle; pass that handle to retrieve the next, and so on.
-     * @return the next entry handle, or 0 at end-of-dictionary.
+     * Iterate dictionary entries.
+     *
+     * <p>Pass 0 for the first call: it creates an iteration cursor and returns
+     * its handle. Pass that handle back to advance, and so on; 0 means the end
+     * of the dictionary.
+     *
+     * <p>The returned handle is a <em>cursor</em>, not a pointer into the
+     * dictionary. The key and value are copied out while the dictionary is
+     * locked, so a concurrent {@link #dictSet} cannot free them underneath the
+     * reader. Any change to the dictionary retires the cursor: the next call
+     * reports the end rather than skipping or repeating entries.
+     *
+     * <p>Ending an iteration (the call that returns 0) releases the cursor.
+     * Use {@link #dictCursorFree} to abandon one early. Cursor handles are
+     * limited by the bridge's slot table, so leaking them eventually makes new
+     * iterations fail instead of growing without bound.
+     *
+     * @return the cursor handle, or 0 at end-of-dictionary
      */
     public native long dictIterate(long box, long prevHandle);
 
-    /** @return the key of a dictionary entry handle (from {@link #dictIterate}). */
+    /** @return the key of a dictionary cursor (from {@link #dictIterate}). */
     public native String dictEntryGetKey(long entryHandle);
 
-    /** @return the value of a dictionary entry handle (from {@link #dictIterate}). */
+    /** @return the value of a dictionary cursor (from {@link #dictIterate}). */
     public native String dictEntryGetValue(long entryHandle);
+
+    /**
+     * Release an iteration cursor without finishing the iteration.
+     *
+     * <p>Optional: the call that reports end-of-dictionary releases it, and
+     * {@link #dictFree} stops the dictionary it is bound to. Passing 0, or a
+     * cursor that is already released, is a no-op.
+     */
+    public native void dictCursorFree(long entryHandle);
 
     /* ================================================================== */
     /* libavformat (demuxing)                                              */
@@ -703,8 +384,23 @@ public final class FFMpegNative {
      */
     public native int formatFindStreamInfo(long ctx);
 
-    /** Close and free the format context (handle becomes invalid). */
-    public native void formatCloseInput(long ctx);
+    /**
+     * Close and free the format context. The handle becomes invalid.
+     *
+     * <p>This runs the managed close protocol: new operations are refused,
+     * blocked I/O is interrupted, and the context is destroyed only after the
+     * operations already in flight have returned. It therefore blocks for up
+     * to a few seconds; do not call it on a thread that must stay responsive.
+     *
+     * @return {@link org.ffmpeg.consts.FormatCloseStatus#FORMAT_CLOSE_OK} only when the native context is gone.
+     *         {@link org.ffmpeg.consts.FormatCloseStatus#FORMAT_CLOSE_UNCONFIRMED} means it may still exist and
+     *         an {@link IllegalStateException} with code
+     *         {@code ffmpeg.format.close.unconfirmed} has been thrown: the last
+     *         operation will finish the teardown, and the slot is never reused.
+     *         {@link org.ffmpeg.consts.FormatCloseStatus#FORMAT_CLOSE_INVALID} means the handle was not a format
+     *         context. Closing 0, or closing twice, is an idempotent no-op.
+     */
+    public native int formatCloseInput(long ctx);
 
     /* -------------------------------------------------------------- */
     /* Network / format probing / manual context                      */
@@ -767,8 +463,14 @@ public final class FFMpegNative {
     /** Print container/stream info to the log (debugging aid). */
     public native void dumpFormat(long ctx, int index, String url, int isOutput);
 
-    /** Free a format context created for muxing (after writeTrailer). */
-    public native void formatFreeContext(long ctx);
+    /**
+     * Free a format context created for muxing (after writeTrailer).
+     *
+     * <p>Same protocol and return values as {@link #formatCloseInput}: the
+     * destructor is chosen from how the context was created, so calling this on
+     * an input context does not free it the output way.
+     */
+    public native int formatFreeContext(long ctx);
 
     /** @return numerator of stream {@code index}'s time base. */
     public native long streamGetTimeBaseNum(long ctx, int index);
@@ -861,7 +563,7 @@ public final class FFMpegNative {
     /** @return number of frames in stream {@code index}, 0 if unknown. */
     public native int streamGetParNbFrames(long ctx, int index);
 
-    /** @return stream {@code index} duration (in time base units), or {@link #AV_NOPTS_VALUE}. */
+    /** @return stream {@code index} duration (in time base units), or {@link org.ffmpeg.consts.AvTimeBase#AV_NOPTS_VALUE}. */
     public native long formatGetStreamDuration(long ctx, int index);
     /** @return stream {@code index} {@code AV_DISPOSITION_*} flags. */
     public native int streamGetDisposition(long ctx, int index);
@@ -1043,7 +745,7 @@ public final class FFMpegNative {
      * MIME type and the requested FFmpeg decoder name are never returned.
      * {@code null} means "not known", never "software decode is in use".
      *
-     * <p>Gate on {@link #CAP_VIDEO_CODEC_COMPONENT_NAME}. The read does not
+     * <p>Gate on {@link org.ffmpeg.consts.BridgeApi#CAP_VIDEO_CODEC_COMPONENT_NAME}. The read does not
      * modify decoder state and may run on any thread, but the context must
      * still be valid: do not call this after {@link #codecFreeContext}, and
      * do not free the context concurrently. Every call returns a new String.
@@ -1053,30 +755,10 @@ public final class FFMpegNative {
      */
     public native String videoCodecComponentName(long codecCtx);
 
-    /** Value of the schema-version slot in a {@link #videoDecodeStats} snapshot. */
-    public static final int VIDEO_DECODE_STATS_SCHEMA_VERSION = 1;
-
-    /** Elements required in {@code out}. */
-    public static final int VIDEO_DECODE_STATS_SLOTS = 6;
-
-    /* Fixed indices into the videoDecodeStats() output array. */
-    /** Always {@link #VIDEO_DECODE_STATS_SCHEMA_VERSION} for this schema. */
-    public static final int VIDEO_DECODE_STATS_SCHEMA_VERSION_INDEX = 0;
-    /** Frames returned by {@link #codecReceiveFrame} with status 0. */
-    public static final int VIDEO_DECODE_STATS_DECODED_FRAMES      = 1;
-    /** Successful Surface submissions through this bridge. */
-    public static final int VIDEO_DECODE_STATS_RENDERED_FRAMES     = 2;
-    /** Frames discarded without being shown, as observed by this bridge. */
-    public static final int VIDEO_DECODE_STATS_DROPPED_FRAMES      = 3;
-    /** Hard decode failures; EAGAIN and EOF are not counted. */
-    public static final int VIDEO_DECODE_STATS_DECODE_ERRORS       = 4;
-    /** {@code AVCodecContext.bit_rate} in bit/s; {@code <= 0} is unknown. */
-    public static final int VIDEO_DECODE_STATS_CURRENT_BITRATE     = 5;
-
     /**
      * Read a per-context decoder counter snapshot (schema v1).
      *
-     * <p>Schema v1 fills {@link #VIDEO_DECODE_STATS_SLOTS} slots, indexed by
+     * <p>Schema v1 fills {@link org.ffmpeg.consts.VideoDecodeStats#VIDEO_DECODE_STATS_SLOTS} slots, indexed by
      * the {@code VIDEO_DECODE_STATS_*} constants:
      * <pre>
      * 0  schemaVersion   always 1
@@ -1096,7 +778,7 @@ public final class FFMpegNative {
      * from FFmpeg and is not counted, so a zero dropped count does not prove
      * that the platform dropped nothing.
      *
-     * <p>{@link #VIDEO_DECODE_STATS_CURRENT_BITRATE} is the codec context's
+     * <p>{@link org.ffmpeg.consts.VideoDecodeStats#VIDEO_DECODE_STATS_CURRENT_BITRATE} is the codec context's
      * declared bit rate; it is not derived from payload size or elapsed time
      * and is {@code <= 0} when the stream did not declare one.
      *
@@ -1107,13 +789,13 @@ public final class FFMpegNative {
      * failure. The context must still be valid: do not call this after
      * {@link #codecFreeContext}, and do not free the context concurrently.
      *
-     * <p>Gate on {@link #CAP_VIDEO_DECODE_STATS}.
+     * <p>Gate on {@link org.ffmpeg.consts.BridgeApi#CAP_VIDEO_DECODE_STATS}.
      *
      * @param codecCtx codec context handle
      * @param out      destination array, at least
-     *                 {@link #VIDEO_DECODE_STATS_SLOTS} elements
+     *                 {@link org.ffmpeg.consts.VideoDecodeStats#VIDEO_DECODE_STATS_SLOTS} elements
      * @param len      number of slots the caller offers; must be at least
-     *                 {@link #VIDEO_DECODE_STATS_SLOTS}
+     *                 {@link org.ffmpeg.consts.VideoDecodeStats#VIDEO_DECODE_STATS_SLOTS}
      * @return 0 on success, or a negative AVERROR as described above
      */
     public native int videoDecodeStats(long codecCtx, long[] out, int len);
@@ -1202,8 +884,8 @@ public final class FFMpegNative {
      * zero-copy. Under the default {@code get_format} the decoder selects
      * its pixel format by inspecting {@code hw_device_ctx}; since this path
      * never sets {@code hw_device_ctx}, {@code get_format} returns
-     * {@link #AV_PIX_FMT_MEDIACODEC} never, the decoder's Surface branch is
-     * skipped, and frames come back as {@link #AV_PIX_FMT_NV12} (23) —
+     * {@link org.ffmpeg.consts.AvPixelFormat#AV_PIX_FMT_MEDIACODEC} never, the decoder's Surface branch is
+     * skipped, and frames come back as {@link org.ffmpeg.consts.AvPixelFormat#AV_PIX_FMT_NV12} (23) —
      * decoded in software buffers, not rendered to the Surface. New code that
      * wants the zero-copy Surface path on mediacodec decoders should use
      * {@link #mediasurfaceHwdeviceCreate} + {@link #setContextHwDeviceCtx}
@@ -1274,7 +956,7 @@ public final class FFMpegNative {
      * Surface zero-copy on the mediacodec hardware decoders (unlike
      * {@link #mediasurfaceDefaultInit}, see its caveat): once the device is
      * set as {@code hw_device_ctx}, the decoder's default {@code get_format}
-     * returns {@link #AV_PIX_FMT_MEDIACODEC} and decoded frames carry an
+     * returns {@link org.ffmpeg.consts.AvPixelFormat#AV_PIX_FMT_MEDIACODEC} and decoded frames carry an
      * {@code AVMediaCodecBuffer*} in {@code frame->data[3]} for
      * {@link #mediasurfaceRenderBufferAtTime}.
      *
@@ -1441,10 +1123,10 @@ public final class FFMpegNative {
     /** @return payload size in bytes. */
     public native int packetGetSize(long pkt);
 
-    /** @return presentation timestamp, or {@link #AV_NOPTS_VALUE}. */
+    /** @return presentation timestamp, or {@link org.ffmpeg.consts.AvTimeBase#AV_NOPTS_VALUE}. */
     public native long packetGetPts(long pkt);
 
-    /** @return decoding timestamp, or {@link #AV_NOPTS_VALUE}. */
+    /** @return decoding timestamp, or {@link org.ffmpeg.consts.AvTimeBase#AV_NOPTS_VALUE}. */
     public native long packetGetDts(long pkt);
 
     /** @return index of the stream this packet belongs to. */
@@ -1512,8 +1194,7 @@ public final class FFMpegNative {
     public native void packetSetFlags(long pkt, int flags);
     /**
      * Copy a side-data element of {@code type} into {@code out}. Pass type =
-     * {@code AV_PKT_DATA_*} (use the integer constants at the end of this
-     * class).
+     * {@code AV_PKT_DATA_*} (see {@code org.ffmpeg.consts.AvPacketSideData}).
      *
      * <p>Legacy entry point retained unchanged for existing callers. It
      * truncates to {@code len} and reports -1 both for "no such side data"
@@ -1548,13 +1229,13 @@ public final class FFMpegNative {
     /** @return pixel/sample format of the frame. */
     public native int frameGetFormat(long frame);
 
-    /** @return presentation timestamp, or {@link #AV_NOPTS_VALUE}. */
+    /** @return presentation timestamp, or {@link org.ffmpeg.consts.AvTimeBase#AV_NOPTS_VALUE}. */
     public native long frameGetPts(long frame);
 
-    /** @return best-effort timestamp, or {@link #AV_NOPTS_VALUE}. */
+    /** @return best-effort timestamp, or {@link org.ffmpeg.consts.AvTimeBase#AV_NOPTS_VALUE}. */
     public native long frameGetBestEffortTimestamp(long frame);
 
-    /** @return packet DTS propagated to the frame, or {@link #AV_NOPTS_VALUE}. */
+    /** @return packet DTS propagated to the frame, or {@link org.ffmpeg.consts.AvTimeBase#AV_NOPTS_VALUE}. */
     public native long frameGetPktDts(long frame);
 
     /** @return 1 if the frame is a key frame, 0 otherwise. */
@@ -1602,7 +1283,7 @@ public final class FFMpegNative {
      * matches real mono/stereo PCM, not something read from the stream; for a
      * single channel the position carries no information.
      *
-     * @see #CAP_FRAME_LAYOUT_NORMALIZE
+     * @see org.ffmpeg.consts.BridgeApi#CAP_FRAME_LAYOUT_NORMALIZE
      */
     public native int frameNormalizeChannelLayout(long frame, long declaredMask);
 
@@ -1652,7 +1333,7 @@ public final class FFMpegNative {
 
     /* -------------------------------------------------------------- */
     /* MediaCodec output buffer rendering. Only valid for frames whose  */
-    /* {@link #frameGetFormat} == {@link #AV_PIX_FMT_MEDIACODEC}.       */
+    /* {@link #frameGetFormat} == {@link org.ffmpeg.consts.AvPixelFormat#AV_PIX_FMT_MEDIACODEC}.       */
     /* -------------------------------------------------------------- */
 
     /**
@@ -1710,7 +1391,7 @@ public final class FFMpegNative {
     /* Software video rendering: sws_scale directly into an            */
     /* ANativeWindow buffer. Use this on the software-decode fallback  */
     /* path, where frames come back in an ordinary pixel format        */
-    /* instead of {@link #AV_PIX_FMT_MEDIACODEC}.                       */
+    /* instead of {@link org.ffmpeg.consts.AvPixelFormat#AV_PIX_FMT_MEDIACODEC}.                       */
     /* -------------------------------------------------------------- */
 
     /**
@@ -1763,21 +1444,6 @@ public final class FFMpegNative {
     /* QUARANTINED, and a quarantined session keeps its resources.          */
     /* ------------------------------------------------------------------ */
 
-    /** Session accepts work. */
-    public static final int OUTPUT_SESSION_ACTIVE = 0;
-    /** Revoked: no new work is admitted; admitted work is draining. */
-    public static final int OUTPUT_SESSION_REVOKING = 1;
-    /**
-     * Revoked, no operation is admitted any more, and the platform window
-     * reference has been released exactly once. Nothing this renderer still
-     * does can touch the old Surface.
-     */
-    public static final int OUTPUT_SESSION_DETACHED = 2;
-    /** Teardown could not be proven; the handle is unusable and must be dropped. */
-    public static final int OUTPUT_SESSION_QUARANTINED = 3;
-    /** Freed. */
-    public static final int OUTPUT_SESSION_CLOSED = 4;
-
     /**
      * Stop admitting work and begin unbinding.
      *
@@ -1788,7 +1454,7 @@ public final class FFMpegNative {
      * @return the number of operations still in flight (>= 0), or a negative
      *         AVERROR (including {@code EINVAL} for a handle that was never
      *         issued or is already freed). Poll {@link #windowRendererFinish}
-     *         until it returns {@link #OUTPUT_SESSION_DETACHED}.
+     *         until it returns {@link org.ffmpeg.consts.OutputSessionState#OUTPUT_SESSION_DETACHED}.
      */
     public native int windowRendererRevoke(long handle);
 
@@ -1796,7 +1462,7 @@ public final class FFMpegNative {
      * Attempt to complete teardown without waiting.
      *
      * @return an {@code OUTPUT_SESSION_*} state.
-     *         {@link #OUTPUT_SESSION_DETACHED} means all three of: the session
+     *         {@link org.ffmpeg.consts.OutputSessionState#OUTPUT_SESSION_DETACHED} means all three of: the session
      *         was revoked, no operation is admitted, and the window reference
      *         has been released. It is never returned because a poll budget
      *         ran out.
@@ -1818,15 +1484,18 @@ public final class FFMpegNative {
     /**
      * Release the renderer, its scaler, and the underlying window reference.
      *
-     * <p>Retires the handle first, so no new operation can start. If an
-     * operation is still admitted, it does <em>not</em> free the scaler, the
-     * window, the locks or the object: the whole renderer is retained until
-     * the last admitted call returns, then released. Calling Free twice, or
-     * with a handle that was already freed, is a no-op.
+     * <p>Revokes the handle so no new operation can start, then drops the
+     * creator reference. The object itself is destroyed by whichever release
+     * drops the last reference: this call when nothing is in flight, otherwise
+     * the last admitted operation. The slot becomes reusable once that has
+     * happened, so create/free cycles are not limited to a fixed table size.
+     *
+     * <p>Calling Free twice, with 0, or with a handle that was already freed is
+     * a no-op.
      *
      * <p>Calling Free without revoking first is supported (it revokes
      * internally), but it gives you no chance to observe
-     * {@link #OUTPUT_SESSION_DETACHED}; prefer the full protocol.
+     * {@link org.ffmpeg.consts.OutputSessionState#OUTPUT_SESSION_DETACHED}; prefer the full protocol.
      */
     public native void windowRendererFree(long handle);
 
@@ -1884,13 +1553,18 @@ public final class FFMpegNative {
     /*   interruptFlagAbort(flag);   // readFrame -> AVERROR_EXIT      */
     /*   demuxThread.join();                                           */
     /*   formatCloseInput(ctx);                                        */
-    /*   interruptFlagFree(flag);    // only after every ctx is closed */
+    /*   interruptFlagFree(flag);    // safe before or after the close */
+    /*                                                                 */
+    /* 2.0: a context that polls the flag holds a reference to it, so  */
+    /* interruptFlagFree no longer has to wait for every context to be */
+    /* closed. The object is freed when the last context releases it.  */
+    /* A flag cannot be swapped for a different one once bound.        */
     /* -------------------------------------------------------------- */
 
     /**
      * Allocate a cleared interrupt flag.
      *
-     * @return an opaque flag handle, or 0 on allocation failure. Free with
+     * @return an opaque flag handle, or 0 on allocation failure. Release with
      *         {@link #interruptFlagFree}.
      */
     public native long interruptFlagCreate();
@@ -1900,6 +1574,12 @@ public final class FFMpegNative {
      * blocking operations on it abort with {@code AVERROR_EXIT} once the flag
      * is raised.
      *
+     * <p>Binding the same flag again is a no-op. Binding a <em>different</em>
+     * flag to a context that already has one is refused with {@code EPERM} and
+     * an {@link IllegalStateException} ({@code ffmpeg.handle.interrupt_bound}):
+     * libavformat may already hold the old callback data, so the swap cannot be
+     * made safe in place. Reopen the context instead.
+     *
      * @return 0 on success, or a negative AVERROR
      */
     public native int formatSetInterruptFlag(long formatCtx, long flag);
@@ -1907,13 +1587,18 @@ public final class FFMpegNative {
     /**
      * Raise the flag: in-flight and subsequent blocking I/O on any context
      * holding it fails with {@code AVERROR_EXIT}. Callable from any thread and
-     * idempotent.
+     * idempotent. Never blocks, never waits for a context lock: a close that
+     * waited here would deadlock with the read it is trying to unblock.
      */
     public native void interruptFlagAbort(long flag);
 
     /**
-     * Free the flag. Every {@link #formatSetInterruptFlag} context must be
-     * closed first, otherwise its callback would read freed memory.
+     * Release this caller's reference to the flag.
+     *
+     * <p>2.0: a context that polls the flag holds its own reference, so this
+     * may be called before the context is closed. The flag object is freed when
+     * the last context releases it, which is what keeps libavformat from
+     * calling into freed memory. Passing 0, or freeing twice, is a no-op.
      */
     public native void interruptFlagFree(long flag);
 
@@ -2196,47 +1881,6 @@ public final class FFMpegNative {
     /* is gated on CAP_BOUNDED_PCM_RESAMPLE.                              */
     /* ================================================================== */
 
-    /** Output samples were written; the input frame has been consumed. */
-    public static final int PCM_OUTPUT_READY = 0;
-
-    /**
-     * All input was taken but nothing could be emitted yet (a filter that
-     * needs look-ahead). Advance your input cursor and feed the next frame.
-     *
-     * <p>A zero-sample frame is not EOF: converting one returns this status
-     * with {@code status[0] == 0}, and it never flushes the session.
-     */
-    public static final int PCM_INPUT_CONSUMED = 1;
-
-    /**
-     * Retained for numeric compatibility only. A synchronous drain reports
-     * progress as {@link #PCM_OUTPUT_READY} / {@link #PCM_DRAINED}, and
-     * {@link #pcmSessionConvert} never returns this: a drain is no longer
-     * driven by polling an internal delay figure.
-     */
-    public static final int PCM_NEED_DRAIN = 2;
-
-    /**
-     * The tail is complete. Only {@link #pcmSessionDrain} reports this, and
-     * only after an empty-input flush actually returned no samples; an empty
-     * or already-finished session reports it without touching the resampler.
-     * {@code status[0]} is 0 in that case.
-     */
-    public static final int PCM_DRAINED = 3;
-
-    /**
-     * The frame's format differs from the configured one and the old
-     * resampler still holds a tail.
-     *
-     * <p>Nothing was consumed and nothing was reconfigured. Drain the old
-     * tail to {@link #PCM_DRAINED} first, then present the same frame again:
-     * the format change is committed at that point and the frame is converted
-     * exactly once. Switching immediately would silently drop the tail.
-     *
-     * @see #pcmSessionDrain
-     */
-    public static final int PCM_FORMAT_CHANGE = 4;
-
     /**
      * Create a bounded resampling session.
      *
@@ -2325,13 +1969,13 @@ public final class FFMpegNative {
      *
      * <p>This is the only way a stream ends. Each call flushes with empty
      * input; a non-empty result means more tail is left, and an empty result
-     * means the tail is complete and {@link #PCM_DRAINED} is reported with
+     * means the tail is complete and {@link org.ffmpeg.consts.PcmSessionStatus#PCM_DRAINED} is reported with
      * {@code status[0] == 0}.
      *
      * <p>Small blocks are the intended use: the flush is resumable, so
      * {@code outCount} does not have to hold the whole tail, and a large
      * backlog never prevents draining. An unconfigured or already-finished
-     * session reports {@link #PCM_DRAINED} without touching the resampler.
+     * session reports {@link org.ffmpeg.consts.PcmSessionStatus#PCM_DRAINED} without touching the resampler.
      *
      * <p>Drain does not obey {@code maxDelaySamples} (it is the way the
      * backlog is removed), but it does obey the output block limits.
@@ -2349,7 +1993,7 @@ public final class FFMpegNative {
      * configured input format is rebuilt from the snapshot, so the next
      * convert is not treated as a format change.
      *
-     * <p>Also the only way to feed input again after {@link #PCM_DRAINED}.
+     * <p>Also the only way to feed input again after {@link org.ffmpeg.consts.PcmSessionStatus#PCM_DRAINED}.
      *
      * @return 0, or negative AVERROR
      */
@@ -2512,7 +2156,7 @@ public final class FFMpegNative {
     /** @return handle to the MOV audio tag table. */
     public native long getMovAudioTags();
 
-    /** Map a fourcc tag to a codec id using a tag-table handle. @return {@code AV_CODEC_ID_*} or {@link #AV_CODEC_ID_NONE}. */
+    /** Map a fourcc tag to a codec id using a tag-table handle. @return {@code AV_CODEC_ID_*} or {@link org.ffmpeg.consts.AvCodecId#AV_CODEC_ID_NONE}. */
     public native int codecGetIdFromTag(long tagTable, int tag);
     /** Map a codec id to a fourcc tag using a tag-table handle. @return the tag, or 0 if none. */
     public native int codecGetTagFromId(long tagTable, int codecId);
@@ -2535,7 +2179,7 @@ public final class FFMpegNative {
      * @return a Java int[] where [0]={@code config}, [1]={@code count}, and
      *         [2..count+1] are the config values, or null if the config type
      *         is not expressible as int (FRAME_RATE / CHANNEL_LAYOUT) or on error.
-     * @see #AV_CODEC_CONFIG_PIX_FORMAT
+     * @see org.ffmpeg.consts.AvCodecConfig#AV_CODEC_CONFIG_PIX_FORMAT
      */
     public native int[] codecGetSupportedConfigs(long codecCtx, long codec, int config, int flags);
 
@@ -2544,7 +2188,7 @@ public final class FFMpegNative {
      * converting from {@code srcPixFmt}.
      * @param pixFmtList list of candidate {@code AV_PIX_FMT_*} values (all elements used; do not add a terminator)
      * @param lossOut optional single-element int[] to receive the loss bitmask
-     * @return the best {@code AV_PIX_FMT_*}, or {@link #AV_PIX_FMT_NONE}
+     * @return the best {@code AV_PIX_FMT_*}, or {@link org.ffmpeg.consts.AvPixelFormat#AV_PIX_FMT_NONE}
      */
     public native int codecFindBestPixFmtOfList(int[] pixFmtList, int srcPixFmt, int hasAlpha, int[] lossOut);
 
@@ -2781,8 +2425,8 @@ public final class FFMpegNative {
 
     /**
      * @return {@code profile} of stream {@code index}'s codecpar (an
-     * {@code AV_PROFILE_*} value such as {@link #AV_PROFILE_DTS_HD_MA}), or
-     * {@link #AV_PROFILE_UNKNOWN}. Needed to tell DTS-HD/E-AC3 extension
+     * {@code AV_PROFILE_*} value such as {@link org.ffmpeg.consts.AvProfile#AV_PROFILE_DTS_HD_MA}), or
+     * {@link org.ffmpeg.consts.AvProfile#AV_PROFILE_UNKNOWN}. Needed to tell DTS-HD/E-AC3 extension
      * streams apart from their base formats when deciding whether a
      * compressed-bitstream passthrough sink can accept the stream as-is.
      */
@@ -2857,7 +2501,7 @@ public final class FFMpegNative {
 
     /** @return number of subtitle rectangles, 0 if none. */
     public native int subtitleGetNumRects(long sub);
-    /** @return subtitle pts (in AV_TIME_BASE), or {@link #AV_NOPTS_VALUE}. */
+    /** @return subtitle pts (in AV_TIME_BASE), or {@link org.ffmpeg.consts.AvTimeBase#AV_NOPTS_VALUE}. */
     public native long subtitleGetPts(long sub);
     /** @return 0 for graphics, non-zero for text. */
     public native int subtitleGetFormat(long sub);
@@ -2968,7 +2612,7 @@ public final class FFMpegNative {
      * every subtitle event and is only useful for short debugging sessions.
      *
      * <p>This does not affect {@link #logSetLevel}, which controls the
-     * separate {@code FFmpeg} tag. Gate on {@link #CAP_LIBASS_FONT_LOG}.
+     * separate {@code FFmpeg} tag. Gate on {@link org.ffmpeg.consts.BridgeApi#CAP_LIBASS_FONT_LOG}.
      */
     public native void assSetLogLevel(int level);
 
@@ -3186,1444 +2830,4 @@ public final class FFMpegNative {
      */
     public native long swsAllocContext();
 
-
-    /* ================================================================== */
-    /* Constants mirrored from FFmpeg                                      */
-    /* ================================================================== */
-
-    /** Undefined timestamp, mirrors FFmpeg's {@code AV_NOPTS_VALUE}. */
-    public static final long AV_NOPTS_VALUE = 0x8000000000000000L;
-
-    /** Media-type constants mirroring {@code enum AVMediaType}. */
-    public static final int AVMEDIA_TYPE_UNKNOWN   = -1;
-    public static final int AVMEDIA_TYPE_VIDEO       = 0;
-    public static final int AVMEDIA_TYPE_AUDIO       = 1;
-    public static final int AVMEDIA_TYPE_DATA         = 2;
-    public static final int AVMEDIA_TYPE_SUBTITLE     = 3;
-    public static final int AVMEDIA_TYPE_ATTACHMENT = 4;
-
-    /** Pixel-format constants mirroring {@code enum AVPixelFormat}. */
-    public static final int AV_PIX_FMT_NONE  = -1;
-    public static final int AV_PIX_FMT_YUV420P = 0;
-    public static final int AV_PIX_FMT_YUYV422 = 1;
-    public static final int AV_PIX_FMT_RGB24    = 2;
-    public static final int AV_PIX_FMT_BGR24    = 3;
-    public static final int AV_PIX_FMT_YUV422P      = 4;
-    public static final int AV_PIX_FMT_YUV444P      = 5;
-    public static final int AV_PIX_FMT_NV21         = 24;
-    public static final int AV_PIX_FMT_RGBA     = 26;
-    public static final int AV_PIX_FMT_BGRA     = 28;
-    public static final int AV_PIX_FMT_YUV420P10LE  = 62;
-    public static final int AV_PIX_FMT_YUV422P10LE  = 64;
-    public static final int AV_PIX_FMT_YUV444P10LE  = 68;
-    public static final int AV_PIX_FMT_P010LE       = 158;
-    /**
-     * Software NV12 (Y + interleaved UV). The mediacodec decoder falls back
-     * to this format (mapped from the platform {@code COLOR_FormatYUV420*}
-     * variants) when no Surface is attached via {@code hw_device_ctx}; decoded
-     * frames live in ordinary host buffers, not in {@code AVMediaCodecBuffer}.
-     * Asserting against this value after open2 helps detect the fallback.
-     */
-    public static final int AV_PIX_FMT_NV12 = 23;
-    /**
-     * Android MediaCodec hardware pixel format. Only frames in this format
-     * carry a non-null {@code AVMediaCodecBuffer*} in {@code frame->data[3]},
-     * which is what {@link #mediasurfaceGetBuffer} hands back for rendering.
-     * Selected by the mediacodec decoder iff {@code avctx->hw_device_ctx} is
-     * a {@link #AV_HWDEVICE_TYPE_MEDIACODEC} device whose {@code hwctx->surface}
-     * is the App Surface (see {@link #mediasurfaceHwdeviceCreate}).
-     */
-    public static final int AV_PIX_FMT_MEDIACODEC = 164;
-
-    /**
-     * Hardware device type constants mirroring {@code enum AVHWDeviceType}.
-     * MediaCodec Surface zero-copy requires {@link #AV_HWDEVICE_TYPE_MEDIACODEC}.
-     */
-    public static final int AV_HWDEVICE_TYPE_MEDIACODEC = 10;
-
-    /** Sample-format constants mirroring {@code enum AVSampleFormat}. */
-    public static final int AV_SAMPLE_FMT_NONE  = -1;
-    public static final int AV_SAMPLE_FMT_U8    = 0;
-    public static final int AV_SAMPLE_FMT_S16   = 1;
-    public static final int AV_SAMPLE_FMT_S32   = 2;
-    public static final int AV_SAMPLE_FMT_FLT    = 3;
-    public static final int AV_SAMPLE_FMT_DBL    = 4;
-    public static final int AV_SAMPLE_FMT_U8P    = 5;
-    public static final int AV_SAMPLE_FMT_S16P   = 6;
-    public static final int AV_SAMPLE_FMT_S32P   = 7;
-    public static final int AV_SAMPLE_FMT_FLTP    = 8;
-    public static final int AV_SAMPLE_FMT_DBLP    = 9;
-    public static final int AV_SAMPLE_FMT_S64     = 10;
-    public static final int AV_SAMPLE_FMT_S64P    = 11;
-    public static final int AV_SAMPLE_FMT_DSD     = 12;
-    public static final int AV_SAMPLE_FMT_NB      = 13;
-
-    /**
-     * Channel constants mirrored from {@code libavutil/channel_layout.h}.
-     * Values match the native enums/macros exactly. The {@code AV_CH_LAYOUT_*}
-     * and {@code AV_CH_*} masks are 64-bit bitfields and are declared as
-     * {@code long}; the channel indices and orders are {@code int}.
-     */
-
-    /** Channel indices, {@code enum AVChannel}. */
-    public static final int AV_CHAN_NONE                   = -1;
-    public static final int AV_CHAN_FRONT_LEFT             = 0;
-    public static final int AV_CHAN_FRONT_RIGHT            = 1;
-    public static final int AV_CHAN_FRONT_CENTER           = 2;
-    public static final int AV_CHAN_LOW_FREQUENCY          = 3;
-    public static final int AV_CHAN_BACK_LEFT              = 4;
-    public static final int AV_CHAN_BACK_RIGHT             = 5;
-    public static final int AV_CHAN_FRONT_LEFT_OF_CENTER   = 6;
-    public static final int AV_CHAN_FRONT_RIGHT_OF_CENTER  = 7;
-    public static final int AV_CHAN_BACK_CENTER            = 8;
-    public static final int AV_CHAN_SIDE_LEFT              = 9;
-    public static final int AV_CHAN_SIDE_RIGHT             = 10;
-    public static final int AV_CHAN_TOP_CENTER             = 11;
-    public static final int AV_CHAN_TOP_FRONT_LEFT         = 12;
-    public static final int AV_CHAN_TOP_FRONT_CENTER       = 13;
-    public static final int AV_CHAN_TOP_FRONT_RIGHT        = 14;
-    public static final int AV_CHAN_TOP_BACK_LEFT          = 15;
-    public static final int AV_CHAN_TOP_BACK_CENTER        = 16;
-    public static final int AV_CHAN_TOP_BACK_RIGHT         = 17;
-    public static final int AV_CHAN_STEREO_LEFT            = 29;
-    public static final int AV_CHAN_STEREO_RIGHT           = 30;
-    public static final int AV_CHAN_WIDE_LEFT              = 31;
-    public static final int AV_CHAN_WIDE_RIGHT             = 32;
-    public static final int AV_CHAN_SURROUND_DIRECT_LEFT   = 33;
-    public static final int AV_CHAN_SURROUND_DIRECT_RIGHT  = 34;
-    public static final int AV_CHAN_LOW_FREQUENCY_2        = 35;
-    public static final int AV_CHAN_TOP_SIDE_LEFT          = 36;
-    public static final int AV_CHAN_TOP_SIDE_RIGHT         = 37;
-    public static final int AV_CHAN_BOTTOM_FRONT_CENTER    = 38;
-    public static final int AV_CHAN_BOTTOM_FRONT_LEFT      = 39;
-    public static final int AV_CHAN_BOTTOM_FRONT_RIGHT     = 40;
-    public static final int AV_CHAN_SIDE_SURROUND_LEFT     = 41;
-    public static final int AV_CHAN_SIDE_SURROUND_RIGHT    = 42;
-    public static final int AV_CHAN_TOP_SURROUND_LEFT      = 43;
-    public static final int AV_CHAN_TOP_SURROUND_RIGHT     = 44;
-    public static final int AV_CHAN_BINAURAL_LEFT          = 61;
-    public static final int AV_CHAN_BINAURAL_RIGHT         = 62;
-    public static final int AV_CHAN_UNUSED                 = 512;   // 0x200
-    public static final int AV_CHAN_UNKNOWN                = 768;   // 0x300
-    public static final int AV_CHAN_AMBISONIC_BASE         = 1024;  // 0x400
-    public static final int AV_CHAN_AMBISONIC_END          = 2047;  // 0x7ff
-
-    /** Per-channel bit masks, {@code AV_CH_*} = {@code 1ULL << AV_CHAN_*}. 64-bit. */
-    public static final long AV_CH_FRONT_LEFT             = 1L;
-    public static final long AV_CH_FRONT_RIGHT            = 2L;
-    public static final long AV_CH_FRONT_CENTER           = 4L;
-    public static final long AV_CH_LOW_FREQUENCY          = 8L;
-    public static final long AV_CH_BACK_LEFT              = 16L;
-    public static final long AV_CH_BACK_RIGHT             = 32L;
-    public static final long AV_CH_FRONT_LEFT_OF_CENTER   = 64L;
-    public static final long AV_CH_FRONT_RIGHT_OF_CENTER  = 128L;
-    public static final long AV_CH_BACK_CENTER            = 256L;
-    public static final long AV_CH_SIDE_LEFT              = 512L;
-    public static final long AV_CH_SIDE_RIGHT             = 1024L;
-    public static final long AV_CH_TOP_CENTER             = 2048L;
-    public static final long AV_CH_TOP_FRONT_LEFT         = 4096L;
-    public static final long AV_CH_TOP_FRONT_CENTER       = 8192L;
-    public static final long AV_CH_TOP_FRONT_RIGHT        = 16384L;
-    public static final long AV_CH_TOP_BACK_LEFT          = 32768L;
-    public static final long AV_CH_TOP_BACK_CENTER        = 65536L;
-    public static final long AV_CH_TOP_BACK_RIGHT         = 131072L;
-    public static final long AV_CH_STEREO_LEFT            = 536870912L;
-    public static final long AV_CH_STEREO_RIGHT           = 1073741824L;
-    public static final long AV_CH_WIDE_LEFT              = 2147483648L;
-    public static final long AV_CH_WIDE_RIGHT             = 4294967296L;
-    public static final long AV_CH_SURROUND_DIRECT_LEFT   = 8589934592L;
-    public static final long AV_CH_SURROUND_DIRECT_RIGHT  = 17179869184L;
-    public static final long AV_CH_LOW_FREQUENCY_2        = 34359738368L;
-    public static final long AV_CH_TOP_SIDE_LEFT          = 68719476736L;
-    public static final long AV_CH_TOP_SIDE_RIGHT         = 137438953472L;
-    public static final long AV_CH_BOTTOM_FRONT_CENTER    = 274877906944L;
-    public static final long AV_CH_BOTTOM_FRONT_LEFT      = 549755813888L;
-    public static final long AV_CH_BOTTOM_FRONT_RIGHT     = 1099511627776L;
-    public static final long AV_CH_SIDE_SURROUND_LEFT     = 2199023255552L;
-    public static final long AV_CH_SIDE_SURROUND_RIGHT    = 4398046511104L;
-    public static final long AV_CH_TOP_SURROUND_LEFT      = 8796093022208L;
-    public static final long AV_CH_TOP_SURROUND_RIGHT     = 17592186044416L;
-    public static final long AV_CH_BINAURAL_LEFT          = 2305843009213693952L;
-    public static final long AV_CH_BINAURAL_RIGHT         = 4611686018427387904L;
-
-    /** Channel-layout bit masks, {@code AV_CH_LAYOUT_*} from {@code libavutil/channel_layout.h}. 64-bit. */
-    public static final long AV_CH_LAYOUT_MONO              = 4L;
-    public static final long AV_CH_LAYOUT_STEREO            = 3L;
-    public static final long AV_CH_LAYOUT_2POINT1           = 11L;
-    public static final long AV_CH_LAYOUT_2_1               = 259L;
-    public static final long AV_CH_LAYOUT_SURROUND          = 7L;
-    public static final long AV_CH_LAYOUT_3POINT1           = 15L;
-    public static final long AV_CH_LAYOUT_4POINT0           = 263L;
-    public static final long AV_CH_LAYOUT_4POINT1           = 271L;
-    public static final long AV_CH_LAYOUT_2_2               = 1539L;
-    public static final long AV_CH_LAYOUT_QUAD              = 51L;
-    public static final long AV_CH_LAYOUT_5POINT0           = 1543L;
-    public static final long AV_CH_LAYOUT_5POINT1           = 1551L;
-    public static final long AV_CH_LAYOUT_5POINT0_BACK      = 55L;
-    public static final long AV_CH_LAYOUT_5POINT1_BACK      = 63L;
-    public static final long AV_CH_LAYOUT_6POINT0           = 1799L;
-    public static final long AV_CH_LAYOUT_6POINT0_FRONT     = 1731L;
-    public static final long AV_CH_LAYOUT_HEXAGONAL         = 311L;
-    public static final long AV_CH_LAYOUT_3POINT1POINT2     = 20495L;
-    public static final long AV_CH_LAYOUT_6POINT1           = 1807L;
-    public static final long AV_CH_LAYOUT_6POINT1_BACK      = 319L;
-    public static final long AV_CH_LAYOUT_6POINT1_FRONT     = 1739L;
-    public static final long AV_CH_LAYOUT_7POINT0           = 1591L;
-    public static final long AV_CH_LAYOUT_7POINT0_FRONT     = 1735L;
-    public static final long AV_CH_LAYOUT_7POINT1           = 1599L;
-    public static final long AV_CH_LAYOUT_7POINT1_WIDE      = 1743L;
-    public static final long AV_CH_LAYOUT_7POINT1_WIDE_BACK = 255L;
-    public static final long AV_CH_LAYOUT_5POINT1POINT2     = 22031L;
-    public static final long AV_CH_LAYOUT_5POINT1POINT2_BACK = 20543L;
-    public static final long AV_CH_LAYOUT_OCTAGONAL         = 1847L;
-    public static final long AV_CH_LAYOUT_CUBE              = 184371L;
-    public static final long AV_CH_LAYOUT_5POINT1POINT4     = 185871L;
-    public static final long AV_CH_LAYOUT_5POINT1POINT6     = 196111L;
-    public static final long AV_CH_LAYOUT_7POINT1POINT2     = 22079L;
-    public static final long AV_CH_LAYOUT_7POINT1POINT4     = 185919L;
-    public static final long AV_CH_LAYOUT_7POINT1POINT6     = 196159L;
-    public static final long AV_CH_LAYOUT_7POINT2POINT3     = 34359825983L;
-    public static final long AV_CH_LAYOUT_9POINT1POINT4     = 186111L;
-    public static final long AV_CH_LAYOUT_9POINT1POINT6     = 206158616319L;
-    public static final long AV_CH_LAYOUT_HEXADECAGONAL     = 6442710839L;
-    public static final long AV_CH_LAYOUT_BINAURAL          = 6917529027641081856L;
-    public static final long AV_CH_LAYOUT_STEREO_DOWNMIX    = 1610612736L;
-    public static final long AV_CH_LAYOUT_22POINT2          = 2164663779327L;
-    /** @deprecated aliases kept for ABI compatibility (FF_API_CHANNEL_LAYOUT_BACK). */
-    @Deprecated
-    public static final long AV_CH_LAYOUT_5POINT1POINT4_BACK = 185871L;
-    public static final long AV_CH_LAYOUT_7POINT1POINT4_BACK = 185919L;
-    public static final long AV_CH_LAYOUT_9POINT1POINT4_BACK = 186111L;
-    public static final long AV_CH_LAYOUT_7POINT1_TOP_BACK   = 20543L;
-
-    /** Channel orders, {@code enum AVChannelOrder}. */
-    public static final int AV_CHANNEL_ORDER_UNSPEC     = 0;
-    public static final int AV_CHANNEL_ORDER_NATIVE     = 1;
-    public static final int AV_CHANNEL_ORDER_CUSTOM     = 2;
-    public static final int AV_CHANNEL_ORDER_AMBISONIC  = 3;
-    public static final int FF_CHANNEL_ORDER_NB         = 4;
-
-    /** Matrix encoding values, {@code enum AVMatrixEncoding}. */
-    public static final int AV_MATRIX_ENCODING_NONE           = 0;
-    public static final int AV_MATRIX_ENCODING_DOLBY          = 1;
-    public static final int AV_MATRIX_ENCODING_DPLII          = 2;
-    public static final int AV_MATRIX_ENCODING_DPLIIX         = 3;
-    public static final int AV_MATRIX_ENCODING_DPLIIZ         = 4;
-    public static final int AV_MATRIX_ENCODING_DOLBYEX        = 5;
-    public static final int AV_MATRIX_ENCODING_DOLBYHEADPHONE = 6;
-    public static final int AV_MATRIX_ENCODING_NB             = 7;
-
-    /** SWS algorithm flags mirroring {@code libswscale}. */
-    public static final int SWS_FAST_BILINEAR = 1;
-    public static final int SWS_BILINEAR       = 2;
-    public static final int SWS_BICUBIC          = 4;
-    public static final int SWS_X                = 8;
-    public static final int SWS_POINT            = 0x10;
-    public static final int SWS_AREA              = 0x20;
-    public static final int SWS_BICUBLIN          = 0x40;
-    public static final int SWS_GAUSS             = 0x80;
-    public static final int SWS_SINC              = 0x100;
-    public static final int SWS_LANCZOS           = 0x200;
-    public static final int SWS_SPLINE            = 0x400;
-    public static final int SWS_STRICT            = 0x800;
-    public static final int SWS_PRINT_INFO        = 0x1000;
-    public static final int SWS_FULL_CHR_H_INT    = 0x2000;
-    public static final int SWS_FULL_CHR_H_INP    = 0x4000;
-    public static final int SWS_DIRECT_BGR        = 0x8000;
-    public static final int SWS_ACCURATE_RND      = 0x40000;
-    public static final int SWS_BITEXACT          = 0x80000;
-    public static final int SWS_ERROR_DIFFUSION   = 0x800000;
-    public static final int SWS_PARAM_DEFAULT     = 123456;
-    public static final int SWS_CS_ITU709         = 1;
-    public static final int SWS_CS_FCC            = 4;
-    public static final int SWS_CS_ITU601         = 5;
-    public static final int SWS_CS_ITU624         = 5;
-    public static final int SWS_CS_SMPTE170M      = 5;
-    public static final int SWS_CS_SMPTE240M      = 7;
-    public static final int SWS_CS_BT2020         = 9;
-    public static final int SWS_CS_DEFAULT        = 5;
-
-    /** Dictionary flags mirroring {@code AV_DICT_*}. */
-    public static final int AV_DICT_MATCH_CASE    = 1;
-    public static final int AV_DICT_IGNORE_SUFFIX = 2;
-    public static final int AV_DICT_DONT_STRDUP_KEY = 4;
-    public static final int AV_DICT_DONT_STRDUP_VAL = 8;
-    public static final int AV_DICT_DONT_STRDUP    = AV_DICT_DONT_STRDUP_KEY;
-    public static final int AV_DICT_DONT_OVERWRITE  = 16;
-    public static final int AV_DICT_APPEND          = 32;
-    public static final int AV_DICT_MULTIKEY        = 64;
-    public static final int AV_DICT_DEDUP           = 128;
-
-    /** Seek flags mirroring {@code AVSEEK_FLAG_*}. */
-    public static final int AVSEEK_FLAG_BACKWARD = 1;
-    public static final int AVSEEK_FLAG_BYTE      = 2;
-    public static final int AVSEEK_FLAG_ANY        = 4;
-    public static final int AVSEEK_FLAG_FRAME     = 8;
-
-    /** AVIO flags mirroring {@code AVIO_FLAG_*}. */
-    public static final int AVIO_FLAG_READ      = 1;
-    public static final int AVIO_FLAG_WRITE     = 2;
-    public static final int AVIO_FLAG_NONBLOCK  = 8;
-    public static final int AVIO_FLAG_DIRECT    = 0x8000;
-
-    /** Packet flag bits mirroring {@code AV_PKT_FLAG_*}. */
-    public static final int AV_PKT_FLAG_KEY        = 0x0001;
-    public static final int AV_PKT_FLAG_CORRUPT    = 0x0002;
-    public static final int AV_PKT_FLAG_DISCARD    = 0x0004;
-    public static final int AV_PKT_FLAG_TRUSTED    = 0x0008;
-    public static final int AV_PKT_FLAG_DISPOSABLE = 0x0010;
-
-    /** Subtitle-rectangle type constants mirroring {@code enum AVSubtitleType}
-     *  (use with {@link #subtitleRectGetType}). */
-    public static final int SUBTITLE_NONE   = 0;
-    public static final int SUBTITLE_BITMAP = 1;
-    public static final int SUBTITLE_TEXT   = 2;
-    public static final int SUBTITLE_ASS    = 3;
-
-    /** Time base: FFmpeg timestamps are in {@code AV_TIME_BASE}ths of a second (1 000 000). */
-    public static final long AV_TIME_BASE = 1_000_000L;
-
-    /**
-     * Time base as a rational, identical to
-     * {@code AV_TIME_BASE_Q = (AVRational){1, AV_TIME_BASE}} = 1/1 000 000.
-     */
-    public static final int AV_TIME_BASE_Q_NUM = 1;
-    public static final int AV_TIME_BASE_Q_DEN = 1_000_000;
-
-    /** Log levels mirroring {@code AV_LOG_*}. Pass to {@link #logSetLevel}. */
-    public static final int AV_LOG_QUIET      = -8;
-    public static final int AV_LOG_PANIC       = 0;
-    public static final int AV_LOG_FATAL       = 8;
-    public static final int AV_LOG_ERROR      = 16;
-    public static final int AV_LOG_WARNING    = 24;
-    public static final int AV_LOG_INFO        = 32;
-    public static final int AV_LOG_VERBOSE   = 40;
-    public static final int AV_LOG_DEBUG     = 48;
-    public static final int AV_LOG_TRACE     = 56;
-
-    /** Rounding modes mirroring {@code enum AVRounding}, for {@link #rescaleRnd}. */
-    public static final int AV_ROUND_ZERO          = 0;
-    public static final int AV_ROUND_INF            = 1;
-    public static final int AV_ROUND_DOWN          = 2;
-    public static final int AV_ROUND_UP              = 3;
-    public static final int AV_ROUND_NEAR_INF    = 5;
-    public static final int AV_ROUND_PASS_MINMAX = 8192;
-
-    /**
-     * Codec id constants, mirrors every entry of {@code enum AVCodecID}
-     * from {@code libavcodec/codec_id.h}. Values are kept in sync with
-     * the native enum; use these instead of hard-coding magic numbers.
-     */
-    public static final int AV_CODEC_ID_NONE = 0;
-    public static final int AV_CODEC_ID_MPEG1VIDEO = 1;
-    public static final int AV_CODEC_ID_MPEG2VIDEO = 2;
-    public static final int AV_CODEC_ID_H261 = 3;
-    public static final int AV_CODEC_ID_H263 = 4;
-    public static final int AV_CODEC_ID_RV10 = 5;
-    public static final int AV_CODEC_ID_RV20 = 6;
-    public static final int AV_CODEC_ID_MJPEG = 7;
-    public static final int AV_CODEC_ID_MJPEGB = 8;
-    public static final int AV_CODEC_ID_LJPEG = 9;
-    public static final int AV_CODEC_ID_SP5X = 10;
-    public static final int AV_CODEC_ID_JPEGLS = 11;
-    public static final int AV_CODEC_ID_MPEG4 = 12;
-    public static final int AV_CODEC_ID_RAWVIDEO = 13;
-    public static final int AV_CODEC_ID_MSMPEG4V1 = 14;
-    public static final int AV_CODEC_ID_MSMPEG4V2 = 15;
-    public static final int AV_CODEC_ID_MSMPEG4V3 = 16;
-    public static final int AV_CODEC_ID_WMV1 = 17;
-    public static final int AV_CODEC_ID_WMV2 = 18;
-    public static final int AV_CODEC_ID_H263P = 19;
-    public static final int AV_CODEC_ID_H263I = 20;
-    public static final int AV_CODEC_ID_FLV1 = 21;
-    public static final int AV_CODEC_ID_SVQ1 = 22;
-    public static final int AV_CODEC_ID_SVQ3 = 23;
-    public static final int AV_CODEC_ID_DVVIDEO = 24;
-    public static final int AV_CODEC_ID_HUFFYUV = 25;
-    public static final int AV_CODEC_ID_CYUV = 26;
-    public static final int AV_CODEC_ID_H264 = 27;
-    public static final int AV_CODEC_ID_INDEO3 = 28;
-    public static final int AV_CODEC_ID_VP3 = 29;
-    public static final int AV_CODEC_ID_THEORA = 30;
-    public static final int AV_CODEC_ID_ASV1 = 31;
-    public static final int AV_CODEC_ID_ASV2 = 32;
-    public static final int AV_CODEC_ID_FFV1 = 33;
-    public static final int AV_CODEC_ID_4XM = 34;
-    public static final int AV_CODEC_ID_VCR1 = 35;
-    public static final int AV_CODEC_ID_CLJR = 36;
-    public static final int AV_CODEC_ID_MDEC = 37;
-    public static final int AV_CODEC_ID_ROQ = 38;
-    public static final int AV_CODEC_ID_INTERPLAY_VIDEO = 39;
-    public static final int AV_CODEC_ID_XAN_WC3 = 40;
-    public static final int AV_CODEC_ID_XAN_WC4 = 41;
-    public static final int AV_CODEC_ID_RPZA = 42;
-    public static final int AV_CODEC_ID_CINEPAK = 43;
-    public static final int AV_CODEC_ID_WS_VQA = 44;
-    public static final int AV_CODEC_ID_MSRLE = 45;
-    public static final int AV_CODEC_ID_MSVIDEO1 = 46;
-    public static final int AV_CODEC_ID_IDCIN = 47;
-    public static final int AV_CODEC_ID_8BPS = 48;
-    public static final int AV_CODEC_ID_SMC = 49;
-    public static final int AV_CODEC_ID_FLIC = 50;
-    public static final int AV_CODEC_ID_TRUEMOTION1 = 51;
-    public static final int AV_CODEC_ID_VMDVIDEO = 52;
-    public static final int AV_CODEC_ID_MSZH = 53;
-    public static final int AV_CODEC_ID_ZLIB = 54;
-    public static final int AV_CODEC_ID_QTRLE = 55;
-    public static final int AV_CODEC_ID_TSCC = 56;
-    public static final int AV_CODEC_ID_ULTI = 57;
-    public static final int AV_CODEC_ID_QDRAW = 58;
-    public static final int AV_CODEC_ID_VIXL = 59;
-    public static final int AV_CODEC_ID_QPEG = 60;
-    public static final int AV_CODEC_ID_PNG = 61;
-    public static final int AV_CODEC_ID_PPM = 62;
-    public static final int AV_CODEC_ID_PBM = 63;
-    public static final int AV_CODEC_ID_PGM = 64;
-    public static final int AV_CODEC_ID_PGMYUV = 65;
-    public static final int AV_CODEC_ID_PAM = 66;
-    public static final int AV_CODEC_ID_FFVHUFF = 67;
-    public static final int AV_CODEC_ID_RV30 = 68;
-    public static final int AV_CODEC_ID_RV40 = 69;
-    public static final int AV_CODEC_ID_VC1 = 70;
-    public static final int AV_CODEC_ID_WMV3 = 71;
-    public static final int AV_CODEC_ID_LOCO = 72;
-    public static final int AV_CODEC_ID_WNV1 = 73;
-    public static final int AV_CODEC_ID_AASC = 74;
-    public static final int AV_CODEC_ID_INDEO2 = 75;
-    public static final int AV_CODEC_ID_FRAPS = 76;
-    public static final int AV_CODEC_ID_TRUEMOTION2 = 77;
-    public static final int AV_CODEC_ID_BMP = 78;
-    public static final int AV_CODEC_ID_CSCD = 79;
-    public static final int AV_CODEC_ID_MMVIDEO = 80;
-    public static final int AV_CODEC_ID_ZMBV = 81;
-    public static final int AV_CODEC_ID_AVS = 82;
-    public static final int AV_CODEC_ID_SMACKVIDEO = 83;
-    public static final int AV_CODEC_ID_NUV = 84;
-    public static final int AV_CODEC_ID_KMVC = 85;
-    public static final int AV_CODEC_ID_FLASHSV = 86;
-    public static final int AV_CODEC_ID_CAVS = 87;
-    public static final int AV_CODEC_ID_JPEG2000 = 88;
-    public static final int AV_CODEC_ID_VMNC = 89;
-    public static final int AV_CODEC_ID_VP5 = 90;
-    public static final int AV_CODEC_ID_VP6 = 91;
-    public static final int AV_CODEC_ID_VP6F = 92;
-    public static final int AV_CODEC_ID_TARGA = 93;
-    public static final int AV_CODEC_ID_DSICINVIDEO = 94;
-    public static final int AV_CODEC_ID_TIERTEXSEQVIDEO = 95;
-    public static final int AV_CODEC_ID_TIFF = 96;
-    public static final int AV_CODEC_ID_GIF = 97;
-    public static final int AV_CODEC_ID_DXA = 98;
-    public static final int AV_CODEC_ID_DNXHD = 99;
-    public static final int AV_CODEC_ID_THP = 100;
-    public static final int AV_CODEC_ID_SGI = 101;
-    public static final int AV_CODEC_ID_C93 = 102;
-    public static final int AV_CODEC_ID_BETHSOFTVID = 103;
-    public static final int AV_CODEC_ID_PTX = 104;
-    public static final int AV_CODEC_ID_TXD = 105;
-    public static final int AV_CODEC_ID_VP6A = 106;
-    public static final int AV_CODEC_ID_AMV = 107;
-    public static final int AV_CODEC_ID_VB = 108;
-    public static final int AV_CODEC_ID_PCX = 109;
-    public static final int AV_CODEC_ID_SUNRAST = 110;
-    public static final int AV_CODEC_ID_INDEO4 = 111;
-    public static final int AV_CODEC_ID_INDEO5 = 112;
-    public static final int AV_CODEC_ID_MIMIC = 113;
-    public static final int AV_CODEC_ID_RL2 = 114;
-    public static final int AV_CODEC_ID_ESCAPE124 = 115;
-    public static final int AV_CODEC_ID_DIRAC = 116;
-    public static final int AV_CODEC_ID_BFI = 117;
-    public static final int AV_CODEC_ID_CMV = 118;
-    public static final int AV_CODEC_ID_MOTIONPIXELS = 119;
-    public static final int AV_CODEC_ID_TGV = 120;
-    public static final int AV_CODEC_ID_TGQ = 121;
-    public static final int AV_CODEC_ID_TQI = 122;
-    public static final int AV_CODEC_ID_AURA = 123;
-    public static final int AV_CODEC_ID_AURA2 = 124;
-    public static final int AV_CODEC_ID_V210X = 125;
-    public static final int AV_CODEC_ID_TMV = 126;
-    public static final int AV_CODEC_ID_V210 = 127;
-    public static final int AV_CODEC_ID_DPX = 128;
-    public static final int AV_CODEC_ID_MAD = 129;
-    public static final int AV_CODEC_ID_FRWU = 130;
-    public static final int AV_CODEC_ID_FLASHSV2 = 131;
-    public static final int AV_CODEC_ID_CDGRAPHICS = 132;
-    public static final int AV_CODEC_ID_R210 = 133;
-    public static final int AV_CODEC_ID_ANM = 134;
-    public static final int AV_CODEC_ID_BINKVIDEO = 135;
-    public static final int AV_CODEC_ID_IFF_ILBM = 136;
-    public static final int AV_CODEC_ID_KGV1 = 137;
-    public static final int AV_CODEC_ID_YOP = 138;
-    public static final int AV_CODEC_ID_VP8 = 139;
-    public static final int AV_CODEC_ID_PICTOR = 140;
-    public static final int AV_CODEC_ID_ANSI = 141;
-    public static final int AV_CODEC_ID_A64_MULTI = 142;
-    public static final int AV_CODEC_ID_A64_MULTI5 = 143;
-    public static final int AV_CODEC_ID_R10K = 144;
-    public static final int AV_CODEC_ID_MXPEG = 145;
-    public static final int AV_CODEC_ID_LAGARITH = 146;
-    public static final int AV_CODEC_ID_PRORES = 147;
-    public static final int AV_CODEC_ID_JV = 148;
-    public static final int AV_CODEC_ID_DFA = 149;
-    public static final int AV_CODEC_ID_WMV3IMAGE = 150;
-    public static final int AV_CODEC_ID_VC1IMAGE = 151;
-    public static final int AV_CODEC_ID_UTVIDEO = 152;
-    public static final int AV_CODEC_ID_BMV_VIDEO = 153;
-    public static final int AV_CODEC_ID_VBLE = 154;
-    public static final int AV_CODEC_ID_DXTORY = 155;
-    public static final int AV_CODEC_ID_XWD = 156;
-    public static final int AV_CODEC_ID_CDXL = 157;
-    public static final int AV_CODEC_ID_XBM = 158;
-    public static final int AV_CODEC_ID_ZEROCODEC = 159;
-    public static final int AV_CODEC_ID_MSS1 = 160;
-    public static final int AV_CODEC_ID_MSA1 = 161;
-    public static final int AV_CODEC_ID_TSCC2 = 162;
-    public static final int AV_CODEC_ID_MTS2 = 163;
-    public static final int AV_CODEC_ID_CLLC = 164;
-    public static final int AV_CODEC_ID_MSS2 = 165;
-    public static final int AV_CODEC_ID_VP9 = 166;
-    public static final int AV_CODEC_ID_AIC = 167;
-    public static final int AV_CODEC_ID_ESCAPE130 = 168;
-    public static final int AV_CODEC_ID_G2M = 169;
-    public static final int AV_CODEC_ID_WEBP = 170;
-    public static final int AV_CODEC_ID_HNM4_VIDEO = 171;
-    public static final int AV_CODEC_ID_HEVC = 172;
-    public static final int AV_CODEC_ID_FIC = 173;
-    public static final int AV_CODEC_ID_ALIAS_PIX = 174;
-    public static final int AV_CODEC_ID_BRENDER_PIX = 175;
-    public static final int AV_CODEC_ID_PAF_VIDEO = 176;
-    public static final int AV_CODEC_ID_EXR = 177;
-    public static final int AV_CODEC_ID_VP7 = 178;
-    public static final int AV_CODEC_ID_SANM = 179;
-    public static final int AV_CODEC_ID_SGIRLE = 180;
-    public static final int AV_CODEC_ID_MVC1 = 181;
-    public static final int AV_CODEC_ID_MVC2 = 182;
-    public static final int AV_CODEC_ID_HQX = 183;
-    public static final int AV_CODEC_ID_TDSC = 184;
-    public static final int AV_CODEC_ID_HQ_HQA = 185;
-    public static final int AV_CODEC_ID_HAP = 186;
-    public static final int AV_CODEC_ID_DDS = 187;
-    public static final int AV_CODEC_ID_DXV = 188;
-    public static final int AV_CODEC_ID_SCREENPRESSO = 189;
-    public static final int AV_CODEC_ID_RSCC = 190;
-    public static final int AV_CODEC_ID_AVS2 = 191;
-    public static final int AV_CODEC_ID_PGX = 192;
-    public static final int AV_CODEC_ID_AVS3 = 193;
-    public static final int AV_CODEC_ID_MSP2 = 194;
-    public static final int AV_CODEC_ID_VVC = 195;
-    public static final int AV_CODEC_ID_Y41P = 196;
-    public static final int AV_CODEC_ID_AVRP = 197;
-    public static final int AV_CODEC_ID_012V = 198;
-    public static final int AV_CODEC_ID_AVUI = 199;
-    public static final int AV_CODEC_ID_TARGA_Y216 = 200;
-    public static final int AV_CODEC_ID_YUV4 = 201;
-    public static final int AV_CODEC_ID_AVRN = 202;
-    public static final int AV_CODEC_ID_CPIA = 203;
-    public static final int AV_CODEC_ID_XFACE = 204;
-    public static final int AV_CODEC_ID_SNOW = 205;
-    public static final int AV_CODEC_ID_SMVJPEG = 206;
-    public static final int AV_CODEC_ID_APNG = 207;
-    public static final int AV_CODEC_ID_DAALA = 208;
-    public static final int AV_CODEC_ID_CFHD = 209;
-    public static final int AV_CODEC_ID_TRUEMOTION2RT = 210;
-    public static final int AV_CODEC_ID_M101 = 211;
-    public static final int AV_CODEC_ID_MAGICYUV = 212;
-    public static final int AV_CODEC_ID_SHEERVIDEO = 213;
-    public static final int AV_CODEC_ID_YLC = 214;
-    public static final int AV_CODEC_ID_PSD = 215;
-    public static final int AV_CODEC_ID_PIXLET = 216;
-    public static final int AV_CODEC_ID_SPEEDHQ = 217;
-    public static final int AV_CODEC_ID_FMVC = 218;
-    public static final int AV_CODEC_ID_SCPR = 219;
-    public static final int AV_CODEC_ID_CLEARVIDEO = 220;
-    public static final int AV_CODEC_ID_XPM = 221;
-    public static final int AV_CODEC_ID_AV1 = 222;
-    public static final int AV_CODEC_ID_BITPACKED = 223;
-    public static final int AV_CODEC_ID_MSCC = 224;
-    public static final int AV_CODEC_ID_SRGC = 225;
-    public static final int AV_CODEC_ID_SVG = 226;
-    public static final int AV_CODEC_ID_GDV = 227;
-    public static final int AV_CODEC_ID_FITS = 228;
-    public static final int AV_CODEC_ID_IMM4 = 229;
-    public static final int AV_CODEC_ID_PROSUMER = 230;
-    public static final int AV_CODEC_ID_MWSC = 231;
-    public static final int AV_CODEC_ID_WCMV = 232;
-    public static final int AV_CODEC_ID_RASC = 233;
-    public static final int AV_CODEC_ID_HYMT = 234;
-    public static final int AV_CODEC_ID_ARBC = 235;
-    public static final int AV_CODEC_ID_AGM = 236;
-    public static final int AV_CODEC_ID_LSCR = 237;
-    public static final int AV_CODEC_ID_VP4 = 238;
-    public static final int AV_CODEC_ID_IMM5 = 239;
-    public static final int AV_CODEC_ID_MVDV = 240;
-    public static final int AV_CODEC_ID_MVHA = 241;
-    public static final int AV_CODEC_ID_CDTOONS = 242;
-    public static final int AV_CODEC_ID_MV30 = 243;
-    public static final int AV_CODEC_ID_NOTCHLC = 244;
-    public static final int AV_CODEC_ID_PFM = 245;
-    public static final int AV_CODEC_ID_MOBICLIP = 246;
-    public static final int AV_CODEC_ID_PHOTOCD = 247;
-    public static final int AV_CODEC_ID_IPU = 248;
-    public static final int AV_CODEC_ID_ARGO = 249;
-    public static final int AV_CODEC_ID_CRI = 250;
-    public static final int AV_CODEC_ID_SIMBIOSIS_IMX = 251;
-    public static final int AV_CODEC_ID_SGA_VIDEO = 252;
-    public static final int AV_CODEC_ID_GEM = 253;
-    public static final int AV_CODEC_ID_VBN = 254;
-    public static final int AV_CODEC_ID_JPEGXL = 255;
-    public static final int AV_CODEC_ID_QOI = 256;
-    public static final int AV_CODEC_ID_PHM = 257;
-    public static final int AV_CODEC_ID_RADIANCE_HDR = 258;
-    public static final int AV_CODEC_ID_WBMP = 259;
-    public static final int AV_CODEC_ID_MEDIA100 = 260;
-    public static final int AV_CODEC_ID_VQC = 261;
-    public static final int AV_CODEC_ID_PDV = 262;
-    public static final int AV_CODEC_ID_EVC = 263;
-    public static final int AV_CODEC_ID_RTV1 = 264;
-    public static final int AV_CODEC_ID_VMIX = 265;
-    public static final int AV_CODEC_ID_LEAD = 266;
-    public static final int AV_CODEC_ID_DNXUC = 267;
-    public static final int AV_CODEC_ID_RV60 = 268;
-    public static final int AV_CODEC_ID_JPEGXL_ANIM = 269;
-    public static final int AV_CODEC_ID_APV = 270;
-    public static final int AV_CODEC_ID_PRORES_RAW = 271;
-    public static final int AV_CODEC_ID_JPEGXS = 272;
-    public static final int AV_CODEC_ID_WEBP_ANIM = 273;
-    public static final int AV_CODEC_ID_ASTC = 274;
-    public static final int AV_CODEC_ID_RW2 = 275;
-    public static final int AV_CODEC_ID_IMM6 = 276;
-    /* Audio: PCM codecs */
-    public static final int AV_CODEC_ID_FIRST_AUDIO = 0x10000; // = 65536
-    public static final int AV_CODEC_ID_PCM_S16LE = 0x10000; // = 65536
-    public static final int AV_CODEC_ID_PCM_S16BE = 0x10001; // = 65537
-    public static final int AV_CODEC_ID_PCM_U16LE = 0x10002; // = 65538
-    public static final int AV_CODEC_ID_PCM_U16BE = 0x10003; // = 65539
-    public static final int AV_CODEC_ID_PCM_S8 = 0x10004; // = 65540
-    public static final int AV_CODEC_ID_PCM_U8 = 0x10005; // = 65541
-    public static final int AV_CODEC_ID_PCM_MULAW = 0x10006; // = 65542
-    public static final int AV_CODEC_ID_PCM_ALAW = 0x10007; // = 65543
-    public static final int AV_CODEC_ID_PCM_S32LE = 0x10008; // = 65544
-    public static final int AV_CODEC_ID_PCM_S32BE = 0x10009; // = 65545
-    public static final int AV_CODEC_ID_PCM_U32LE = 0x1000A; // = 65546
-    public static final int AV_CODEC_ID_PCM_U32BE = 0x1000B; // = 65547
-    public static final int AV_CODEC_ID_PCM_S24LE = 0x1000C; // = 65548
-    public static final int AV_CODEC_ID_PCM_S24BE = 0x1000D; // = 65549
-    public static final int AV_CODEC_ID_PCM_U24LE = 0x1000E; // = 65550
-    public static final int AV_CODEC_ID_PCM_U24BE = 0x1000F; // = 65551
-    public static final int AV_CODEC_ID_PCM_S24DAUD = 0x10010; // = 65552
-    public static final int AV_CODEC_ID_PCM_ZORK = 0x10011; // = 65553
-    public static final int AV_CODEC_ID_PCM_S16LE_PLANAR = 0x10012; // = 65554
-    public static final int AV_CODEC_ID_PCM_DVD = 0x10013; // = 65555
-    public static final int AV_CODEC_ID_PCM_F32BE = 0x10014; // = 65556
-    public static final int AV_CODEC_ID_PCM_F32LE = 0x10015; // = 65557
-    public static final int AV_CODEC_ID_PCM_F64BE = 0x10016; // = 65558
-    public static final int AV_CODEC_ID_PCM_F64LE = 0x10017; // = 65559
-    public static final int AV_CODEC_ID_PCM_BLURAY = 0x10018; // = 65560
-    public static final int AV_CODEC_ID_PCM_LXF = 0x10019; // = 65561
-    public static final int AV_CODEC_ID_S302M = 0x1001A; // = 65562
-    public static final int AV_CODEC_ID_PCM_S8_PLANAR = 0x1001B; // = 65563
-    public static final int AV_CODEC_ID_PCM_S24LE_PLANAR = 0x1001C; // = 65564
-    public static final int AV_CODEC_ID_PCM_S32LE_PLANAR = 0x1001D; // = 65565
-    public static final int AV_CODEC_ID_PCM_S16BE_PLANAR = 0x1001E; // = 65566
-    public static final int AV_CODEC_ID_PCM_S64LE = 0x1001F; // = 65567
-    public static final int AV_CODEC_ID_PCM_S64BE = 0x10020; // = 65568
-    public static final int AV_CODEC_ID_PCM_F16LE = 0x10021; // = 65569
-    public static final int AV_CODEC_ID_PCM_F24LE = 0x10022; // = 65570
-    public static final int AV_CODEC_ID_PCM_VIDC = 0x10023; // = 65571
-    public static final int AV_CODEC_ID_PCM_SGA = 0x10024; // = 65572
-    public static final int AV_CODEC_ID_PCM_DVDA = 0x10025; // = 65573
-    /* Audio: ADPCM codecs */
-    public static final int AV_CODEC_ID_ADPCM_IMA_QT = 0x11000; // = 69632
-    public static final int AV_CODEC_ID_ADPCM_IMA_WAV = 0x11001; // = 69633
-    public static final int AV_CODEC_ID_ADPCM_IMA_DK3 = 0x11002; // = 69634
-    public static final int AV_CODEC_ID_ADPCM_IMA_DK4 = 0x11003; // = 69635
-    public static final int AV_CODEC_ID_ADPCM_IMA_WS = 0x11004; // = 69636
-    public static final int AV_CODEC_ID_ADPCM_IMA_SMJPEG = 0x11005; // = 69637
-    public static final int AV_CODEC_ID_ADPCM_MS = 0x11006; // = 69638
-    public static final int AV_CODEC_ID_ADPCM_4XM = 0x11007; // = 69639
-    public static final int AV_CODEC_ID_ADPCM_XA = 0x11008; // = 69640
-    public static final int AV_CODEC_ID_ADPCM_ADX = 0x11009; // = 69641
-    public static final int AV_CODEC_ID_ADPCM_EA = 0x1100A; // = 69642
-    public static final int AV_CODEC_ID_ADPCM_G726 = 0x1100B; // = 69643
-    public static final int AV_CODEC_ID_ADPCM_CT = 0x1100C; // = 69644
-    public static final int AV_CODEC_ID_ADPCM_SWF = 0x1100D; // = 69645
-    public static final int AV_CODEC_ID_ADPCM_YAMAHA = 0x1100E; // = 69646
-    public static final int AV_CODEC_ID_ADPCM_SBPRO_4 = 0x1100F; // = 69647
-    public static final int AV_CODEC_ID_ADPCM_SBPRO_3 = 0x11010; // = 69648
-    public static final int AV_CODEC_ID_ADPCM_SBPRO_2 = 0x11011; // = 69649
-    public static final int AV_CODEC_ID_ADPCM_THP = 0x11012; // = 69650
-    public static final int AV_CODEC_ID_ADPCM_IMA_AMV = 0x11013; // = 69651
-    public static final int AV_CODEC_ID_ADPCM_EA_R1 = 0x11014; // = 69652
-    public static final int AV_CODEC_ID_ADPCM_EA_R3 = 0x11015; // = 69653
-    public static final int AV_CODEC_ID_ADPCM_EA_R2 = 0x11016; // = 69654
-    public static final int AV_CODEC_ID_ADPCM_IMA_EA_SEAD = 0x11017; // = 69655
-    public static final int AV_CODEC_ID_ADPCM_IMA_EA_EACS = 0x11018; // = 69656
-    public static final int AV_CODEC_ID_ADPCM_EA_XAS = 0x11019; // = 69657
-    public static final int AV_CODEC_ID_ADPCM_EA_MAXIS_XA = 0x1101A; // = 69658
-    public static final int AV_CODEC_ID_ADPCM_IMA_ISS = 0x1101B; // = 69659
-    public static final int AV_CODEC_ID_ADPCM_G722 = 0x1101C; // = 69660
-    public static final int AV_CODEC_ID_ADPCM_IMA_APC = 0x1101D; // = 69661
-    public static final int AV_CODEC_ID_ADPCM_VIMA = 0x1101E; // = 69662
-    public static final int AV_CODEC_ID_ADPCM_AFC = 0x1101F; // = 69663
-    public static final int AV_CODEC_ID_ADPCM_IMA_OKI = 0x11020; // = 69664
-    public static final int AV_CODEC_ID_ADPCM_DTK = 0x11021; // = 69665
-    public static final int AV_CODEC_ID_ADPCM_IMA_RAD = 0x11022; // = 69666
-    public static final int AV_CODEC_ID_ADPCM_G726LE = 0x11023; // = 69667
-    public static final int AV_CODEC_ID_ADPCM_THP_LE = 0x11024; // = 69668
-    public static final int AV_CODEC_ID_ADPCM_PSX = 0x11025; // = 69669
-    public static final int AV_CODEC_ID_ADPCM_AICA = 0x11026; // = 69670
-    public static final int AV_CODEC_ID_ADPCM_IMA_DAT4 = 0x11027; // = 69671
-    public static final int AV_CODEC_ID_ADPCM_MTAF = 0x11028; // = 69672
-    public static final int AV_CODEC_ID_ADPCM_AGM = 0x11029; // = 69673
-    public static final int AV_CODEC_ID_ADPCM_ARGO = 0x1102A; // = 69674
-    public static final int AV_CODEC_ID_ADPCM_IMA_SSI = 0x1102B; // = 69675
-    public static final int AV_CODEC_ID_ADPCM_ZORK = 0x1102C; // = 69676
-    public static final int AV_CODEC_ID_ADPCM_IMA_APM = 0x1102D; // = 69677
-    public static final int AV_CODEC_ID_ADPCM_IMA_ALP = 0x1102E; // = 69678
-    public static final int AV_CODEC_ID_ADPCM_IMA_MTF = 0x1102F; // = 69679
-    public static final int AV_CODEC_ID_ADPCM_IMA_CUNNING = 0x11030; // = 69680
-    public static final int AV_CODEC_ID_ADPCM_IMA_MOFLEX = 0x11031; // = 69681
-    public static final int AV_CODEC_ID_ADPCM_IMA_ACORN = 0x11032; // = 69682
-    public static final int AV_CODEC_ID_ADPCM_XMD = 0x11033; // = 69683
-    public static final int AV_CODEC_ID_ADPCM_IMA_XBOX = 0x11034; // = 69684
-    public static final int AV_CODEC_ID_ADPCM_SANYO = 0x11035; // = 69685
-    public static final int AV_CODEC_ID_ADPCM_IMA_HVQM4 = 0x11036; // = 69686
-    public static final int AV_CODEC_ID_ADPCM_IMA_PDA = 0x11037; // = 69687
-    public static final int AV_CODEC_ID_ADPCM_N64 = 0x11038; // = 69688
-    public static final int AV_CODEC_ID_ADPCM_IMA_HVQM2 = 0x11039; // = 69689
-    public static final int AV_CODEC_ID_ADPCM_IMA_MAGIX = 0x1103A; // = 69690
-    public static final int AV_CODEC_ID_ADPCM_PSXC = 0x1103B; // = 69691
-    public static final int AV_CODEC_ID_ADPCM_CIRCUS = 0x1103C; // = 69692
-    public static final int AV_CODEC_ID_ADPCM_IMA_ESCAPE = 0x1103D; // = 69693
-    public static final int AV_CODEC_ID_ADPCM_RHETOREX = 0x1103E; // = 69694
-    public static final int AV_CODEC_ID_ADPCM_IMA_CITRIX = 0x1103F; // = 69695
-    /* Audio: AMR */
-    public static final int AV_CODEC_ID_AMR_NB = 0x12000; // = 73728
-    public static final int AV_CODEC_ID_AMR_WB = 0x12001; // = 73729
-    /* Audio: RealAudio */
-    public static final int AV_CODEC_ID_RA_144 = 0x13000; // = 77824
-    public static final int AV_CODEC_ID_RA_288 = 0x13001; // = 77825
-    /* Audio: DPCM codecs */
-    public static final int AV_CODEC_ID_ROQ_DPCM = 0x14000; // = 81920
-    public static final int AV_CODEC_ID_INTERPLAY_DPCM = 0x14001; // = 81921
-    public static final int AV_CODEC_ID_XAN_DPCM = 0x14002; // = 81922
-    public static final int AV_CODEC_ID_SOL_DPCM = 0x14003; // = 81923
-    public static final int AV_CODEC_ID_SDX2_DPCM = 0x14004; // = 81924
-    public static final int AV_CODEC_ID_GREMLIN_DPCM = 0x14005; // = 81925
-    public static final int AV_CODEC_ID_DERF_DPCM = 0x14006; // = 81926
-    public static final int AV_CODEC_ID_WADY_DPCM = 0x14007; // = 81927
-    public static final int AV_CODEC_ID_CBD2_DPCM = 0x14008; // = 81928
-    /* Audio codecs */
-    public static final int AV_CODEC_ID_MP2 = 0x15000; // = 86016
-    public static final int AV_CODEC_ID_MP3 = 0x15001; // = 86017
-    public static final int AV_CODEC_ID_AAC = 0x15002; // = 86018
-    public static final int AV_CODEC_ID_AC3 = 0x15003; // = 86019
-    public static final int AV_CODEC_ID_DTS = 0x15004; // = 86020
-    public static final int AV_CODEC_ID_VORBIS = 0x15005; // = 86021
-    public static final int AV_CODEC_ID_DVAUDIO = 0x15006; // = 86022
-    public static final int AV_CODEC_ID_WMAV1 = 0x15007; // = 86023
-    public static final int AV_CODEC_ID_WMAV2 = 0x15008; // = 86024
-    public static final int AV_CODEC_ID_MACE3 = 0x15009; // = 86025
-    public static final int AV_CODEC_ID_MACE6 = 0x1500A; // = 86026
-    public static final int AV_CODEC_ID_VMDAUDIO = 0x1500B; // = 86027
-    public static final int AV_CODEC_ID_FLAC = 0x1500C; // = 86028
-    public static final int AV_CODEC_ID_MP3ADU = 0x1500D; // = 86029
-    public static final int AV_CODEC_ID_MP3ON4 = 0x1500E; // = 86030
-    public static final int AV_CODEC_ID_SHORTEN = 0x1500F; // = 86031
-    public static final int AV_CODEC_ID_ALAC = 0x15010; // = 86032
-    public static final int AV_CODEC_ID_WESTWOOD_SND1 = 0x15011; // = 86033
-    public static final int AV_CODEC_ID_GSM = 0x15012; // = 86034
-    public static final int AV_CODEC_ID_QDM2 = 0x15013; // = 86035
-    public static final int AV_CODEC_ID_COOK = 0x15014; // = 86036
-    public static final int AV_CODEC_ID_TRUESPEECH = 0x15015; // = 86037
-    public static final int AV_CODEC_ID_TTA = 0x15016; // = 86038
-    public static final int AV_CODEC_ID_SMACKAUDIO = 0x15017; // = 86039
-    public static final int AV_CODEC_ID_QCELP = 0x15018; // = 86040
-    public static final int AV_CODEC_ID_WAVPACK = 0x15019; // = 86041
-    public static final int AV_CODEC_ID_DSICINAUDIO = 0x1501A; // = 86042
-    public static final int AV_CODEC_ID_IMC = 0x1501B; // = 86043
-    public static final int AV_CODEC_ID_MUSEPACK7 = 0x1501C; // = 86044
-    public static final int AV_CODEC_ID_MLP = 0x1501D; // = 86045
-    public static final int AV_CODEC_ID_GSM_MS = 0x1501E; // = 86046
-    public static final int AV_CODEC_ID_ATRAC3 = 0x1501F; // = 86047
-    public static final int AV_CODEC_ID_APE = 0x15020; // = 86048
-    public static final int AV_CODEC_ID_NELLYMOSER = 0x15021; // = 86049
-    public static final int AV_CODEC_ID_MUSEPACK8 = 0x15022; // = 86050
-    public static final int AV_CODEC_ID_SPEEX = 0x15023; // = 86051
-    public static final int AV_CODEC_ID_WMAVOICE = 0x15024; // = 86052
-    public static final int AV_CODEC_ID_WMAPRO = 0x15025; // = 86053
-    public static final int AV_CODEC_ID_WMALOSSLESS = 0x15026; // = 86054
-    public static final int AV_CODEC_ID_ATRAC3P = 0x15027; // = 86055
-    public static final int AV_CODEC_ID_EAC3 = 0x15028; // = 86056
-    public static final int AV_CODEC_ID_SIPR = 0x15029; // = 86057
-    public static final int AV_CODEC_ID_MP1 = 0x1502A; // = 86058
-    public static final int AV_CODEC_ID_TWINVQ = 0x1502B; // = 86059
-    public static final int AV_CODEC_ID_TRUEHD = 0x1502C; // = 86060
-    public static final int AV_CODEC_ID_MP4ALS = 0x1502D; // = 86061
-    public static final int AV_CODEC_ID_ATRAC1 = 0x1502E; // = 86062
-    public static final int AV_CODEC_ID_BINKAUDIO_RDFT = 0x1502F; // = 86063
-    public static final int AV_CODEC_ID_BINKAUDIO_DCT = 0x15030; // = 86064
-    public static final int AV_CODEC_ID_AAC_LATM = 0x15031; // = 86065
-    public static final int AV_CODEC_ID_QDMC = 0x15032; // = 86066
-    public static final int AV_CODEC_ID_CELT = 0x15033; // = 86067
-    public static final int AV_CODEC_ID_G723_1 = 0x15034; // = 86068
-    public static final int AV_CODEC_ID_G729 = 0x15035; // = 86069
-    public static final int AV_CODEC_ID_8SVX_EXP = 0x15036; // = 86070
-    public static final int AV_CODEC_ID_8SVX_FIB = 0x15037; // = 86071
-    public static final int AV_CODEC_ID_BMV_AUDIO = 0x15038; // = 86072
-    public static final int AV_CODEC_ID_RALF = 0x15039; // = 86073
-    public static final int AV_CODEC_ID_IAC = 0x1503A; // = 86074
-    public static final int AV_CODEC_ID_ILBC = 0x1503B; // = 86075
-    public static final int AV_CODEC_ID_OPUS = 0x1503C; // = 86076
-    public static final int AV_CODEC_ID_COMFORT_NOISE = 0x1503D; // = 86077
-    public static final int AV_CODEC_ID_TAK = 0x1503E; // = 86078
-    public static final int AV_CODEC_ID_METASOUND = 0x1503F; // = 86079
-    public static final int AV_CODEC_ID_PAF_AUDIO = 0x15040; // = 86080
-    public static final int AV_CODEC_ID_ON2AVC = 0x15041; // = 86081
-    public static final int AV_CODEC_ID_DSS_SP = 0x15042; // = 86082
-    public static final int AV_CODEC_ID_CODEC2 = 0x15043; // = 86083
-    public static final int AV_CODEC_ID_FFWAVESYNTH = 0x15044; // = 86084
-    public static final int AV_CODEC_ID_SONIC = 0x15045; // = 86085
-    public static final int AV_CODEC_ID_SONIC_LS = 0x15046; // = 86086
-    public static final int AV_CODEC_ID_EVRC = 0x15047; // = 86087
-    public static final int AV_CODEC_ID_SMV = 0x15048; // = 86088
-    public static final int AV_CODEC_ID_DSD_LSBF = 0x15049; // = 86089
-    public static final int AV_CODEC_ID_DSD_MSBF = 0x1504A; // = 86090
-    public static final int AV_CODEC_ID_DSD_LSBF_PLANAR = 0x1504B; // = 86091
-    public static final int AV_CODEC_ID_DSD_MSBF_PLANAR = 0x1504C; // = 86092
-    public static final int AV_CODEC_ID_4GV = 0x1504D; // = 86093
-    public static final int AV_CODEC_ID_INTERPLAY_ACM = 0x1504E; // = 86094
-    public static final int AV_CODEC_ID_XMA1 = 0x1504F; // = 86095
-    public static final int AV_CODEC_ID_XMA2 = 0x15050; // = 86096
-    public static final int AV_CODEC_ID_DST = 0x15051; // = 86097
-    public static final int AV_CODEC_ID_ATRAC3AL = 0x15052; // = 86098
-    public static final int AV_CODEC_ID_ATRAC3PAL = 0x15053; // = 86099
-    public static final int AV_CODEC_ID_DOLBY_E = 0x15054; // = 86100
-    public static final int AV_CODEC_ID_APTX = 0x15055; // = 86101
-    public static final int AV_CODEC_ID_APTX_HD = 0x15056; // = 86102
-    public static final int AV_CODEC_ID_SBC = 0x15057; // = 86103
-    public static final int AV_CODEC_ID_ATRAC9 = 0x15058; // = 86104
-    public static final int AV_CODEC_ID_HCOM = 0x15059; // = 86105
-    public static final int AV_CODEC_ID_ACELP_KELVIN = 0x1505A; // = 86106
-    public static final int AV_CODEC_ID_MPEGH_3D_AUDIO = 0x1505B; // = 86107
-    public static final int AV_CODEC_ID_SIREN = 0x1505C; // = 86108
-    public static final int AV_CODEC_ID_HCA = 0x1505D; // = 86109
-    public static final int AV_CODEC_ID_FASTAUDIO = 0x1505E; // = 86110
-    public static final int AV_CODEC_ID_MSNSIREN = 0x1505F; // = 86111
-    public static final int AV_CODEC_ID_DFPWM = 0x15060; // = 86112
-    public static final int AV_CODEC_ID_BONK = 0x15061; // = 86113
-    public static final int AV_CODEC_ID_MISC4 = 0x15062; // = 86114
-    public static final int AV_CODEC_ID_APAC = 0x15063; // = 86115
-    public static final int AV_CODEC_ID_FTR = 0x15064; // = 86116
-    public static final int AV_CODEC_ID_WAVARC = 0x15065; // = 86117
-    public static final int AV_CODEC_ID_RKA = 0x15066; // = 86118
-    public static final int AV_CODEC_ID_AC4 = 0x15067; // = 86119
-    public static final int AV_CODEC_ID_OSQ = 0x15068; // = 86120
-    public static final int AV_CODEC_ID_QOA = 0x15069; // = 86121
-    public static final int AV_CODEC_ID_LC3 = 0x1506A; // = 86122
-    public static final int AV_CODEC_ID_G728 = 0x1506B; // = 86123
-    public static final int AV_CODEC_ID_AHX = 0x1506C; // = 86124
-    public static final int AV_CODEC_ID_APPLE_APAC = 0x1506D; // = 86125
-    /* Subtitle codecs */
-    public static final int AV_CODEC_ID_FIRST_SUBTITLE = 0x17000; // = 94208
-    public static final int AV_CODEC_ID_DVD_SUBTITLE = 0x17000; // = 94208
-    public static final int AV_CODEC_ID_DVB_SUBTITLE = 0x17001; // = 94209
-    public static final int AV_CODEC_ID_TEXT = 0x17002; // = 94210
-    public static final int AV_CODEC_ID_XSUB = 0x17003; // = 94211
-    public static final int AV_CODEC_ID_SSA = 0x17004; // = 94212
-    public static final int AV_CODEC_ID_MOV_TEXT = 0x17005; // = 94213
-    public static final int AV_CODEC_ID_HDMV_PGS_SUBTITLE = 0x17006; // = 94214
-    public static final int AV_CODEC_ID_DVB_TELETEXT = 0x17007; // = 94215
-    public static final int AV_CODEC_ID_SRT = 0x17008; // = 94216
-    public static final int AV_CODEC_ID_MICRODVD = 0x17009; // = 94217
-    public static final int AV_CODEC_ID_EIA_608 = 0x1700A; // = 94218
-    public static final int AV_CODEC_ID_JACOSUB = 0x1700B; // = 94219
-    public static final int AV_CODEC_ID_SAMI = 0x1700C; // = 94220
-    public static final int AV_CODEC_ID_REALTEXT = 0x1700D; // = 94221
-    public static final int AV_CODEC_ID_STL = 0x1700E; // = 94222
-    public static final int AV_CODEC_ID_SUBVIEWER1 = 0x1700F; // = 94223
-    public static final int AV_CODEC_ID_SUBVIEWER = 0x17010; // = 94224
-    public static final int AV_CODEC_ID_SUBRIP = 0x17011; // = 94225
-    public static final int AV_CODEC_ID_WEBVTT = 0x17012; // = 94226
-    public static final int AV_CODEC_ID_MPL2 = 0x17013; // = 94227
-    public static final int AV_CODEC_ID_VPLAYER = 0x17014; // = 94228
-    public static final int AV_CODEC_ID_PJS = 0x17015; // = 94229
-    public static final int AV_CODEC_ID_ASS = 0x17016; // = 94230
-    public static final int AV_CODEC_ID_HDMV_TEXT_SUBTITLE = 0x17017; // = 94231
-    public static final int AV_CODEC_ID_TTML = 0x17018; // = 94232
-    public static final int AV_CODEC_ID_ARIB_CAPTION = 0x17019; // = 94233
-    public static final int AV_CODEC_ID_IVTV_VBI = 0x1701A; // = 94234
-    /* Other / attachments */
-    public static final int AV_CODEC_ID_FIRST_UNKNOWN = 0x18000; // = 98304
-    public static final int AV_CODEC_ID_TTF = 0x18000; // = 98304
-    public static final int AV_CODEC_ID_SCTE_35 = 0x18001; // = 98305
-    public static final int AV_CODEC_ID_EPG = 0x18002; // = 98306
-    public static final int AV_CODEC_ID_BINTEXT = 0x18003; // = 98307
-    public static final int AV_CODEC_ID_XBIN = 0x18004; // = 98308
-    public static final int AV_CODEC_ID_IDF = 0x18005; // = 98309
-    public static final int AV_CODEC_ID_OTF = 0x18006; // = 98310
-    public static final int AV_CODEC_ID_SMPTE_KLV = 0x18007; // = 98311
-    public static final int AV_CODEC_ID_DVD_NAV = 0x18008; // = 98312
-    public static final int AV_CODEC_ID_TIMED_ID3 = 0x18009; // = 98313
-    public static final int AV_CODEC_ID_BIN_DATA = 0x1800A; // = 98314
-    public static final int AV_CODEC_ID_SMPTE_2038 = 0x1800B; // = 98315
-    public static final int AV_CODEC_ID_LCEVC = 0x1800C; // = 98316
-    public static final int AV_CODEC_ID_SMPTE_436M_ANC = 0x1800D; // = 98317
-    public static final int AV_CODEC_ID_ITUT_T35 = 0x1800E; // = 98318
-    /* Probe / fake / null codecs */
-    public static final int AV_CODEC_ID_PROBE = 0x19000; // = 102400
-    public static final int AV_CODEC_ID_MPEG2TS = 0x20000; // = 131072
-    public static final int AV_CODEC_ID_MPEG4SYSTEMS = 0x20001; // = 131073
-    public static final int AV_CODEC_ID_FFMETADATA = 0x21000; // = 135168
-    public static final int AV_CODEC_ID_WRAPPED_AVFRAME = 0x21001; // = 135169
-    public static final int AV_CODEC_ID_VNULL = 0x21002; // = 135170
-    public static final int AV_CODEC_ID_ANULL = 0x21003; // = 135171
-
-    /** @deprecated alias kept for parity with {@code AV_CODEC_ID_IFF_ILBM}. */
-    @Deprecated
-    public static final int AV_CODEC_ID_IFF_BYTERUN1 = AV_CODEC_ID_IFF_ILBM;
-
-    /** @deprecated alias kept for parity with {@code AV_CODEC_ID_HEVC}. */
-    @Deprecated
-    public static final int AV_CODEC_ID_H265 = AV_CODEC_ID_HEVC;
-
-    /** @deprecated alias kept for parity with {@code AV_CODEC_ID_VVC}. */
-    @Deprecated
-    public static final int AV_CODEC_ID_H266 = AV_CODEC_ID_VVC;
-
-    /**
-     * Misc codec constants mirrored from {@code libavcodec/defs.h}: input
-     * padding, error-detection flags, compliance levels, every codec profile
-     * ({@code AV_PROFILE_*}), level, field order, discard levels and audio
-     * service types. Values match the native macros/enums.
-     *
-     * <p>The {@code AV_PROFILE_*} set is the full list from {@code defs.h};
-     * for compressed-bitstream passthrough the relevant ones are the audio
-     * profiles (e.g. {@link #AV_PROFILE_DTS}, {@link #AV_PROFILE_EAC3_DDP_ATMOS})
-     * and the AAC profiles ({@link #AV_PROFILE_AAC_LOW} for ADTS packing).
-     */
-    public static final int AV_INPUT_BUFFER_PADDING_SIZE = 64;
-
-    /** Error-detection flags, {@code AV_EF_*}. */
-    public static final int AV_EF_CRCCHECK   = 1;
-    public static final int AV_EF_BITSTREAM  = 2;
-    public static final int AV_EF_BUFFER     = 4;
-    public static final int AV_EF_EXPLODE    = 8;
-    public static final int AV_EF_IGNORE_ERR = 0x8000;  // = 32768
-    public static final int AV_EF_CAREFUL    = 0x10000; // = 65536
-    public static final int AV_EF_COMPLIANT  = 0x20000; // = 131072
-    public static final int AV_EF_AGGRESSIVE = 0x40000; // = 262144
-
-    /** Compliance levels, {@code FF_COMPLIANCE_*}. */
-    public static final int FF_COMPLIANCE_VERY_STRICT = 2;
-    public static final int FF_COMPLIANCE_STRICT       = 1;
-    public static final int FF_COMPLIANCE_NORMAL       = 0;
-    public static final int FF_COMPLIANCE_UNOFFICIAL   = -1;
-    public static final int FF_COMPLIANCE_EXPERIMENTAL = -2;
-
-    /** Codec profiles, every {@code AV_PROFILE_*} from {@code libavcodec/defs.h}. */
-    public static final int AV_PROFILE_AAC_ELD = 38;
-    public static final int AV_PROFILE_AAC_HE = 4;
-    public static final int AV_PROFILE_AAC_HE_V2 = 28;
-    public static final int AV_PROFILE_AAC_LD = 22;
-    public static final int AV_PROFILE_AAC_LOW = 1;
-    public static final int AV_PROFILE_AAC_LTP = 3;
-    public static final int AV_PROFILE_AAC_MAIN = 0;
-    public static final int AV_PROFILE_AAC_SSR = 2;
-    public static final int AV_PROFILE_AAC_USAC = 41;
-    public static final int AV_PROFILE_APV_400_10 = 99;
-    public static final int AV_PROFILE_APV_422_10 = 33;
-    public static final int AV_PROFILE_APV_422_12 = 44;
-    public static final int AV_PROFILE_APV_444_10 = 55;
-    public static final int AV_PROFILE_APV_444_12 = 66;
-    public static final int AV_PROFILE_APV_4444_10 = 77;
-    public static final int AV_PROFILE_APV_4444_12 = 88;
-    public static final int AV_PROFILE_ARIB_PROFILE_A = 0;
-    public static final int AV_PROFILE_ARIB_PROFILE_C = 1;
-    public static final int AV_PROFILE_ASTC_HDR = 4;
-    public static final int AV_PROFILE_ASTC_HDR_RGB_LDR_A = 3;
-    public static final int AV_PROFILE_ASTC_LDR = 2;
-    public static final int AV_PROFILE_ASTC_LDR_SRGB = 1;
-    public static final int AV_PROFILE_ASTC_LINEAR_ANY = 5;
-    public static final int AV_PROFILE_AV1_HIGH = 1;
-    public static final int AV_PROFILE_AV1_MAIN = 0;
-    public static final int AV_PROFILE_AV1_PROFESSIONAL = 2;
-    public static final int AV_PROFILE_CAVS_BROADCASTING = 72;
-    public static final int AV_PROFILE_CAVS_JIZHUN = 32;
-    public static final int AV_PROFILE_DNXHD = 0;
-    public static final int AV_PROFILE_DNXHR_444 = 5;
-    public static final int AV_PROFILE_DNXHR_HQ = 3;
-    public static final int AV_PROFILE_DNXHR_HQX = 4;
-    public static final int AV_PROFILE_DNXHR_LB = 1;
-    public static final int AV_PROFILE_DNXHR_SQ = 2;
-    public static final int AV_PROFILE_DTS = 20;
-    public static final int AV_PROFILE_DTS_96_24 = 40;
-    public static final int AV_PROFILE_DTS_ES = 30;
-    public static final int AV_PROFILE_DTS_EXPRESS = 70;
-    public static final int AV_PROFILE_DTS_HD_HRA = 50;
-    public static final int AV_PROFILE_DTS_HD_MA = 60;
-    public static final int AV_PROFILE_DTS_HD_MA_X = 61;
-    public static final int AV_PROFILE_DTS_HD_MA_X_IMAX = 62;
-    public static final int AV_PROFILE_EAC3_DDP_ATMOS = 30;
-    public static final int AV_PROFILE_EVC_BASELINE = 0;
-    public static final int AV_PROFILE_EVC_MAIN = 1;
-    public static final int AV_PROFILE_H264_BASELINE = 66;
-    public static final int AV_PROFILE_H264_CAVLC_444 = 44;
-    public static final int AV_PROFILE_H264_CONSTRAINED = 512;
-    public static final int AV_PROFILE_H264_CONSTRAINED_BASELINE = 578;
-    public static final int AV_PROFILE_H264_EXTENDED = 88;
-    public static final int AV_PROFILE_H264_HIGH = 100;
-    public static final int AV_PROFILE_H264_HIGH_10 = 110;
-    public static final int AV_PROFILE_H264_HIGH_10_INTRA = 2158;
-    public static final int AV_PROFILE_H264_HIGH_422 = 122;
-    public static final int AV_PROFILE_H264_HIGH_422_INTRA = 2170;
-    public static final int AV_PROFILE_H264_HIGH_444 = 144;
-    public static final int AV_PROFILE_H264_HIGH_444_INTRA = 2292;
-    public static final int AV_PROFILE_H264_HIGH_444_PREDICTIVE = 244;
-    public static final int AV_PROFILE_H264_INTRA = 2048;
-    public static final int AV_PROFILE_H264_MAIN = 77;
-    public static final int AV_PROFILE_H264_MULTIVIEW_HIGH = 118;
-    public static final int AV_PROFILE_H264_STEREO_HIGH = 128;
-    public static final int AV_PROFILE_HEVC_MAIN = 1;
-    public static final int AV_PROFILE_HEVC_MAIN_10 = 2;
-    public static final int AV_PROFILE_HEVC_MAIN_STILL_PICTURE = 3;
-    public static final int AV_PROFILE_HEVC_MULTIVIEW_MAIN = 6;
-    public static final int AV_PROFILE_HEVC_REXT = 4;
-    public static final int AV_PROFILE_HEVC_SCC = 9;
-    public static final int AV_PROFILE_JPEG2000_CSTREAM_NO_RESTRICTION = 0x8000; // = 32768
-    public static final int AV_PROFILE_JPEG2000_CSTREAM_RESTRICTION_0 = 1;
-    public static final int AV_PROFILE_JPEG2000_CSTREAM_RESTRICTION_1 = 2;
-    public static final int AV_PROFILE_JPEG2000_DCINEMA_2K = 3;
-    public static final int AV_PROFILE_JPEG2000_DCINEMA_4K = 4;
-    public static final int AV_PROFILE_KLVA_ASYNC = 1;
-    public static final int AV_PROFILE_KLVA_SYNC = 0;
-    public static final int AV_PROFILE_MJPEG_HUFFMAN_BASELINE_DCT = 192;
-    public static final int AV_PROFILE_MJPEG_HUFFMAN_EXTENDED_SEQUENTIAL_DCT = 193;
-    public static final int AV_PROFILE_MJPEG_HUFFMAN_LOSSLESS = 195;
-    public static final int AV_PROFILE_MJPEG_HUFFMAN_PROGRESSIVE_DCT = 194;
-    public static final int AV_PROFILE_MJPEG_JPEG_LS = 247;
-    public static final int AV_PROFILE_MPEG2_422 = 0;
-    public static final int AV_PROFILE_MPEG2_AAC_HE = 131;
-    public static final int AV_PROFILE_MPEG2_AAC_LOW = 128;
-    public static final int AV_PROFILE_MPEG2_HIGH = 1;
-    public static final int AV_PROFILE_MPEG2_MAIN = 4;
-    public static final int AV_PROFILE_MPEG2_SIMPLE = 5;
-    public static final int AV_PROFILE_MPEG2_SNR_SCALABLE = 3;
-    public static final int AV_PROFILE_MPEG2_SS = 2;
-    public static final int AV_PROFILE_MPEG4_ADVANCED_CODING = 11;
-    public static final int AV_PROFILE_MPEG4_ADVANCED_CORE = 12;
-    public static final int AV_PROFILE_MPEG4_ADVANCED_REAL_TIME = 9;
-    public static final int AV_PROFILE_MPEG4_ADVANCED_SCALABLE_TEXTURE = 13;
-    public static final int AV_PROFILE_MPEG4_ADVANCED_SIMPLE = 15;
-    public static final int AV_PROFILE_MPEG4_BASIC_ANIMATED_TEXTURE = 7;
-    public static final int AV_PROFILE_MPEG4_CORE = 2;
-    public static final int AV_PROFILE_MPEG4_CORE_SCALABLE = 10;
-    public static final int AV_PROFILE_MPEG4_HYBRID = 8;
-    public static final int AV_PROFILE_MPEG4_MAIN = 3;
-    public static final int AV_PROFILE_MPEG4_N_BIT = 4;
-    public static final int AV_PROFILE_MPEG4_SCALABLE_TEXTURE = 5;
-    public static final int AV_PROFILE_MPEG4_SIMPLE = 0;
-    public static final int AV_PROFILE_MPEG4_SIMPLE_FACE_ANIMATION = 6;
-    public static final int AV_PROFILE_MPEG4_SIMPLE_SCALABLE = 1;
-    public static final int AV_PROFILE_MPEG4_SIMPLE_STUDIO = 14;
-    public static final int AV_PROFILE_MPEGH_3DA_BL = 3;
-    public static final int AV_PROFILE_MPEGH_3DA_HIGH = 1;
-    public static final int AV_PROFILE_MPEGH_3DA_LC = 2;
-    public static final int AV_PROFILE_MPEGH_3DA_MAIN = 0;
-    public static final int AV_PROFILE_PRORES_4444 = 4;
-    public static final int AV_PROFILE_PRORES_HQ = 3;
-    public static final int AV_PROFILE_PRORES_LT = 1;
-    public static final int AV_PROFILE_PRORES_PROXY = 0;
-    public static final int AV_PROFILE_PRORES_RAW = 0;
-    public static final int AV_PROFILE_PRORES_RAW_HQ = 1;
-    public static final int AV_PROFILE_PRORES_STANDARD = 2;
-    public static final int AV_PROFILE_PRORES_XQ = 5;
-    public static final int AV_PROFILE_RESERVED = -100;
-    public static final int AV_PROFILE_SBC_MSBC = 1;
-    public static final int AV_PROFILE_TRUEHD_ATMOS = 30;
-    public static final int AV_PROFILE_UNKNOWN = -99;
-    public static final int AV_PROFILE_VC1_ADVANCED = 3;
-    public static final int AV_PROFILE_VC1_COMPLEX = 2;
-    public static final int AV_PROFILE_VC1_MAIN = 1;
-    public static final int AV_PROFILE_VC1_SIMPLE = 0;
-    public static final int AV_PROFILE_VP9_0 = 0;
-    public static final int AV_PROFILE_VP9_1 = 1;
-    public static final int AV_PROFILE_VP9_2 = 2;
-    public static final int AV_PROFILE_VP9_3 = 3;
-    public static final int AV_PROFILE_VVC_MAIN_10 = 1;
-    public static final int AV_PROFILE_VVC_MAIN_10_444 = 33;
-
-    /** Unknown level sentinel, {@code AV_LEVEL_UNKNOWN}. */
-    public static final int AV_LEVEL_UNKNOWN = -99;
-
-    /** Field-order values, {@code enum AVFieldOrder}. */
-    public static final int AV_FIELD_UNKNOWN     = 0;
-    public static final int AV_FIELD_PROGRESSIVE = 1;
-    public static final int AV_FIELD_TT          = 2;
-    public static final int AV_FIELD_BB          = 3;
-    public static final int AV_FIELD_TB          = 4;
-    public static final int AV_FIELD_BT          = 5;
-
-    /** Discard levels, {@code enum AVDiscard}. */
-    public static final int AVDISCARD_NONE    = -16;
-    public static final int AVDISCARD_DEFAULT = 0;
-    public static final int AVDISCARD_NONREF  = 8;
-    public static final int AVDISCARD_BIDIR   = 16;
-    public static final int AVDISCARD_NONINTRA = 24;
-    public static final int AVDISCARD_NONKEY  = 32;
-    public static final int AVDISCARD_ALL     = 48;
-
-    /** Audio service types, {@code enum AVAudioServiceType}. */
-    public static final int AV_AUDIO_SERVICE_TYPE_MAIN              = 0;
-    public static final int AV_AUDIO_SERVICE_TYPE_EFFECTS           = 1;
-    public static final int AV_AUDIO_SERVICE_TYPE_VISUALLY_IMPAIRED = 2;
-    public static final int AV_AUDIO_SERVICE_TYPE_HEARING_IMPAIRED  = 3;
-    public static final int AV_AUDIO_SERVICE_TYPE_DIALOGUE          = 4;
-    public static final int AV_AUDIO_SERVICE_TYPE_COMMENTARY        = 5;
-    public static final int AV_AUDIO_SERVICE_TYPE_EMERGENCY         = 6;
-    public static final int AV_AUDIO_SERVICE_TYPE_VOICE_OVER        = 7;
-    public static final int AV_AUDIO_SERVICE_TYPE_KARAOKE           = 8;
-    public static final int AV_AUDIO_SERVICE_TYPE_NB                = 9;
-
-    /**
-     * {@code ANativeWindow} buffer formats for
-     * {@link #windowRendererSetSize} (mirrors {@code AHardwareBuffer_Format}).
-     */
-    public static final int WINDOW_FORMAT_RGBA_8888 = 1;
-    public static final int WINDOW_FORMAT_RGBX_8888 = 2;
-    public static final int WINDOW_FORMAT_RGB_565    = 4;
-
-    /**
-     * Font-provider flags for {@link #assSetFonts} (libass
-     * {@code ASS_FONT_SELECT_*}).
-     */
-    public static final int ASS_FONT_SELECT_OFF    = 0;
-    public static final int ASS_FONT_SELECT_ENABLE = 1;
-    public static final int ASS_FONT_SELECT_INVERT = 2;
-
-    /** Codec-config enum values mirroring {@code enum AVCodecConfig} (use with {@link #codecGetSupportedConfigs}). */
-    public static final int AV_CODEC_CONFIG_PIX_FORMAT      = 0;
-    public static final int AV_CODEC_CONFIG_FRAME_RATE      = 1;
-    public static final int AV_CODEC_CONFIG_SAMPLE_RATE     = 2;
-    public static final int AV_CODEC_CONFIG_SAMPLE_FORMAT   = 3;
-    public static final int AV_CODEC_CONFIG_CHANNEL_LAYOUT  = 4;
-    public static final int AV_CODEC_CONFIG_COLOR_RANGE     = 5;
-    public static final int AV_CODEC_CONFIG_COLOR_SPACE     = 6;
-    public static final int AV_CODEC_CONFIG_ALPHA_MODE      = 7;
-
-    /** AVOption search flags, mirroring {@code AV_OPT_SEARCH_*}. */
-    public static final int AV_OPT_SEARCH_CHILDREN = 1 << 0;   /* 1  */
-    public static final int AV_OPT_SEARCH_FAKE_OBJ = 1 << 1;   /* 2  */
-
-    /** AVOption flag bits, mirroring {@code AV_OPT_FLAG_*}. */
-    public static final int AV_OPT_FLAG_ENCODING_PARAM  = 1 << 0;   /* 1     */
-    public static final int AV_OPT_FLAG_DECODING_PARAM  = 1 << 1;   /* 2     */
-    public static final int AV_OPT_FLAG_AUDIO_PARAM     = 1 << 3;   /* 8     */
-    public static final int AV_OPT_FLAG_VIDEO_PARAM     = 1 << 4;   /* 16    */
-    public static final int AV_OPT_FLAG_SUBTITLE_PARAM  = 1 << 5;   /* 32    */
-    public static final int AV_OPT_FLAG_EXPORT          = 1 << 6;   /* 64    */
-    public static final int AV_OPT_FLAG_READONLY        = 1 << 7;   /* 128   */
-    public static final int AV_OPT_FLAG_BSF_PARAM       = 1 << 8;   /* 256   */
-    public static final int AV_OPT_FLAG_RUNTIME_PARAM   = 1 << 15;  /* 32768 */
-    public static final int AV_OPT_FLAG_FILTERING_PARAM = 1 << 16;  /* 65536 */
-    public static final int AV_OPT_FLAG_DEPRECATED      = 1 << 17;  /* 131072 */
-
-    public static final int AV_OPT_TYPE_FLAGS       = 1;
-    public static final int AV_OPT_TYPE_INT         = 2;
-    public static final int AV_OPT_TYPE_INT64       = 3;
-    public static final int AV_OPT_TYPE_DOUBLE      = 4;
-    public static final int AV_OPT_TYPE_FLOAT       = 5;
-    public static final int AV_OPT_TYPE_STRING      = 6;
-    public static final int AV_OPT_TYPE_RATIONAL    = 7;
-    public static final int AV_OPT_TYPE_BINARY      = 8;
-    public static final int AV_OPT_TYPE_DICT        = 9;
-    public static final int AV_OPT_TYPE_UINT64      = 10;
-    public static final int AV_OPT_TYPE_CONST       = 11;
-    public static final int AV_OPT_TYPE_IMAGE_SIZE  = 12;
-    public static final int AV_OPT_TYPE_PIXEL_FMT   = 13;
-    public static final int AV_OPT_TYPE_SAMPLE_FMT  = 14;
-    public static final int AV_OPT_TYPE_VIDEO_RATE  = 15;
-    public static final int AV_OPT_TYPE_DURATION    = 16;
-    public static final int AV_OPT_TYPE_COLOR       = 17;
-    public static final int AV_OPT_TYPE_BOOL        = 18;
-    public static final int AV_OPT_TYPE_CHLAYOUT    = 19;
-    public static final int AV_OPT_TYPE_UINT        = 20;
-    public static final int AV_OPT_TYPE_FLAG_ARRAY  = 65536;
-
-    public static final int AV_PKT_DATA_PALETTE                       = 0;
-    public static final int AV_PKT_DATA_NEW_EXTRADATA                 = 1;
-    public static final int AV_PKT_DATA_PARAM_CHANGE                  = 2;
-    public static final int AV_PKT_DATA_H263_MB_INFO                  = 3;
-    public static final int AV_PKT_DATA_REPLAYGAIN                    = 4;
-    public static final int AV_PKT_DATA_DISPLAYMATRIX                 = 5;
-    public static final int AV_PKT_DATA_STEREO3D                      = 6;
-    public static final int AV_PKT_DATA_AUDIO_SERVICE_TYPE            = 7;
-    public static final int AV_PKT_DATA_QUALITY_STATS                 = 8;
-    public static final int AV_PKT_DATA_FALLBACK_TRACK                = 9;
-    public static final int AV_PKT_DATA_CPB_PROPERTIES                = 10;
-    public static final int AV_PKT_DATA_SKIP_SAMPLES                  = 11;
-    public static final int AV_PKT_DATA_JP_DUALMONO                   = 12;
-    public static final int AV_PKT_DATA_STRINGS_METADATA              = 13;
-    public static final int AV_PKT_DATA_SUBTITLE_POSITION             = 14;
-    public static final int AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL      = 15;
-    public static final int AV_PKT_DATA_WEBVTT_IDENTIFIER             = 16;
-    public static final int AV_PKT_DATA_WEBVTT_SETTINGS               = 17;
-    public static final int AV_PKT_DATA_METADATA_UPDATE               = 18;
-    public static final int AV_PKT_DATA_MPEGTS_STREAM_ID              = 19;
-    public static final int AV_PKT_DATA_MASTERING_DISPLAY_METADATA    = 20;
-    public static final int AV_PKT_DATA_SPHERICAL                     = 21;
-    public static final int AV_PKT_DATA_CONTENT_LIGHT_LEVEL           = 22;
-    public static final int AV_PKT_DATA_A53_CC                        = 23;
-    public static final int AV_PKT_DATA_ENCRYPTION_INIT_INFO          = 24;
-    public static final int AV_PKT_DATA_ENCRYPTION_INFO               = 25;
-    public static final int AV_PKT_DATA_AFD                           = 26;
-    public static final int AV_PKT_DATA_PRFT                          = 27;
-    public static final int AV_PKT_DATA_ICC_PROFILE                   = 28;
-    public static final int AV_PKT_DATA_DOVI_CONF                     = 29;
-    public static final int AV_PKT_DATA_S12M_TIMECODE                 = 30;
-    public static final int AV_PKT_DATA_DYNAMIC_HDR10_PLUS            = 31;
-    public static final int AV_PKT_DATA_IAMF_MIX_GAIN_PARAM           = 32;
-    public static final int AV_PKT_DATA_IAMF_DEMIXING_INFO_PARAM      = 33;
-    public static final int AV_PKT_DATA_IAMF_RECON_GAIN_INFO_PARAM    = 34;
-    public static final int AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT  = 35;
-    public static final int AV_PKT_DATA_FRAME_CROPPING                = 36;
-    public static final int AV_PKT_DATA_LCEVC                         = 37;
-    public static final int AV_PKT_DATA_3D_REFERENCE_DISPLAYS         = 38;
-    public static final int AV_PKT_DATA_RTCP_SR                        = 39;
-    public static final int AV_PKT_DATA_EXIF                          = 40;
-    public static final int AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5   = 41;
-    public static final int AV_PKT_DATA_HEVC_CONF                     = 42;
-    public static final int AV_PKT_DATA_GAIN_MAP_PARAMS               = 43;
-    public static final int AV_PKT_DATA_NB                            = 44;
-
-    public static final int AV_FRAME_DATA_PANSCAN                     = 0;
-    public static final int AV_FRAME_DATA_A53_CC                      = 1;
-    public static final int AV_FRAME_DATA_STEREO3D                    = 2;
-    public static final int AV_FRAME_DATA_MATRIXENCODING              = 3;
-    public static final int AV_FRAME_DATA_DOWNMIX_INFO                = 4;
-    public static final int AV_FRAME_DATA_REPLAYGAIN                  = 5;
-    public static final int AV_FRAME_DATA_DISPLAYMATRIX               = 6;
-    public static final int AV_FRAME_DATA_AFD                         = 7;
-    public static final int AV_FRAME_DATA_MOTION_VECTORS              = 8;
-    public static final int AV_FRAME_DATA_SKIP_SAMPLES                = 9;
-    public static final int AV_FRAME_DATA_AUDIO_SERVICE_TYPE          = 10;
-    public static final int AV_FRAME_DATA_MASTERING_DISPLAY_METADATA  = 11;
-    public static final int AV_FRAME_DATA_GOP_TIMECODE                = 12;
-    public static final int AV_FRAME_DATA_SPHERICAL                   = 13;
-    public static final int AV_FRAME_DATA_CONTENT_LIGHT_LEVEL         = 14;
-    public static final int AV_FRAME_DATA_ICC_PROFILE                 = 15;
-    public static final int AV_FRAME_DATA_S12M_TIMECODE               = 16;
-    public static final int AV_FRAME_DATA_DYNAMIC_HDR_PLUS            = 17;
-    public static final int AV_FRAME_DATA_REGIONS_OF_INTEREST         = 18;
-    public static final int AV_FRAME_DATA_VIDEO_ENC_PARAMS            = 19;
-    public static final int AV_FRAME_DATA_SEI_UNREGISTERED            = 20;
-    public static final int AV_FRAME_DATA_FILM_GRAIN_PARAMS           = 21;
-    public static final int AV_FRAME_DATA_DETECTION_BBOXES            = 22;
-    public static final int AV_FRAME_DATA_DOVI_RPU_BUFFER             = 23;
-    public static final int AV_FRAME_DATA_DOVI_METADATA               = 24;
-    public static final int AV_FRAME_DATA_DYNAMIC_HDR_VIVID           = 25;
-    public static final int AV_FRAME_DATA_AMBIENT_VIEWING_ENVIRONMENT = 26;
-    public static final int AV_FRAME_DATA_VIDEO_HINT                  = 27;
-    public static final int AV_FRAME_DATA_LCEVC                       = 28;
-    public static final int AV_FRAME_DATA_VIEW_ID                     = 29;
-    public static final int AV_FRAME_DATA_3D_REFERENCE_DISPLAYS       = 30;
-    public static final int AV_FRAME_DATA_EXIF                        = 31;
-    public static final int AV_FRAME_DATA_DYNAMIC_HDR_SMPTE_2094_APP5 = 32;
-    public static final int AV_FRAME_DATA_IAMF_MIX_GAIN_PARAM         = 33;
-    public static final int AV_FRAME_DATA_IAMF_DEMIXING_INFO_PARAM    = 34;
-    public static final int AV_FRAME_DATA_IAMF_RECON_GAIN_INFO_PARAM  = 35;
-    public static final int AV_FRAME_DATA_RAW_COLOR_PARAMS            = 36;
-    public static final int AV_FRAME_DATA_DOWNMIX_MATRIX              = 37;
-    public static final int AV_FRAME_DATA_GAIN_MAP_PARAMS             = 38;
-
-    public static final int AV_DOVI_COMPRESSION_NONE     = 0;
-    public static final int AV_DOVI_COMPRESSION_LIMITED  = 1;
-    public static final int AV_DOVI_COMPRESSION_RESERVED = 2;
-    public static final int AV_DOVI_COMPRESSION_EXTENDED = 3;
-
-    public static final int AV_SIDE_DATA_PARAM_CHANGE_SAMPLE_RATE  = 0x0004;
-    public static final int AV_SIDE_DATA_PARAM_CHANGE_DIMENSIONS   = 0x0008;
-
-    public static final int AVERROR_BSF_NOT_FOUND       = -1179861752;
-    public static final int AVERROR_BUG                 = -558323010;
-    public static final int AVERROR_BUFFER_TOO_SMALL    = -1397118274;
-    public static final int AVERROR_DECODER_NOT_FOUND   = -1128613112;
-    public static final int AVERROR_DEMUXER_NOT_FOUND   = -1296385272;
-    public static final int AVERROR_ENCODER_NOT_FOUND   = -1129203192;
-    public static final int AVERROR_EOF                 = -541478725;
-    public static final int AVERROR_EXIT                = -1414092869;
-    public static final int AVERROR_EXTERNAL            = -542398533;
-    public static final int AVERROR_FILTER_NOT_FOUND    = -1279870712;
-    public static final int AVERROR_INVALIDDATA         = -1094995529;
-    public static final int AVERROR_MUXER_NOT_FOUND     = -1481985528;
-    public static final int AVERROR_OPTION_NOT_FOUND    = -1414549496;
-    public static final int AVERROR_PATCHWELCOME        = -1163346256;
-    public static final int AVERROR_PROTOCOL_NOT_FOUND  = -1330794744;
-    public static final int AVERROR_STREAM_NOT_FOUND    = -1381258232;
-    public static final int AVERROR_BUG2                = -541545794;
-    public static final int AVERROR_UNKNOWN             = -1313558101;
-    public static final int AVERROR_EXPERIMENTAL        = -733130664;
-    public static final int AVERROR_INPUT_CHANGED       = -1668179713;
-    public static final int AVERROR_OUTPUT_CHANGED      = -1668179714;
-    public static final int AVERROR_HTTP_BAD_REQUEST    = -808465656;
-    public static final int AVERROR_HTTP_UNAUTHORIZED   = -825242872;
-    public static final int AVERROR_HTTP_FORBIDDEN      = -858797304;
-    public static final int AVERROR_HTTP_NOT_FOUND      = -875574520;
-    public static final int AVERROR_HTTP_TOO_MANY_REQUESTS = -959591672;
-    public static final int AVERROR_HTTP_OTHER_4XX      = -1482175736;
-    public static final int AVERROR_HTTP_SERVER_ERROR   = -1482175992;
-
-    public static final int AVERROR_E2BIG   = -7;
-    public static final int AVERROR_ENOENT  = -2;
-    public static final int AVERROR_EIO     = -5;
-    public static final int AVERROR_EAGAIN  = -11;
-    public static final int AVERROR_ENOMEM  = -12;
-    public static final int AVERROR_EINVAL  = -22;
-    public static final int AVERROR_ENOSPC  = -28;
-    public static final int AVERROR_ENOSYS  = -38;
-    public static final int AVERROR_EOVERFLOW = -75;
-
-    public static final int AV_DISPOSITION_DEFAULT            = 1;
-    public static final int AV_DISPOSITION_DUB                = 2;
-    public static final int AV_DISPOSITION_ORIGINAL           = 4;
-    public static final int AV_DISPOSITION_COMMENT            = 8;
-    public static final int AV_DISPOSITION_LYRICS             = 16;
-    public static final int AV_DISPOSITION_KARAOKE            = 32;
-    public static final int AV_DISPOSITION_FORCED             = 64;
-    public static final int AV_DISPOSITION_HEARING_IMPAIRED   = 128;
-    public static final int AV_DISPOSITION_VISUAL_IMPAIRED    = 256;
-    public static final int AV_DISPOSITION_CLEAN_EFFECTS      = 512;
-    public static final int AV_DISPOSITION_ATTACHED_PIC       = 1024;
-    public static final int AV_DISPOSITION_TIMED_THUMBNAILS   = 2048;
-    public static final int AV_DISPOSITION_NON_DIEGETIC       = 4096;
-    public static final int AV_DISPOSITION_CAPTIONS           = 65536;
-    public static final int AV_DISPOSITION_DESCRIPTIONS       = 131072;
-    public static final int AV_DISPOSITION_METADATA           = 262144;
-    public static final int AV_DISPOSITION_DEPENDENT          = 524288;
-    public static final int AV_DISPOSITION_STILL_IMAGE        = 1048576;
-    public static final int AV_DISPOSITION_MULTILAYER         = 2097152;
-
-    public static final int AVCOL_RANGE_UNSPECIFIED  = 0;
-    public static final int AVCOL_RANGE_MPEG         = 1;
-    public static final int AVCOL_RANGE_JPEG         = 2;
-    public static final int AVCOL_RANGE_NB           = 3;
-
-    public static final int AVCOL_SPC_RGB                = 0;
-    public static final int AVCOL_SPC_BT709              = 1;
-    public static final int AVCOL_SPC_UNSPECIFIED        = 2;
-    public static final int AVCOL_SPC_RESERVED           = 3;
-    public static final int AVCOL_SPC_FCC                = 4;
-    public static final int AVCOL_SPC_BT470BG            = 5;
-    public static final int AVCOL_SPC_SMPTE170M          = 6;
-    public static final int AVCOL_SPC_SMPTE240M          = 7;
-    public static final int AVCOL_SPC_YCGCO              = 8;
-    public static final int AVCOL_SPC_BT2020_NCL         = 9;
-    public static final int AVCOL_SPC_BT2020_CL          = 10;
-    public static final int AVCOL_SPC_SMPTE2085          = 11;
-    public static final int AVCOL_SPC_CHROMA_DERIVED_NCL = 12;
-    public static final int AVCOL_SPC_CHROMA_DERIVED_CL  = 13;
-    public static final int AVCOL_SPC_ICTCP              = 14;
-    public static final int AVCOL_SPC_IPT_C2             = 15;
-    public static final int AVCOL_SPC_YCGCO_RE           = 16;
-    public static final int AVCOL_SPC_YCGCO_RO           = 17;
-    public static final int AVCOL_SPC_YCOCG              = 8;
-    public static final int AVCOL_SPC_NB                 = 18;
-
-    public static final int AVCOL_PRI_RESERVED0      = 0;
-    public static final int AVCOL_PRI_BT709          = 1;
-    public static final int AVCOL_PRI_UNSPECIFIED    = 2;
-    public static final int AVCOL_PRI_RESERVED       = 3;
-    public static final int AVCOL_PRI_BT470M         = 4;
-    public static final int AVCOL_PRI_BT470BG        = 5;
-    public static final int AVCOL_PRI_SMPTE170M      = 6;
-    public static final int AVCOL_PRI_SMPTE240M      = 7;
-    public static final int AVCOL_PRI_FILM           = 8;
-    public static final int AVCOL_PRI_BT2020         = 9;
-    public static final int AVCOL_PRI_SMPTEST428_1   = 10;
-    public static final int AVCOL_PRI_SMPTE428       = 10;
-    public static final int AVCOL_PRI_SMPTE431       = 11;
-    public static final int AVCOL_PRI_SMPTE432       = 12;
-    public static final int AVCOL_PRI_JEDEC_P22      = 22;
-    public static final int AVCOL_PRI_EBU3213        = 22;
-    public static final int AVCOL_PRI_V_GAMUT        = 256;
-    public static final int AVCOL_PRI_EXT_BASE       = 256;
-    public static final int AVCOL_PRI_EXT_NB         = 257;
-    public static final int AVCOL_PRI_NB             = 23;
-
-    public static final int AVCOL_TRC_RESERVED0      = 0;
-    public static final int AVCOL_TRC_BT709          = 1;
-    public static final int AVCOL_TRC_UNSPECIFIED    = 2;
-    public static final int AVCOL_TRC_RESERVED       = 3;
-    public static final int AVCOL_TRC_GAMMA22        = 4;
-    public static final int AVCOL_TRC_GAMMA28        = 5;
-    public static final int AVCOL_TRC_SMPTE170M      = 6;
-    public static final int AVCOL_TRC_SMPTE240M      = 7;
-    public static final int AVCOL_TRC_LINEAR         = 8;
-    public static final int AVCOL_TRC_LOG            = 9;
-    public static final int AVCOL_TRC_LOG_SQRT       = 10;
-    public static final int AVCOL_TRC_IEC61966_2_4   = 11;
-    public static final int AVCOL_TRC_BT1361_ECG     = 12;
-    public static final int AVCOL_TRC_IEC61966_2_1   = 13;
-    public static final int AVCOL_TRC_BT2020_10      = 14;
-    public static final int AVCOL_TRC_BT2020_12      = 15;
-    public static final int AVCOL_TRC_SMPTEST2084    = 16;
-    public static final int AVCOL_TRC_SMPTE2084      = 16;
-    public static final int AVCOL_TRC_SMPTEST428_1   = 17;
-    public static final int AVCOL_TRC_SMPTE428       = 17;
-    public static final int AVCOL_TRC_ARIB_STD_B67   = 18;
-    public static final int AVCOL_TRC_V_LOG          = 256;
-    public static final int AVCOL_TRC_EXT_BASE       = 256;
-    public static final int AVCOL_TRC_EXT_NB         = 257;
-    public static final int AVCOL_TRC_NB             = 19;
-
-    public static final int AV_PICTURE_TYPE_NONE  = 0;
-    public static final int AV_PICTURE_TYPE_I     = 1;
-    public static final int AV_PICTURE_TYPE_P     = 2;
-    public static final int AV_PICTURE_TYPE_B     = 3;
-    public static final int AV_PICTURE_TYPE_S     = 4;
-    public static final int AV_PICTURE_TYPE_SI    = 5;
-    public static final int AV_PICTURE_TYPE_SP    = 6;
-    public static final int AV_PICTURE_TYPE_BI    = 7;
-
-    public static final int AV_BUFFERSRC_FLAG_NO_CHECK_FORMAT  = 1;
-    public static final int AV_BUFFERSRC_FLAG_PUSH             = 4;
-    public static final int AV_BUFFERSRC_FLAG_KEEP_REF         = 8;
-
-    public static final int AV_BUFFERSINK_FLAG_PEEK        = 1;
-    public static final int AV_BUFFERSINK_FLAG_NO_REQUEST  = 2;
-
-    public static final int AVFILTER_CMD_FLAG_ONE   = 1;
-    public static final int AVFILTER_CMD_FLAG_FAST  = 2;
-
-    public static final int AV_HWFRAME_MAP_READ       = 1;
-    public static final int AV_HWFRAME_MAP_WRITE      = 2;
-    public static final int AV_HWFRAME_MAP_OVERWRITE  = 4;
-    public static final int AV_HWFRAME_MAP_DIRECT     = 8;
-
-    public static final int AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX  = 1;
-    public static final int AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX  = 2;
-    public static final int AV_CODEC_HW_CONFIG_METHOD_INTERNAL       = 4;
-    public static final int AV_CODEC_HW_CONFIG_METHOD_AD_HOC         = 8;
-
-    public static final int AV_CODEC_PROP_INTRA_ONLY   = 1;
-    public static final int AV_CODEC_PROP_LOSSY        = 2;
-    public static final int AV_CODEC_PROP_LOSSLESS     = 4;
-    public static final int AV_CODEC_PROP_REORDER      = 8;
-    public static final int AV_CODEC_PROP_FIELDS       = 16;
-    public static final int AV_CODEC_PROP_ENHANCEMENT  = 32;
-    public static final int AV_CODEC_PROP_BITMAP_SUB   = 65536;
-    public static final int AV_CODEC_PROP_TEXT_SUB     = 131072;
-
-    public static final int FF_LOSS_RESOLUTION       = 1;
-    public static final int FF_LOSS_DEPTH            = 2;
-    public static final int FF_LOSS_COLORSPACE       = 4;
-    public static final int FF_LOSS_ALPHA            = 8;
-    public static final int FF_LOSS_COLORQUANT       = 16;
-    public static final int FF_LOSS_CHROMA           = 32;
-    public static final int FF_LOSS_EXCESS_RESOLUTION = 64;
-    public static final int FF_LOSS_EXCESS_DEPTH     = 128;
-
-    public static final int AVALPHA_MODE_UNSPECIFIED    = 0;
-    public static final int AVALPHA_MODE_PREMULTIPLIED  = 1;
-    public static final int AVALPHA_MODE_STRAIGHT       = 2;
-    public static final int AVALPHA_MODE_NB             = 3;
 }

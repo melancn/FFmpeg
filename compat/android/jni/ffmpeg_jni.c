@@ -94,6 +94,12 @@
 
 #include "libswresample/swresample.h"
 
+/* Managed handle infrastructure. The registry is FFmpeg-independent; the
+ * format unit owns AVFormatContext lifetime, the per-context execution lock and
+ * the interrupt flag dependency. */
+#include "ffmpeg_jni_handle_registry.h"
+#include "ffmpeg_jni_format_handle.h"
+
 /* Optional libass subtitle rendering (see the libass section near the end
  * of this file; compiled only when FFmpeg was configured --enable-libass). */
 #include "config.h"
@@ -109,161 +115,236 @@ static JavaVM *g_vm = NULL;
 #define PTR(type, h) ((type)(intptr_t)(h))
 
 /* ------------------------------------------------------------------ */
-/* AVDictionary handle validation                                      */
+/* JNI error contract                                                  */
 /*                                                                     */
-/* Java holds a dictionary as a jlong. Historically that was a calloc'ed */
-/* AVDictionary** box, so a stale or bogus value (freed box, wrong kind */
-/* of pointer, an 8-byte block the allocator handed out again) reached  */
-/* av_dict_get/av_dict_free unchecked and crashed inside libavutil:    */
-/* SIGSEGV at av_dict_get+28 reading 0x00696863, then av_dict_free+32   */
-/* on the very same fault address. These helpers turn such a handle    */
-/* into a logged AVERROR(EINVAL); they never abort on mismatch.        */
+/* A handle that does not name a live managed object is a bug in the   */
+/* caller, not a "no data" answer. Methods that return a business value */
+/* (a codec id, a sample rate, a name) therefore raise an exception      */
+/* instead of handing back 0, which every caller would read as a real    */
+/* value. Methods that already return a status keep returning a negative */
+/* AVERROR; only the ones that cannot signal failure any other way       */
+/* throw.                                                               */
 /* ------------------------------------------------------------------ */
 
-#define FF_DICT_BOX_MAGIC 0x44494354u /* "DICT" */
-
-typedef struct FFDictBox {
-    uint32_t magic;         /* FF_DICT_BOX_MAGIC while the box is alive. */
-    uint32_t reserved;      /* Keeps the dictionary pointer 8-byte aligned. */
-    AVDictionary *dict;     /* May be NULL: an empty dictionary. */
-} FFDictBox;
-
-/* Boxes come from a fixed arena, never from malloc.
- *
- * Why it matters: a freed box address used to be immediately available for the
- * allocator to hand out again (a 2-word block is exactly what an 8-byte string
- * buffer asks for). A late second release then walked that memory as a
- * dictionary and crashed in av_dict_free. With the arena the address stays
- * "ours but dead", which the generation flags below report instead of trusting
- * the contents. Slots are reused only by a *new* dictCreate(). */
-#define FF_DICT_SLOTS 16
-static FFDictBox g_dict_arena[FF_DICT_SLOTS];   /* zeroed: BSS */
-static int g_dict_live[FF_DICT_SLOTS];          /* 0 = slot never used/freed */
-static uint32_t g_dict_epoch[FF_DICT_SLOTS];    /* bumped on every release */
-static pthread_mutex_t g_dict_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* Live box count, exposed in logs only. */
-static int g_dict_live_count;
-
-/* Slot of a handle, or -1 when the address is not one of our slots. */
-static int ff_dict_slot_of(jlong handle)
+static void ff_jni_throw(JNIEnv *env, const char *cls, const char *code,
+                         const char *api)
 {
-    uintptr_t base = (uintptr_t)&g_dict_arena[0];
-    uintptr_t addr = (uintptr_t)PTR(void *, handle);
-    uintptr_t first = (uintptr_t)&g_dict_arena[0].magic;
-    if (addr < first)
-        return -1;
-    if (((addr - first) % sizeof(FFDictBox)) != 0)
-        return -1;
-    if ((addr - base) / sizeof(FFDictBox) >= FF_DICT_SLOTS)
-        return -1;
-    return (int)((addr - base) / sizeof(FFDictBox));
+    jclass c;
+    char msg[256];
+
+    if (!env)
+        return;                 /* no VM to report to: nothing to throw into */
+
+    snprintf(msg, sizeof(msg), "%s (%s)", api, code);
+    c = (*env)->FindClass(env, cls);
+    if (!c) {
+        /* The class is part of the platform; if it is missing, the pending
+         * exception from FindClass is already the best report available. */
+        return;
+    }
+    (*env)->ThrowNew(env, c, msg);
+    (*env)->DeleteLocalRef(env, c);
 }
 
-/* Grabs a free slot. Never returns a slot that is still live. */
-static FFDictBox *ff_dict_box_alloc(void)
+/* The token is not a live object of the expected kind (stale, wrong type or
+ * never issued). */
+static void ff_jni_throw_stale(JNIEnv *env, const char *code, const char *api)
 {
-    FFDictBox *box = NULL;
+    ff_jni_throw(env, "java/lang/IllegalStateException", code, api);
+}
+
+/* The token is fine but an argument to the call is not. */
+static void ff_jni_throw_badarg(JNIEnv *env, const char *code, const char *api)
+{
+    ff_jni_throw(env, "java/lang/IllegalArgumentException", code, api);
+}
+
+/* ------------------------------------------------------------------ */
+/* AVDictionary handles                                                */
+/*                                                                     */
+/* Java holds a dictionary as a long. It used to be the address of a    */
+/* calloc'ed AVDictionary** box, so a stale or bogus value (freed box,  */
+/* wrong kind of pointer, an 8-byte block the allocator handed out      */
+/* again) reached av_dict_get/av_dict_free unchecked and crashed inside */
+/* libavutil. The handle is now a token from the handle registry, so    */
+/* the type, the slot and the generation are all checked before any     */
+/* pointer is dereferenced, and a dictionary that reuses a freed slot   */
+/* can never be reached through the old handle.                         */
+/*                                                                     */
+/* Each dictionary also carries its own mutex and a revision counter.   */
+/* The mutex makes a set/copy/serialise safe against a concurrent free  */
+/* or another set, and it is held across the FFmpeg calls that consume  */
+/* the dictionary as options. The revision is what lets an iteration    */
+/* cursor notice that the contents changed underneath it.               */
+/* ------------------------------------------------------------------ */
+
+typedef struct FFDictHandle {
+    AVDictionary   *dict;       /* NULL is a valid empty dictionary */
+    pthread_mutex_t lock;       /* guards `dict` and `revision` */
+    int             lock_ready;
+    uint32_t        revision;   /* bumped on every content change */
+} FFDictHandle;
+
+/* One guarded dictionary operation: a registry reference plus the content
+ * lock, both held for the whole entry point. */
+typedef struct FFDictOp {
+    FFDictHandle *handle;
+    int64_t       token;
+} FFDictOp;
+
+/* An iteration cursor.
+ *
+ * It deliberately stores no AVDictionaryEntry. That pointer is an alias into
+ * entries that the next set/remove frees, so handing it to Java is what made
+ * dictEntryGetKey() able to read freed memory. The cursor keeps a count and a
+ * copy of the current key/value instead, and remembers the dictionary revision
+ * it was positioned at, so a change invalidates the cursor explicitly instead
+ * of silently skipping or replaying entries. */
+typedef struct FFDictCursor {
+    int64_t  dict_token;
+    uint32_t revision;
+    int      count;         /* entries already returned */
+    int      started;
+    int      done;
+    char    *key;           /* copy of the current entry, never an alias */
+    char    *value;
+} FFDictCursor;
+
+static void ff_dict_finalize(void *p)
+{
+    FFDictHandle *h = p;
+
+    if (h->lock_ready) {
+        pthread_mutex_lock(&h->lock);
+        av_dict_free(&h->dict);
+        pthread_mutex_unlock(&h->lock);
+        pthread_mutex_destroy(&h->lock);
+        h->lock_ready = 0;
+    }
+    av_free(h);
+}
+
+static void ff_dict_cursor_finalize(void *p)
+{
+    FFDictCursor *c = p;
+
+    av_freep(&c->key);
+    av_freep(&c->value);
+    av_free(c);
+}
+
+/* Begins a guarded dictionary operation. On success the dictionary mutex is
+ * held; on failure nothing is held and NULL is returned. */
+static FFDictHandle *ff_dict_op_begin(jlong token, FFDictOp *op)
+{
+    FFDictHandle *h;
+
+    op->handle = NULL;
+    op->token  = (int64_t)token;
+    if (!token)
+        return NULL;
+
+    h = ff_handle_acquire((int64_t)token, FF_HANDLE_TYPE_DICTIONARY, NULL);
+    if (!h)
+        return NULL;
+
+    pthread_mutex_lock(&h->lock);
+    /* Re-check once the lock is ours: a close may have started while this
+     * operation was waiting, and it must not begin native work on a
+     * dictionary whose teardown is already under way. */
+    if (ff_handle_closing((int64_t)token, FF_HANDLE_TYPE_DICTIONARY) > 0) {
+        pthread_mutex_unlock(&h->lock);
+        ff_handle_release((int64_t)token, FF_HANDLE_TYPE_DICTIONARY);
+        return NULL;
+    }
+
+    op->handle = h;
+    return h;
+}
+
+static void ff_dict_op_end(FFDictOp *op)
+{
+    if (!op || !op->handle)
+        return;
+    pthread_mutex_unlock(&op->handle->lock);
+    ff_handle_release(op->token, FF_HANDLE_TYPE_DICTIONARY);
+    op->handle = NULL;
+}
+
+static void ff_dict_op_cleanup(FFDictOp *op)
+{
+    ff_dict_op_end(op);
+}
+
+/* Declares `op` and `holder`, and holds the dictionary lock until the enclosing
+ * block is left - including every early return. */
+#define FF_DICT_OP(token, op, holder)                                        \
+    FFDictOp op __attribute__((cleanup(ff_dict_op_cleanup)));                \
+    FFDictHandle *holder = ff_dict_op_begin((token), &op)
+
+/* Entry number `index` of a dictionary, or NULL past the end. Walking from the
+ * head keeps the position exact even for repeated keys; the cursor's revision
+ * check keeps the cost from mattering by rejecting changed dictionaries. */
+static const AVDictionaryEntry *ff_dict_entry_at(const AVDictionary *d, int index)
+{
+    const AVDictionaryEntry *e = NULL;
     int i;
-    pthread_mutex_lock(&g_dict_lock);
-    for (i = 0; i < FF_DICT_SLOTS; i++) {
-        if (!g_dict_live[i]) {
-            g_dict_live[i] = 1;
-            g_dict_epoch[i]++;
-            g_dict_live_count++;
-            box = &g_dict_arena[i];
-            break;
+
+    if (index < 0)
+        return NULL;
+    for (i = 0; i <= index; i++) {
+        e = av_dict_iterate(d, e);
+        if (!e)
+            return NULL;
+    }
+    return e;
+}
+
+/* Moves a cursor one entry forward and copies that entry out.
+ * @return 1 when a new current entry was stored, 0 at the end. */
+static int ff_dict_cursor_advance(FFDictHandle *h, FFDictCursor *c)
+{
+    const AVDictionaryEntry *e;
+
+    if (!h || !c || c->done)
+        return 0;
+
+    if (c->started && c->revision != h->revision) {
+        /* Contents changed since the last step. Continuing would skip or
+         * repeat entries, so the cursor is retired instead. */
+        c->done = 1;
+        av_freep(&c->key);
+        av_freep(&c->value);
+        return 0;
+    }
+
+    e = ff_dict_entry_at(h->dict, c->count);
+    if (!e) {
+        c->done = 1;
+        av_freep(&c->key);
+        av_freep(&c->value);
+        return 0;
+    }
+
+    av_freep(&c->key);
+    av_freep(&c->value);
+    c->key = av_strdup(e->key ? e->key : "");
+    if (!c->key) {
+        c->done = 1;
+        return 0;
+    }
+    if (e->value) {
+        c->value = av_strdup(e->value);
+        if (!c->value) {
+            c->done = 1;
+            av_freep(&c->key);
+            return 0;
         }
     }
-    pthread_mutex_unlock(&g_dict_lock);
-    if (box) {
-        box->magic = FF_DICT_BOX_MAGIC;
-        box->dict = NULL;
-    }
-    return box;
-}
-
-/* Releases a live generation. The slot stays in the arena so the address is
- * never re-used by malloc for something else. */
-static void ff_dict_box_release(FFDictBox *box)
-{
-    int slot = ff_dict_slot_of((jlong)(intptr_t)box);
-    if (slot < 0)
-        return;
-    box->magic = 0;
-    box->dict = NULL;
-    pthread_mutex_lock(&g_dict_lock);
-    g_dict_live[slot] = 0;
-    g_dict_epoch[slot]++;
-    g_dict_live_count--;
-    pthread_mutex_unlock(&g_dict_lock);
-}
-
-/* Classifies a Java handle. Returns the box only in OK state; why it failed is
- * left in *slot_out / *epoch_out / *state_out for the caller to log. */
-typedef enum {
-    FF_DICT_OK = 0,
-    FF_DICT_NOT_A_SLOT,
-    FF_DICT_NOT_LIVE,
-    FF_DICT_BAD_MAGIC,
-} FFDictHandleState;
-
-static FFDictBox *ff_dict_resolve(jlong handle, int *slot_out, uint32_t *epoch_out,
-                                  FFDictHandleState *state_out)
-{
-    int slot;
-    FFDictBox *box;
-    int live;
-    *slot_out = -1;
-    *epoch_out = 0;
-    if (!handle) {
-        *state_out = FF_DICT_NOT_A_SLOT;
-        return NULL;
-    }
-    slot = ff_dict_slot_of(handle);
-    if (slot < 0) {
-        *state_out = FF_DICT_NOT_A_SLOT;
-        return NULL;
-    }
-    box = &g_dict_arena[slot];
-    *slot_out = slot;
-    pthread_mutex_lock(&g_dict_lock);
-    live = g_dict_live[slot];
-    *epoch_out = g_dict_epoch[slot];
-    pthread_mutex_unlock(&g_dict_lock);
-    if (!live) {
-        *state_out = FF_DICT_NOT_LIVE;
-        return NULL;
-    }
-    if (box->magic != FF_DICT_BOX_MAGIC) {
-        *state_out = FF_DICT_BAD_MAGIC;
-        return NULL;
-    }
-    *state_out = FF_DICT_OK;
-    return box;
-}
-
-/* Resolves a Java handle to a live box. NULL (with a log) when the value
- * is not a slot of our arena at all, or is a slot whose current generation
- * was already released. `api` names the caller so a single logcat line
- * identifies the offending entry point. */
-static FFDictBox *ff_dict_box_from_handle(jlong handle, const char *api)
-{
-    int slot;
-    uint32_t epoch;
-    FFDictHandleState state;
-    FFDictBox *box = ff_dict_resolve(handle, &slot, &epoch, &state);
-    if (box)
-        return box;
-    __android_log_print(ANDROID_LOG_ERROR, "ffmpeg_jni",
-                        "%s: AVDictionary handle 0x%08lx rejected: %s (slot=%d epoch=%u "
-                        "liveCount=%d)",
-                        api, (unsigned long)(intptr_t)PTR(void *, handle),
-                        state == FF_DICT_NOT_LIVE ? "not live (never created or already freed)"
-                            : state == FF_DICT_BAD_MAGIC ? "magic mismatch"
-                            : "not an arena slot",
-                        slot, (unsigned)epoch, g_dict_live_count);
-    return NULL;
+    c->count++;
+    c->revision = h->revision;
+    c->started  = 1;
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -525,7 +606,7 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
 /* detectable instead of letting callers assume a capability is there. */
 /* ------------------------------------------------------------------ */
 
-#define FF_JNI_BRIDGE_API_MAJOR 1
+#define FF_JNI_BRIDGE_API_MAJOR 2
 /* 1.1 adds the bounded PCM resampling session. It only appends entry points,
  * so this is a minor bump: a 1.0 caller keeps working unchanged, and a 1.1
  * caller detects the capability bit instead of guessing from the version.
@@ -553,8 +634,28 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  * ass_set_message_cb(); without this callback those messages are discarded on
  * Android. The entries only append, so a 1.4 caller is unaffected; a 1.5
  * caller gates on FF_JNI_CAP_LIBASS_FONT_LOG because the whole libass section
- * is absent from a non-libass build. */
-#define FF_JNI_BRIDGE_API_MINOR 6
+ * is absent from a non-libass build.
+ *
+ * 2.0 changes what a `long` handle *means* for the object kinds below, so it is
+ * a major bump even though most method signatures are unchanged:
+ *
+ *   - AVFormatContext, AVDictionary, the dictionary iteration cursor, the
+ *     interrupt flag and the window renderer are now opaque tokens (type +
+ *     slot + generation), never addresses;
+ *   - a stale or foreign handle is refused instead of dereferenced, and the
+ *     value-getters throw instead of returning 0;
+ *   - formatCloseInput()/formatFreeContext() return a status and report
+ *     ffmpeg.format.close.unconfirmed rather than pretending a close finished;
+ *   - the dictionary iteration handle is a cursor, not an AVDictionaryEntry*;
+ *   - dictionary handles carry a real generation, so a freed dictionary cannot
+ *     be reached through its old handle after the slot is reused;
+ *   - the window renderer's slot is reusable, and the finaliser runs when the
+ *     last reference drops.
+ *
+ * A 1.x JAR must not be used with a 2.x library: its longs are addresses and
+ * will be refused, which is the intended failure. Callers must compare the
+ * major version and gate each feature on its capability bit. */
+#define FF_JNI_BRIDGE_API_MINOR 0
 #define FF_JNI_BRIDGE_API_VERSION \
     ((FF_JNI_BRIDGE_API_MAJOR << 16) | FF_JNI_BRIDGE_API_MINOR)
 
@@ -586,7 +687,13 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
 #define FF_JNI_CAP_PCM_SESSION_SAFE_V2   (1LL << 5)
 /* 1.2: Free() retains the whole renderer while an operation is admitted,
  * handles are registry-checked with a generation, and Finish() releases the
- * platform window exactly once before reporting DETACHED. */
+ * platform window exactly once before reporting DETACHED.
+ *
+ * 2.0 supersedes the "retained" part with FF_JNI_CAP_RENDERER_SLOT_RECYCLE:
+ * destruction is now driven by the registry reference count, the creator
+ * reference is released by Free(), and the slot is reusable. This bit stays
+ * set because the close protocol it describes - revoke, drain, release the
+ * window once - is still the contract. */
 #define FF_JNI_CAP_RENDERER_SAFE_CLOSE   (1LL << 6)
 /* NOT set: per-output codec buffer accounting is not implemented.
  * mediasurfaceGetOutstandingBuffers() stays a process-wide diagnostic and is
@@ -627,6 +734,23 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
 #define FF_JNI_CAP_FRAME_SIDE_DATA          (1LL << 16)
 #define FF_JNI_CAP_SIDE_DATA_TYPES          (1LL << 17)
 #define FF_JNI_CAP_VIDEO_METADATA_SNAPSHOT  (1LL << 18)
+
+/* 2.0: AVFormatContext handles are controlled tokens with a per-context
+ * execution lock. A closed context can no longer be read, probed, seeked or
+ * written, and a close waits for in-flight operations before destroying it. */
+#define FF_JNI_CAP_FORMAT_HANDLE_GUARD      (1LL << 19)
+/* 2.0: dictionary handles carry a slot generation, so a freed dictionary is
+ * never mistaken for the one that reuses its slot. */
+#define FF_JNI_CAP_DICT_HANDLE_GENERATION   (1LL << 20)
+/* 2.0: dictionary iteration returns a cursor bound to a content revision
+ * instead of an AVDictionaryEntry pointer; a changed dictionary retires it. */
+#define FF_JNI_CAP_DICT_ITERATION_CURSOR    (1LL << 21)
+/* 2.0: a format context keeps the interrupt flag alive for as long as
+ * libavformat may poll it, so interruptFlagFree() may run first. */
+#define FF_JNI_CAP_INTERRUPT_LIFETIME       (1LL << 22)
+/* 2.0: the window renderer releases its creator reference on Free() and its
+ * slot is reusable, with destruction deferred to the last operation. */
+#define FF_JNI_CAP_RENDERER_SLOT_RECYCLE    (1LL << 23)
 
 /* Bumped whenever the packet budget accounting rules change, so a stored
  * charge value can be attributed to the policy that produced it. */
@@ -803,7 +927,12 @@ Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
                          FF_JNI_CAP_STREAM_SIDE_DATA |
                          FF_JNI_CAP_FRAME_SIDE_DATA |
                          FF_JNI_CAP_SIDE_DATA_TYPES |
-                         FF_JNI_CAP_VIDEO_METADATA_SNAPSHOT);
+                         FF_JNI_CAP_VIDEO_METADATA_SNAPSHOT |
+                         FF_JNI_CAP_FORMAT_HANDLE_GUARD |
+                         FF_JNI_CAP_DICT_HANDLE_GENERATION |
+                         FF_JNI_CAP_DICT_ITERATION_CURSOR |
+                         FF_JNI_CAP_INTERRUPT_LIFETIME |
+                         FF_JNI_CAP_RENDERER_SLOT_RECYCLE);
 #if CONFIG_LIBASS
     caps |= (jlong)FF_JNI_CAP_LIBASS_FONT_LOG;
 #endif
@@ -940,35 +1069,50 @@ Java_org_ffmpeg_FFMpegNative_strerror(JNIEnv *env, jobject thiz, jint errnum)
 }
 
 /* ------------------------------------------------------------------ */
-/* AVDictionary (stored behind a pointer box so Java keeps a long)     */
+/* AVDictionary (a token, never a pointer)                             */
 /* ------------------------------------------------------------------ */
 
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_dictCreate(JNIEnv *env, jobject thiz)
 {
-    FFDictBox *box = ff_dict_box_alloc();
-    if (!box) {
-        /* All slots live: boxes leaked by Java. Refuse instead of handing out
-         * a handle that cannot be verified on the way back. */
-        __android_log_print(ANDROID_LOG_ERROR, "ffmpeg_jni",
-                            "dictCreate: arena full (%d slots live), allocation refused",
-                            FF_DICT_SLOTS);
+    FFDictHandle *h = av_mallocz(sizeof(*h));
+    int64_t token;
+
+    if (!h)
+        return 0;
+    if (pthread_mutex_init(&h->lock, NULL) != 0) {
+        av_free(h);
         return 0;
     }
-    return (jlong)(intptr_t)box;
+    h->lock_ready = 1;
+    h->dict       = NULL;
+    h->revision   = 1;
+
+    token = ff_handle_create(FF_HANDLE_TYPE_DICTIONARY, h, ff_dict_finalize);
+    if (!token) {
+        __android_log_print(ANDROID_LOG_ERROR, "ffmpeg_jni",
+                            "dictCreate: no handle slot available, allocation refused");
+        pthread_mutex_destroy(&h->lock);
+        h->lock_ready = 0;
+        av_free(h);
+        return 0;
+    }
+    return (jlong)token;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_dictSet(JNIEnv *env, jobject thiz,
                                      jlong box, jstring key, jstring val, jint flags)
 {
-    FFDictBox *holder = ff_dict_box_from_handle(box, "dictSet");
-    if (!holder || !key)
-        return AVERROR(EINVAL);
-    const char *k = (*env)->GetStringUTFChars(env, key, NULL);
+    FF_DICT_OP(box, op, holder);
+    const char *k;
     const char *v = NULL;
     int ret;
 
+    if (!holder || !key)
+        return AVERROR(EINVAL);
+
+    k = (*env)->GetStringUTFChars(env, key, NULL);
     if (!k)
         return AVERROR(ENOMEM);
     if (val) {
@@ -983,6 +1127,8 @@ Java_org_ffmpeg_FFMpegNative_dictSet(JNIEnv *env, jobject thiz,
     (*env)->ReleaseStringUTFChars(env, key, k);
     if (val)
         (*env)->ReleaseStringUTFChars(env, val, v);
+    if (ret >= 0)
+        holder->revision++;     /* invalidates any cursor positioned before this */
     return ret;
 }
 
@@ -990,77 +1136,113 @@ JNIEXPORT jstring JNICALL
 Java_org_ffmpeg_FFMpegNative_dictGet(JNIEnv *env, jobject thiz,
                                      jlong box, jstring key, jint flags)
 {
-    FFDictBox *holder = ff_dict_box_from_handle(box, "dictGet");
-    if (!holder || !key)
+    FF_DICT_OP(box, op, holder);
+    const char *k;
+    AVDictionaryEntry *e;
+    jstring out;
+
+    if (!holder) {
+        /* A dead handle is a caller bug; "no such key" is what NULL means, and
+         * answering NULL here would hide it. */
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale", "dictGet");
         return NULL;
-    AVDictionary *d = holder->dict;
-    if (!d)
+    }
+    if (!key)
         return NULL;
-    const char *k = (*env)->GetStringUTFChars(env, key, NULL);
+    if (!holder->dict)
+        return NULL;            /* empty dictionary: the key is simply absent */
+
+    k = (*env)->GetStringUTFChars(env, key, NULL);
     if (!k)
         return NULL;
-    AVDictionaryEntry *e = av_dict_get(d, k, NULL, flags);
+    e = av_dict_get(holder->dict, k, NULL, flags);
     (*env)->ReleaseStringUTFChars(env, key, k);
-    return e ? (*env)->NewStringUTF(env, e->value) : NULL;
+    if (!e)
+        return NULL;
+    /* Copied under the dictionary lock, so the entry cannot be freed between
+     * the lookup and the copy. */
+    out = (*env)->NewStringUTF(env, e->value ? e->value : "");
+    return out;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_dictCount(JNIEnv *env, jobject thiz, jlong box)
 {
-    FFDictBox *holder = ff_dict_box_from_handle(box, "dictCount");
-    return holder ? (jint)av_dict_count(holder->dict) : 0;
+    FF_DICT_OP(box, op, holder);
+
+    if (!holder) {
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale", "dictCount");
+        return 0;
+    }
+    return (jint)av_dict_count(holder->dict);
 }
 
 JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_dictFree(JNIEnv *env, jobject thiz, jlong box)
 {
-    FFDictBox *holder = ff_dict_box_from_handle(box, "dictFree");
-    if (!holder) {
-        /* Not the live generation of this slot. It may be a late duplicate
-         * release of a box that has already been freed - that is the normal
-         * shape of a double free, and the old code crashed here inside
-         * av_dict_free on the very same address. Reporting beats dying. */
-        __android_log_print(ANDROID_LOG_WARN, "ffmpeg_jni",
-                            "dictFree: handle 0x%08lx is not live (double free?) liveCount=%d",
-                            (unsigned long)(intptr_t)PTR(void *, box), g_dict_live_count);
-        return;
-    }
-    av_dict_free(&holder->dict);
-    ff_dict_box_release(holder);
+    int64_t token = (int64_t)box;
+
+    /* Idempotent: closing a dictionary that is already closed - or 0 - is a
+     * no-op, and it can never reach a newer dictionary that reused the slot
+     * because the generation would differ. */
+    ff_handle_revoke(token, FF_HANDLE_TYPE_DICTIONARY);
 }
 
 /* ------------------------------------------------------------------ */
 /* libavformat                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Interrupt plumbing used by both formatOpenInput variants; defined below. */
-typedef struct FFInterruptFlag {
-    /* Written by the controlling thread, polled by the I/O thread. */
-    volatile int aborted;
-} FFInterruptFlag;
+/* How long formatCloseInput() waits for the last operation to leave before it
+ * reports the close as unconfirmed. Long enough for a demux read that is
+ * already returning, short enough that a teardown thread is not parked for the
+ * protocol's own timeout. */
+#define FF_JNI_CLOSE_WAIT_MS 5000
 
-static int ff_jni_interrupt_cb(void *opaque);
-
+/* Opens an input and publishes it as a managed format context.
+ *
+ * The options dictionary is held - reference and lock - across
+ * avformat_open_input(), which consumes entries in place. Releasing the
+ * reference before the call, or copying the dictionary, would either let a
+ * concurrent dictFree() free the entries underneath libavformat or silently
+ * change which options remain visible on the caller's handle afterwards. */
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_formatOpenInput(JNIEnv *env, jobject thiz,
                                              jstring url, jlong optionsBox)
 {
+    AVFormatContext *ctx = NULL;
+    int64_t token = 0;
+    int ret = AVERROR(EINVAL);
+
     if (!url)
         return 0;
-    FFDictBox *holder = NULL;
-    if (optionsBox) {
-        holder = ff_dict_box_from_handle(optionsBox, "formatOpenInput");
-        if (!holder)
+
+    {
+        FF_DICT_OP(optionsBox, dop, dholder);
+        AVDictionary **opts;
+        const char *u;
+
+        if (optionsBox && !dholder) {
+            ff_jni_throw_stale(env, "ffmpeg.handle.stale", "formatOpenInput");
             return 0;
+        }
+        opts = dholder ? &dholder->dict : NULL;
+
+        u = (*env)->GetStringUTFChars(env, url, NULL);
+        if (!u)
+            return 0;
+        ret = avformat_open_input(&ctx, u, NULL, opts);
+        (*env)->ReleaseStringUTFChars(env, url, u);
     }
-    AVDictionary **opts = holder ? &holder->dict : NULL;
-    AVFormatContext *ctx = NULL;
-    const char *u = (*env)->GetStringUTFChars(env, url, NULL);
-    int ret = avformat_open_input(&ctx, u, NULL, opts);
-    (*env)->ReleaseStringUTFChars(env, url, u);
-    if (ret < 0 || !ctx)
+
+    if (ret < 0 || !ctx) {
+        /* avformat_open_input frees ctx on failure; free defensively when it
+         * hands back a non-NULL context together with an error. */
+        if (ctx)
+            avformat_close_input(&ctx);
         return 0;
-    return (jlong)(intptr_t)ctx;
+    }
+    token = ff_format_publish(ctx, FF_FORMAT_SOURCE_INPUT, 0, NULL);
+    return (jlong)token;
 }
 
 /* Variant of formatOpenInput whose I/O can be cancelled while it is still
@@ -1077,142 +1259,258 @@ Java_org_ffmpeg_FFMpegNative_formatOpenInput(JNIEnv *env, jobject thiz,
  * then is it opened. Raising the flag now makes the in-flight open fail with
  * AVERROR_EXIT promptly.
  *
+ * The flag reference taken here is handed to the published format context,
+ * which keeps it alive for as long as libavformat may still call back - that
+ * is what lets Java free its own handle without leaving the callback pointing
+ * at freed memory.
+ *
  * @param url          input URL / path
- * @param optionsBox   AVDictionary** box, 0 for none
- * @param flag         interrupt flag handle; 0 means "no cancellation"
- * @return the opened AVFormatContext, or 0 on failure (same contract as
- *         formatOpenInput). On failure the context is closed here. */
+ * @param optionsBox   dictionary token, 0 for none
+ * @param flag         interrupt flag token; 0 means "no cancellation"
+ * @return the format context token, or 0 on failure (same contract as
+ *         formatOpenInput). On failure everything acquired here is released. */
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_formatOpenInputWithInterrupt(JNIEnv *env, jobject thiz,
                                                           jstring url, jlong optionsBox,
                                                           jlong flag)
 {
+    AVFormatContext *ctx = NULL;
+    FFInterruptFlag *f = NULL;
+    int64_t token = 0;
+    int ret = AVERROR(EINVAL);
+
     if (!url)
         return 0;
-    FFDictBox *holder = NULL;
-    if (optionsBox) {
-        holder = ff_dict_box_from_handle(optionsBox, "formatOpenInputWithInterrupt");
-        if (!holder)
+
+    {
+        FF_DICT_OP(optionsBox, dop, dholder);
+        AVDictionary **opts;
+        const char *u;
+
+        if (optionsBox && !dholder) {
+            ff_jni_throw_stale(env, "ffmpeg.handle.stale",
+                               "formatOpenInputWithInterrupt");
             return 0;
+        }
+        opts = dholder ? &dholder->dict : NULL;
+
+        if (flag) {
+            f = ff_interrupt_acquire(flag, NULL);
+            if (!f) {
+                ff_jni_throw_stale(env, "ffmpeg.handle.stale",
+                                   "formatOpenInputWithInterrupt");
+                return 0;
+            }
+            /* An already cancelled generation must not start DNS/TLS/probe
+             * work: the caller has given up before we began. */
+            if (ff_interrupt_raised(f)) {
+                ff_interrupt_release(flag);
+                return 0;
+            }
+        }
+
+        ctx = avformat_alloc_context();
+        if (!ctx) {
+            if (flag)
+                ff_interrupt_release(flag);
+            return 0;
+        }
+        if (f)
+            ff_format_install_interrupt(ctx, f);
+
+        u = (*env)->GetStringUTFChars(env, url, NULL);
+        if (!u) {
+            avformat_free_context(ctx);
+            if (flag)
+                ff_interrupt_release(flag);
+            return 0;
+        }
+        ret = avformat_open_input(&ctx, u, NULL, opts);
+        (*env)->ReleaseStringUTFChars(env, url, u);
     }
-    AVDictionary **opts = holder ? &holder->dict : NULL;
-    FFInterruptFlag *f = flag ? PTR(FFInterruptFlag *, flag) : NULL;
-    /* An already cancelled generation must not start DNS/TLS/probe work. */
-    if (ff_jni_interrupt_cb(f))
-        return 0;
-    AVFormatContext *ctx = avformat_alloc_context();
-    if (!ctx)
-        return 0;
-    if (f) {
-        ctx->interrupt_callback.callback = ff_jni_interrupt_cb;
-        ctx->interrupt_callback.opaque   = f;
-    }
-    const char *u = (*env)->GetStringUTFChars(env, url, NULL);
-    if (!u) {
-        avformat_free_context(ctx);
-        return 0;
-    }
-    int ret = avformat_open_input(&ctx, u, NULL, opts);
-    (*env)->ReleaseStringUTFChars(env, url, u);
+
     if (ret < 0 || !ctx) {
-        /* avformat_open_input frees ctx on failure, but free defensively:
-         * a NULL return with a non-NULL ctx would otherwise leak. */
+        /* avformat_open_input frees ctx on failure, but free defensively: a
+         * NULL return with a non-NULL ctx would otherwise leak. The flag
+         * reference goes back too, now that no context can poll it. */
         if (ctx)
             avformat_close_input(&ctx);
+        if (flag)
+            ff_interrupt_release(flag);
         return 0;
     }
-    return (jlong)(intptr_t)ctx;
+
+    /* The handle adopts both the context and the flag reference. */
+    token = ff_format_publish(ctx, FF_FORMAT_SOURCE_INPUT, (int64_t)flag, f);
+    return (jlong)token;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_formatFindStreamInfo(JNIEnv *env, jobject thiz, jlong ctx)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+
     if (!c)
         return AVERROR(EINVAL);
     return (jint)avformat_find_stream_info(c, NULL);
 }
 
-JNIEXPORT void JNICALL
+/* Closes a format context through the managed close protocol.
+ *
+ * Returns 0 only when the native context is gone. A negative result means it
+ * may still exist - either the token was not a format context at all, or the
+ * wait for in-flight operations expired. In the second case the last
+ * operation finishes the teardown and the slot is never reused, so the caller
+ * may retry the close but must not pretend the resources are released. */
+JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_formatCloseInput(JNIEnv *env, jobject thiz, jlong ctx)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
-    if (c)
-        avformat_close_input(&c);
+    int rc;
+
+    if (!ctx)
+        return FF_FORMAT_CLOSE_OK;      /* close(0) is an idempotent no-op */
+
+    rc = ff_format_close((int64_t)ctx, FF_JNI_CLOSE_WAIT_MS);
+    if (rc == FF_FORMAT_CLOSE_UNCONFIRMED) {
+        ff_jni_throw_stale(env, "ffmpeg.format.close.unconfirmed",
+                           "formatCloseInput");
+    } else if (rc == FF_FORMAT_CLOSE_INVALID) {
+        ff_jni_throw_badarg(env, "ffmpeg.handle.type_mismatch",
+                            "formatCloseInput");
+    }
+    return (jint)rc;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_getNbStreams(JNIEnv *env, jobject thiz, jlong ctx)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
-    return c ? (jint)c->nb_streams : 0;
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+
+    if (!c) {
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale", "getNbStreams");
+        return 0;
+    }
+    return (jint)c->nb_streams;
 }
 
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_getDuration(JNIEnv *env, jobject thiz, jlong ctx)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
-    return c ? (jlong)c->duration : 0;
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+
+    if (!c) {
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale", "getDuration");
+        return 0;
+    }
+    return (jlong)c->duration;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_findBestStream(JNIEnv *env, jobject thiz,
                                             jlong ctx, jint type, jint want, jint related)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+
     if (!c)
         return AVERROR(EINVAL);
     return (jint)av_find_best_stream(c, (enum AVMediaType)type, want, related, NULL, 0);
 }
 
+/* Stream parameters of stream `index`.
+ *
+ * Only valid while an operation is open: the returned pointer belongs to the
+ * format context and dies with it. It must never be stored in Java or handed
+ * to an asynchronous task - the operation reference is what makes this
+ * dereference safe, not the null checks below. */
+static AVCodecParameters *stream_par_locked(FFFormatOp *op, jint index)
+{
+    AVFormatContext *c = op ? op->ctx : NULL;
+
+    if (!c)
+        return NULL;
+    if (index < 0 || index >= (jint)c->nb_streams)
+        return NULL;
+    if (!c->streams || !c->streams[index])
+        return NULL;
+    return c->streams[index]->codecpar;
+}
+
+/* Throws unless the operation could be opened and the index names a stream.
+ * Returns the parameters, or NULL. A NULL return with no exception pending
+ * means the stream genuinely carries no codec parameters. */
+static AVCodecParameters *stream_par_checked(JNIEnv *env, FFFormatOp *op,
+                                             jint index, const char *api)
+{
+    if (!op->handle) {
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale", api);
+        return NULL;
+    }
+    if (index < 0 || index >= (jint)op->ctx->nb_streams) {
+        ff_jni_throw_badarg(env, "ffmpeg.handle.bad_index", api);
+        return NULL;
+    }
+    return stream_par_locked(op, index);
+}
+
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetStartTime(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
-    if (!c || index < 0 || index >= (jint)c->nb_streams)
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetStartTime");
+
+    (void)c;
+    if (!p)
         return AV_NOPTS_VALUE;
     return (jlong)c->streams[index]->start_time;
-}
-
-static AVCodecParameters *stream_par(AVFormatContext *c, jint index)
-{
-    if (!c || index < 0 || index >= (jint)c->nb_streams)
-        return NULL;
-    return c->streams[index]->codecpar;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetCodecId(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetCodecId");
+
+    (void)c;
     return p ? (jint)p->codec_id : AV_CODEC_ID_NONE;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetCodecType(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetCodecType");
+
+    (void)c;
     return p ? (jint)p->codec_type : (jint)AVMEDIA_TYPE_UNKNOWN;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetWidth(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetWidth");
+
+    (void)c;
     return p ? (jint)p->width : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetHeight(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetHeight");
+
+    (void)c;
     return p ? (jint)p->height : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetFormat(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetFormat");
+
+    (void)c;
     return p ? (jint)p->format : -1;
 }
 
@@ -1255,12 +1553,14 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_codecParametersToContext(JNIEnv *env, jobject thiz,
                                                       jlong codecCtx, jlong fmtCtx, jint index)
 {
+    FF_FORMAT_OP_BEGIN(fmtCtx, op, fc);
     AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
-    AVFormatContext *fc = PTR(AVFormatContext *, fmtCtx);
-    AVCodecParameters *p = stream_par(fc, index);
-    if (!cc || !p)
+    AVCodecParameters *p = stream_par_locked(&op, index);
+    int ret;
+
+    if (!cc || !fc || !p)
         return AVERROR(EINVAL);
-    int ret = avcodec_parameters_to_context(cc, p);
+    ret = avcodec_parameters_to_context(cc, p);
     /* avcodec_parameters_to_context() does not carry the stream time base
      * over, and decoders that rescale packet timestamps (mediacodec sends
      * them to the codec in AV_TIME_BASE units) need it. */
@@ -2100,11 +2400,14 @@ Java_org_ffmpeg_FFMpegNative_streamGetSideDataSize(JNIEnv *env, jobject thiz,
                                                    jlong fmt, jint index,
                                                    jint type)
 {
+    FF_FORMAT_OP_BEGIN(fmt, op, fc);
     const AVPacketSideData *sd;
     jint size;
     int ret;
 
-    ret = ff_jni_stream_sd_lookup(PTR(AVFormatContext *, fmt), index, type, &sd);
+    (void)fc;
+
+    ret = ff_jni_stream_sd_lookup(fc, index, type, &sd);
     if (ret < 0)
         return ret;
     ret = ff_jni_sd_size_to_jint(sd->size, &size);
@@ -2119,12 +2422,15 @@ Java_org_ffmpeg_FFMpegNative_streamCopySideDataExact(JNIEnv *env, jobject thiz,
                                                      jint type, jbyteArray out,
                                                      jint offset, jint capacity)
 {
+    FF_FORMAT_OP_BEGIN(fmt, op, fc);
     const AVPacketSideData *sd;
     int ret;
 
+    (void)fc;
+
     if (!env || !out || offset < 0 || capacity < 0)
         return AVERROR(EINVAL);
-    ret = ff_jni_stream_sd_lookup(PTR(AVFormatContext *, fmt), index, type, &sd);
+    ret = ff_jni_stream_sd_lookup(fc, index, type, &sd);
     if (ret < 0)
         return ret;
     return ff_jni_sd_copy(env, sd->data, sd->size, out, offset, capacity);
@@ -2196,16 +2502,19 @@ JNIEXPORT jintArray JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetSideDataTypes(JNIEnv *env, jobject thiz,
                                                     jlong fmt, jint index)
 {
+    FF_FORMAT_OP_BEGIN(fmt, op, fc);
     const AVPacketSideData *sd;
     jintArray arr;
     jint value;
     int nb, i;
 
+    (void)fc;
+
     if (!env)
         return NULL;
     if ((*env)->ExceptionCheck(env))
         return NULL;
-    if (ff_jni_stream_sd_entries(PTR(AVFormatContext *, fmt), index,
+    if (ff_jni_stream_sd_entries(fc, index,
                                  &sd, &nb) < 0)
         return NULL;
 
@@ -2389,13 +2698,16 @@ Java_org_ffmpeg_FFMpegNative_streamGetDoviConfig(JNIEnv *env, jobject thiz,
                                                  jlong fmt, jint index,
                                                  jlongArray out)
 {
+    FF_FORMAT_OP_BEGIN(fmt, op, fc);
     const AVPacketSideData *sd;
     jlong values[FF_JNI_DOVI_CONFIG_SLOTS];
     int ret;
 
+    (void)fc;
+
     if (!env || !out)
         return AVERROR(EINVAL);
-    ret = ff_jni_stream_sd_lookup(PTR(AVFormatContext *, fmt), index,
+    ret = ff_jni_stream_sd_lookup(fc, index,
                                   AV_PKT_DATA_DOVI_CONF, &sd);
     if (ret < 0)
         return ret;
@@ -2412,13 +2724,16 @@ Java_org_ffmpeg_FFMpegNative_streamGetMasteringDisplayMetadata(JNIEnv *env,
                                                               jint index,
                                                               jlongArray out)
 {
+    FF_FORMAT_OP_BEGIN(fmt, op, fc);
     const AVPacketSideData *sd;
     jlong values[FF_JNI_MASTERING_DISPLAY_SLOTS];
     int ret;
 
+    (void)fc;
+
     if (!env || !out)
         return AVERROR(EINVAL);
-    ret = ff_jni_stream_sd_lookup(PTR(AVFormatContext *, fmt), index,
+    ret = ff_jni_stream_sd_lookup(fc, index,
                                   AV_PKT_DATA_MASTERING_DISPLAY_METADATA, &sd);
     if (ret < 0)
         return ret;
@@ -2458,13 +2773,16 @@ Java_org_ffmpeg_FFMpegNative_streamGetContentLightMetadata(JNIEnv *env,
                                                           jlong fmt, jint index,
                                                           jlongArray out)
 {
+    FF_FORMAT_OP_BEGIN(fmt, op, fc);
     const AVPacketSideData *sd;
     jlong values[FF_JNI_CONTENT_LIGHT_SLOTS];
     int ret;
 
+    (void)fc;
+
     if (!env || !out)
         return AVERROR(EINVAL);
-    ret = ff_jni_stream_sd_lookup(PTR(AVFormatContext *, fmt), index,
+    ret = ff_jni_stream_sd_lookup(fc, index,
                                   AV_PKT_DATA_CONTENT_LIGHT_LEVEL, &sd);
     if (ret < 0)
         return ret;
@@ -2501,13 +2819,16 @@ Java_org_ffmpeg_FFMpegNative_streamGetDisplayMatrix(JNIEnv *env, jobject thiz,
                                                     jlong fmt, jint index,
                                                     jlongArray out)
 {
+    FF_FORMAT_OP_BEGIN(fmt, op, fc);
     const AVPacketSideData *sd;
     jlong values[FF_JNI_DISPLAY_MATRIX_SLOTS];
     int ret;
 
+    (void)fc;
+
     if (!env || !out)
         return AVERROR(EINVAL);
-    ret = ff_jni_stream_sd_lookup(PTR(AVFormatContext *, fmt), index,
+    ret = ff_jni_stream_sd_lookup(fc, index,
                                   AV_PKT_DATA_DISPLAYMATRIX, &sd);
     if (ret < 0)
         return ret;
@@ -4219,7 +4540,7 @@ Java_org_ffmpeg_FFMpegNative_pcmSessionFree(JNIEnv *env, jobject thiz, jlong han
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_readFrame(JNIEnv *env, jobject thiz, jlong ctx, jlong pkt)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     AVPacket *p = PTR(AVPacket *, pkt);
     if (!c || !p)
         return AVERROR(EINVAL);
@@ -4230,7 +4551,7 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_seekFrame(JNIEnv *env, jobject thiz, jlong ctx,
                                        jint streamIndex, jlong timestamp, jint flags)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c)
         return AVERROR(EINVAL);
     return (jint)av_seek_frame(c, streamIndex, (int64_t)timestamp, flags);
@@ -4240,7 +4561,7 @@ JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_dumpFormat(JNIEnv *env, jobject thiz, jlong ctx,
                                         jint index, jstring url, jint isOutput)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c)
         return;
     const char *u = url ? (*env)->GetStringUTFChars(env, url, NULL) : NULL;
@@ -4249,18 +4570,19 @@ Java_org_ffmpeg_FFMpegNative_dumpFormat(JNIEnv *env, jobject thiz, jlong ctx,
         (*env)->ReleaseStringUTFChars(env, url, u);
 }
 
-JNIEXPORT void JNICALL
+JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_formatFreeContext(JNIEnv *env, jobject thiz, jlong ctx)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
-    if (c)
-        avformat_free_context(c);
+    /* Same protocol as formatCloseInput. The destructor is chosen from the
+     * origin recorded at publication, so calling this entry point on an input
+     * context cannot free it the output way (or the reverse). */
+    return Java_org_ffmpeg_FFMpegNative_formatCloseInput(env, thiz, ctx);
 }
 
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetTimeBaseNum(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams)
         return 0;
     return (jlong)c->streams[index]->time_base.num;
@@ -4269,7 +4591,7 @@ Java_org_ffmpeg_FFMpegNative_streamGetTimeBaseNum(JNIEnv *env, jobject thiz, jlo
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetTimeBaseDen(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams)
         return 0;
     return (jlong)c->streams[index]->time_base.den;
@@ -4325,15 +4647,20 @@ Java_org_ffmpeg_FFMpegNative_formatAllocOutputContext2(JNIEnv *env, jobject thiz
     int ret = avformat_alloc_output_context2(&ctx, NULL, fmt, fn);
     if (formatName) (*env)->ReleaseStringUTFChars(env, formatName, fmt);
     if (filename)   (*env)->ReleaseStringUTFChars(env, filename, fn);
-    if (ret < 0 || !ctx)
+    if (ret < 0 || !ctx) {
+        if (ctx)
+            avformat_free_context(ctx);
         return 0;
-    return (jlong)(intptr_t)ctx;
+    }
+    /* Output context: its destructor frees the context and closes a pb this
+     * bridge opened later through ioOpen(). */
+    return (jlong)ff_format_publish(ctx, FF_FORMAT_SOURCE_OUTPUT, 0, NULL);
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_formatNewStream(JNIEnv *env, jobject thiz, jlong ctx, jlong codec)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     AVCodec *co = PTR(AVCodec *, codec);
     if (!c)
         return AVERROR(EINVAL);
@@ -4346,43 +4673,62 @@ Java_org_ffmpeg_FFMpegNative_formatNewStream(JNIEnv *env, jobject thiz, jlong ct
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_ioOpen(JNIEnv *env, jobject thiz, jlong ctx, jstring url, jint flags)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    const char *u;
+    int ret;
+
     if (!c || !url)
         return AVERROR(EINVAL);
-    const char *u = (*env)->GetStringUTFChars(env, url, NULL);
-    int ret = avio_open(&c->pb, u, flags);
+    u = (*env)->GetStringUTFChars(env, url, NULL);
+    if (!u)
+        return AVERROR(ENOMEM);
+    ret = avio_open(&c->pb, u, flags);
     (*env)->ReleaseStringUTFChars(env, url, u);
+    if (ret >= 0) {
+        /* This bridge opened ctx->pb, so the destructor has to close it:
+         * avformat_free_context() does not. */
+        ff_format_op_mark_pb_owned(&op);
+    }
     return ret;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_ioClose(JNIEnv *env, jobject thiz, jlong ctx)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    int ret;
+
     if (!c || !c->pb)
         return AVERROR(EINVAL);
-    return (jint)avio_closep(&c->pb);
+    ret = avio_closep(&c->pb);
+    if (ret >= 0) {
+        /* Already closed here: the destructor must not close it again. */
+        ff_format_op_clear_pb_owned(&op);
+    }
+    return (jint)ret;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_formatWriteHeader(JNIEnv *env, jobject thiz, jlong ctx, jlong optionsBox)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
-    FFDictBox *holder = NULL;
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    FF_DICT_OP(optionsBox, dop, dholder);
+    int ret;
+
     if (!c)
         return AVERROR(EINVAL);
-    if (optionsBox) {
-        holder = ff_dict_box_from_handle(optionsBox, "formatWriteHeader");
-        if (!holder)
-            return AVERROR(EINVAL);
-    }
-    return (jint)avformat_write_header(c, holder ? &holder->dict : NULL);
+    if (optionsBox && !dholder)
+        return AVERROR(EINVAL);
+    ret = (int)avformat_write_header(c, dholder ? &dholder->dict : NULL);
+    if (dholder && ret >= 0)
+        dholder->revision++;    /* header writing consumes options in place */
+    return (jint)ret;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_writeFrame(JNIEnv *env, jobject thiz, jlong ctx, jlong pkt)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     AVPacket *p = PTR(AVPacket *, pkt);
     if (!c)
         return AVERROR(EINVAL);
@@ -4392,7 +4738,7 @@ Java_org_ffmpeg_FFMpegNative_writeFrame(JNIEnv *env, jobject thiz, jlong ctx, jl
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_interleavedWriteFrame(JNIEnv *env, jobject thiz, jlong ctx, jlong pkt)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     AVPacket *p = PTR(AVPacket *, pkt);
     if (!c)
         return AVERROR(EINVAL);
@@ -4402,7 +4748,7 @@ Java_org_ffmpeg_FFMpegNative_interleavedWriteFrame(JNIEnv *env, jobject thiz, jl
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_writeTrailer(JNIEnv *env, jobject thiz, jlong ctx)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c)
         return AVERROR(EINVAL);
     return (jint)av_write_trailer(c);
@@ -4498,12 +4844,46 @@ Java_org_ffmpeg_FFMpegNative_frameSetAudioFormat(JNIEnv *env, jobject thiz, jlon
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_dictCopy(JNIEnv *env, jobject thiz, jlong dstBox, jlong srcBox, jint flags)
 {
-    FFDictBox *dstHolder = ff_dict_box_from_handle(dstBox, "dictCopy");
-    FFDictBox *srcHolder = srcBox ? ff_dict_box_from_handle(srcBox, "dictCopy(src)") : NULL;
-    if (!dstHolder || (srcBox && !srcHolder))
-        return AVERROR(EINVAL);
-    return (jint)av_dict_copy(&dstHolder->dict, srcHolder ? srcHolder->dict : NULL,
-                              flags & ~(AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL));
+    /* Two dictionaries means two locks. They are always taken in token order,
+     * so a copy A->B racing a copy B->A cannot deadlock. Copying a dictionary
+     * onto itself is a no-op, so it is collapsed to the single-lock case. */
+    FFDictOp op1 = { NULL, 0 };
+    FFDictOp op2 = { NULL, 0 };
+    FFDictHandle *h1 = NULL, *h2 = NULL;
+    FFDictHandle *dst, *src = NULL;
+    jlong first  = dstBox;
+    jlong second = srcBox;
+    int ret = AVERROR(EINVAL);
+
+    if (srcBox == dstBox)
+        second = 0;
+    if (second && second < first) {
+        first  = srcBox;
+        second = dstBox;
+    }
+
+    h1 = ff_dict_op_begin(first, &op1);
+    if (h1) {
+        h2 = second ? ff_dict_op_begin(second, &op2) : NULL;
+        if (!second || h2) {
+            dst = (first == dstBox) ? h1 : h2;
+            if (srcBox == 0)
+                src = NULL;
+            else if (srcBox == dstBox)
+                src = dst;
+            else
+                src = (first == srcBox) ? h1 : h2;
+            ret = (int)av_dict_copy(&dst->dict, src ? src->dict : NULL,
+                                    flags & ~(AV_DICT_DONT_STRDUP_KEY |
+                                              AV_DICT_DONT_STRDUP_VAL));
+            if (ret >= 0)
+                dst->revision++;
+        }
+        if (h2)
+            ff_dict_op_end(&op2);
+        ff_dict_op_end(&op1);
+    }
+    return (jint)ret;
 }
 
 JNIEXPORT jlong JNICALL
@@ -4697,10 +5077,30 @@ Java_org_ffmpeg_FFMpegNative_getContextTimeBaseDen(JNIEnv *env, jobject thiz, jl
 /* Generic option API (av_opt_*): set codec/format options             */
 /* ------------------------------------------------------------------ */
 
+/* Resolves the unmanaged object a generic av_opt_* entry point operates on.
+ *
+ * These entry points predate the managed handles and still take a raw
+ * AVClass-bearing pointer (an AVCodecContext, an AVFilterContext, a
+ * SwsContext, ...). What they must never do is accept a managed token and use
+ * it as an address: a format context, dictionary or renderer token is not an
+ * AVClass object, and dereferencing it is exactly the unchecked access the
+ * token scheme exists to prevent. There is no "token parse failed, fall back
+ * to a raw pointer" path. */
+static void *ff_opt_object(JNIEnv *env, jlong obj)
+{
+    if (!obj)
+        return NULL;
+    if (ff_handle_is_live((int64_t)obj)) {
+        ff_jni_throw_badarg(env, "ffmpeg.handle.type_mismatch", "av_opt_*");
+        return NULL;
+    }
+    return (void *)(intptr_t)obj;
+}
+
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_optSetString(JNIEnv *env, jobject thiz, jlong obj, jstring name, jstring val)
 {
-    void *o = PTR(void *, obj);
+    void *o = ff_opt_object(env, obj);
     if (!o || !name)
         return AVERROR(EINVAL);
     const char *n = (*env)->GetStringUTFChars(env, name, NULL);
@@ -4715,7 +5115,7 @@ Java_org_ffmpeg_FFMpegNative_optSetString(JNIEnv *env, jobject thiz, jlong obj, 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_optSetInt(JNIEnv *env, jobject thiz, jlong obj, jstring name, jlong val)
 {
-    void *o = PTR(void *, obj);
+    void *o = ff_opt_object(env, obj);
     if (!o || !name)
         return AVERROR(EINVAL);
     const char *n = (*env)->GetStringUTFChars(env, name, NULL);
@@ -4727,7 +5127,7 @@ Java_org_ffmpeg_FFMpegNative_optSetInt(JNIEnv *env, jobject thiz, jlong obj, jst
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_optSetDouble(JNIEnv *env, jobject thiz, jlong obj, jstring name, jdouble val)
 {
-    void *o = PTR(void *, obj);
+    void *o = ff_opt_object(env, obj);
     if (!o || !name)
         return AVERROR(EINVAL);
     const char *n = (*env)->GetStringUTFChars(env, name, NULL);
@@ -4739,7 +5139,7 @@ Java_org_ffmpeg_FFMpegNative_optSetDouble(JNIEnv *env, jobject thiz, jlong obj, 
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_optGetInt(JNIEnv *env, jobject thiz, jlong obj, jstring name)
 {
-    void *o = PTR(void *, obj);
+    void *o = ff_opt_object(env, obj);
     if (!o || !name)
         return AVERROR(EINVAL);
     const char *n = (*env)->GetStringUTFChars(env, name, NULL);
@@ -5036,7 +5436,7 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_formatSeekFile(JNIEnv *env, jobject thiz, jlong ctx,
                                             jint streamIndex, jlong minTs, jlong ts, jlong maxTs, jint flags)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c)
         return AVERROR(EINVAL);
     return (jint)avformat_seek_file(c, streamIndex, (int64_t)minTs, (int64_t)ts, (int64_t)maxTs, flags);
@@ -5045,7 +5445,7 @@ Java_org_ffmpeg_FFMpegNative_formatSeekFile(JNIEnv *env, jobject thiz, jlong ctx
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_formatFlush(JNIEnv *env, jobject thiz, jlong ctx)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c)
         return AVERROR(EINVAL);
     return (jint)avformat_flush(c);
@@ -5063,7 +5463,7 @@ Java_org_ffmpeg_FFMpegNative_getFormatTimeBaseQ(JNIEnv *env, jobject thiz)
 JNIEXPORT jstring JNICALL
 Java_org_ffmpeg_FFMpegNative_formatGetInputFormatName(JNIEnv *env, jobject thiz, jlong ctx)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || !c->iformat || !c->iformat->name)
         return NULL;
     return (*env)->NewStringUTF(env, c->iformat->name);
@@ -5072,7 +5472,7 @@ Java_org_ffmpeg_FFMpegNative_formatGetInputFormatName(JNIEnv *env, jobject thiz,
 JNIEXPORT jstring JNICALL
 Java_org_ffmpeg_FFMpegNative_formatGetOutputFormatName(JNIEnv *env, jobject thiz, jlong ctx)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || !c->oformat || !c->oformat->name)
         return NULL;
     return (*env)->NewStringUTF(env, c->oformat->name);
@@ -5085,7 +5485,7 @@ Java_org_ffmpeg_FFMpegNative_formatGetOutputFormatName(JNIEnv *env, jobject thiz
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetAvgFrameRateNum(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams)
         return 0;
     return (jint)c->streams[index]->avg_frame_rate.num;
@@ -5094,7 +5494,7 @@ Java_org_ffmpeg_FFMpegNative_streamGetAvgFrameRateNum(JNIEnv *env, jobject thiz,
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetAvgFrameRateDen(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams)
         return 0;
     return (jint)c->streams[index]->avg_frame_rate.den;
@@ -5103,7 +5503,7 @@ Java_org_ffmpeg_FFMpegNative_streamGetAvgFrameRateDen(JNIEnv *env, jobject thiz,
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetRFrameRateNum(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams)
         return 0;
     return (jint)c->streams[index]->r_frame_rate.num;
@@ -5112,7 +5512,7 @@ Java_org_ffmpeg_FFMpegNative_streamGetRFrameRateNum(JNIEnv *env, jobject thiz, j
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetRFrameRateDen(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams)
         return 0;
     return (jint)c->streams[index]->r_frame_rate.den;
@@ -5121,14 +5521,17 @@ Java_org_ffmpeg_FFMpegNative_streamGetRFrameRateDen(JNIEnv *env, jobject thiz, j
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetParBitRate(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetParBitRate");
+
+    (void)c;
     return p ? (jint)p->bit_rate : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetParNbFrames(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams)
         return 0;
     return (jint)c->streams[index]->nb_frames;
@@ -5157,10 +5560,11 @@ Java_org_ffmpeg_FFMpegNative_bsfAllocByName(JNIEnv *env, jobject thiz, jstring n
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_bsfCopyInputPar(JNIEnv *env, jobject thiz, jlong bsfCtx, jlong fmtCtx, jint index)
 {
+    FF_FORMAT_OP_BEGIN(fmtCtx, op, fc);
     AVBSFContext *bc = PTR(AVBSFContext *, bsfCtx);
-    AVFormatContext *fc = PTR(AVFormatContext *, fmtCtx);
-    AVCodecParameters *p = stream_par(fc, index);
-    if (!bc || !p)
+    AVCodecParameters *p = stream_par_locked(&op, index);
+
+    if (!bc || !fc || !p)
         return AVERROR(EINVAL);
     return (jint)avcodec_parameters_copy(bc->par_in, p);
 }
@@ -5364,7 +5768,11 @@ Java_org_ffmpeg_FFMpegNative_formatNetworkDeinit(JNIEnv *env, jobject thiz)
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_formatAllocContext(JNIEnv *env, jobject thiz)
 {
-    return (jlong)(intptr_t)avformat_alloc_context();
+    AVFormatContext *ctx = avformat_alloc_context();
+
+    if (!ctx)
+        return 0;
+    return (jlong)ff_format_publish(ctx, FF_FORMAT_SOURCE_ALLOCATED, 0, NULL);
 }
 
 JNIEXPORT jlong JNICALL
@@ -5396,7 +5804,7 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_formatQueryCodec(JNIEnv *env, jobject thiz,
                                               jlong ctx, jint codecId, jint stdCompliance)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || !c->oformat)
         return AVERROR(EINVAL);
     return (jint)avformat_query_codec(c->oformat, (enum AVCodecID)codecId, stdCompliance);
@@ -5462,7 +5870,10 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_getAudioFrameDuration2(JNIEnv *env, jobject thiz,
                                                      jlong fmtCtx, jint index, jint frameBytes)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, fmtCtx), index);
+    FF_FORMAT_OP_BEGIN(fmtCtx, op, fc);
+    AVCodecParameters *p = stream_par_locked(&op, index);
+
+    (void)fc;
     return p ? (jint)av_get_audio_frame_duration2(p, frameBytes) : AVERROR(EINVAL);
 }
 
@@ -5552,14 +5963,16 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_dictParseString(JNIEnv *env, jobject thiz,
                                              jlong box, jstring str, jstring keyValSep, jstring pairsSep, jint flags)
 {
-    FFDictBox *holder = ff_dict_box_from_handle(box, "dictParseString");
-    if (!holder || !str)
-        return AVERROR(EINVAL);
-    const char *s = (*env)->GetStringUTFChars(env, str, NULL);
+    FF_DICT_OP(box, op, holder);
+    const char *s;
     const char *k = NULL;
     const char *p = NULL;
     int ret;
 
+    if (!holder || !str)
+        return AVERROR(EINVAL);
+
+    s = (*env)->GetStringUTFChars(env, str, NULL);
     if (!s)
         return AVERROR(ENOMEM);
     if (keyValSep) {
@@ -5582,18 +5995,25 @@ Java_org_ffmpeg_FFMpegNative_dictParseString(JNIEnv *env, jobject thiz,
     (*env)->ReleaseStringUTFChars(env, str, s);
     if (k) (*env)->ReleaseStringUTFChars(env, keyValSep, k);
     if (p) (*env)->ReleaseStringUTFChars(env, pairsSep, p);
+    if (ret >= 0)
+        holder->revision++;
     return ret;
 }
 
 JNIEXPORT jstring JNICALL
 Java_org_ffmpeg_FFMpegNative_dictGetString(JNIEnv *env, jobject thiz, jlong box, jstring keyValSep, jstring pairsSep)
 {
-    FFDictBox *holder = ff_dict_box_from_handle(box, "dictGetString");
-    if (!holder)
-        return NULL;
+    FF_DICT_OP(box, op, holder);
     char *buf = NULL;
     const char *k = NULL;
     const char *p = NULL;
+    int ret;
+    jstring result;
+
+    if (!holder) {
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale", "dictGetString");
+        return NULL;
+    }
     if (keyValSep) {
         k = (*env)->GetStringUTFChars(env, keyValSep, NULL);
         if (!k)
@@ -5606,37 +6026,148 @@ Java_org_ffmpeg_FFMpegNative_dictGetString(JNIEnv *env, jobject thiz, jlong box,
             return NULL;
         }
     }
-    int ret = av_dict_get_string(holder->dict, &buf, k ? k[0] : ':', p ? p[0] : ',');
+    ret = av_dict_get_string(holder->dict, &buf, k ? k[0] : ':', p ? p[0] : ',');
     if (k) (*env)->ReleaseStringUTFChars(env, keyValSep, k);
     if (p) (*env)->ReleaseStringUTFChars(env, pairsSep, p);
-    jstring result = (ret == 0 && buf) ? (*env)->NewStringUTF(env, buf) : NULL;
+    result = (ret == 0 && buf) ? (*env)->NewStringUTF(env, buf) : NULL;
     if (buf)
         av_freep(&buf);
     return result;
 }
 
+/* Iteration.
+ *
+ * The old shape returned a raw AVDictionaryEntry pointer, and dictEntryGetKey/
+ * Value dereferenced it later. That pointer aliases entries the next set or
+ * remove frees, so a caller holding it across a change read freed memory. The
+ * handle is now a cursor bound to one dictionary and one content revision:
+ * key and value are copied out while the dictionary lock is held, and any
+ * change retires the cursor instead of letting it skip or replay entries.
+ *
+ * @param box        dictionary token
+ * @param prevHandle 0 to start, otherwise the cursor token returned last time
+ * @return the cursor token, or 0 at the end of the iteration
+ */
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_dictIterate(JNIEnv *env, jobject thiz, jlong box, jlong prevHandle)
 {
-    FFDictBox *holder = ff_dict_box_from_handle(box, "dictIterate");
-    const AVDictionaryEntry *prev = PTR(const AVDictionaryEntry *, prevHandle);
-    if (!holder)
+    FFDictHandle *holder;
+    FFDictOp dop = { NULL, 0 };
+    FFDictCursor *cur;
+    int64_t token;
+
+    if (prevHandle) {
+        cur = ff_handle_acquire((int64_t)prevHandle, FF_HANDLE_TYPE_DICT_CURSOR,
+                                NULL);
+        if (!cur)
+            return 0;                       /* already spent: nothing to report */
+        if (cur->dict_token != (int64_t)box) {
+            ff_handle_release((int64_t)prevHandle, FF_HANDLE_TYPE_DICT_CURSOR);
+            ff_jni_throw_badarg(env, "ffmpeg.handle.type_mismatch", "dictIterate");
+            return 0;
+        }
+
+        holder = ff_dict_op_begin(box, &dop);
+        if (!holder || !ff_dict_cursor_advance(holder, cur)) {
+            if (holder)
+                ff_dict_op_end(&dop);
+            ff_handle_release((int64_t)prevHandle, FF_HANDLE_TYPE_DICT_CURSOR);
+            /* End of iteration, or the dictionary changed underneath: either
+             * way the cursor is spent, so retire it now instead of leaving it
+             * to occupy a slot until dictFree. */
+            ff_handle_revoke((int64_t)prevHandle, FF_HANDLE_TYPE_DICT_CURSOR);
+            return 0;
+        }
+        ff_dict_op_end(&dop);
+        ff_handle_release((int64_t)prevHandle, FF_HANDLE_TYPE_DICT_CURSOR);
+        return prevHandle;
+    }
+
+    holder = ff_dict_op_begin(box, &dop);
+    if (!holder) {
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale", "dictIterate");
         return 0;
-    return (jlong)(intptr_t)av_dict_iterate(holder->dict, prev);
+    }
+
+    cur = av_mallocz(sizeof(*cur));
+    if (!cur) {
+        ff_dict_op_end(&dop);
+        return 0;
+    }
+    cur->dict_token = (int64_t)box;
+    cur->revision   = holder->revision;
+
+    token = ff_handle_create(FF_HANDLE_TYPE_DICT_CURSOR, cur,
+                             ff_dict_cursor_finalize);
+    if (!token) {
+        /* Slot cap reached: the bound on abandoned cursors. Refusing is better
+         * than handing out a token that cannot be verified. */
+        av_free(cur);
+        ff_dict_op_end(&dop);
+        __android_log_print(ANDROID_LOG_ERROR, "ffmpeg_jni",
+                            "dictIterate: no cursor slot available");
+        return 0;
+    }
+
+    if (!ff_dict_cursor_advance(holder, cur)) {
+        ff_dict_op_end(&dop);
+        ff_handle_revoke(token, FF_HANDLE_TYPE_DICT_CURSOR);
+        return 0;                           /* empty dictionary */
+    }
+    ff_dict_op_end(&dop);
+    return (jlong)token;
+}
+
+/* Copies the current key or value out of a cursor. */
+static jstring ff_dict_cursor_string(JNIEnv *env, jlong entryHandle, int want_value)
+{
+    const char *api = want_value ? "dictEntryGetValue" : "dictEntryGetKey";
+    FFDictCursor *cur;
+    FFDictHandle *holder;
+    FFDictOp dop = { NULL, 0 };
+    int64_t dict_token;
+    const char *s;
+    jstring out = NULL;
+
+    cur = ff_handle_acquire((int64_t)entryHandle, FF_HANDLE_TYPE_DICT_CURSOR, NULL);
+    if (!cur) {
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale", api);
+        return NULL;
+    }
+
+    dict_token = cur->dict_token;
+    holder = ff_dict_op_begin(dict_token, &dop);
+    /* The copy belongs to the cursor and stays valid even when the dictionary
+     * is closing, so this works either way; the lock only serialises it
+     * against a concurrent advance. */
+    (void)holder;
+    s = want_value ? cur->value : cur->key;
+    if (s)
+        out = (*env)->NewStringUTF(env, s);
+    if (holder)
+        ff_dict_op_end(&dop);
+    ff_handle_release((int64_t)entryHandle, FF_HANDLE_TYPE_DICT_CURSOR);
+    return out;
 }
 
 JNIEXPORT jstring JNICALL
 Java_org_ffmpeg_FFMpegNative_dictEntryGetKey(JNIEnv *env, jobject thiz, jlong entryHandle)
 {
-    const AVDictionaryEntry *e = PTR(const AVDictionaryEntry *, entryHandle);
-    return (e && e->key) ? (*env)->NewStringUTF(env, e->key) : NULL;
+    return ff_dict_cursor_string(env, entryHandle, 0);
 }
 
 JNIEXPORT jstring JNICALL
 Java_org_ffmpeg_FFMpegNative_dictEntryGetValue(JNIEnv *env, jobject thiz, jlong entryHandle)
 {
-    const AVDictionaryEntry *e = PTR(const AVDictionaryEntry *, entryHandle);
-    return (e && e->value) ? (*env)->NewStringUTF(env, e->value) : NULL;
+    return ff_dict_cursor_string(env, entryHandle, 1);
+}
+
+/* Releases a cursor early. Optional: dictIterate retires the cursor when the
+ * iteration ends, and dictFree stops the dictionary it is bound to. */
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_dictCursorFree(JNIEnv *env, jobject thiz, jlong entryHandle)
+{
+    ff_handle_revoke((int64_t)entryHandle, FF_HANDLE_TYPE_DICT_CURSOR);
 }
 
 JNIEXPORT jint JNICALL
@@ -5727,7 +6258,7 @@ Java_org_ffmpeg_FFMpegNative_channelLayoutNormalizeMask(JNIEnv *env, jobject thi
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_optSetQ(JNIEnv *env, jobject thiz, jlong obj, jstring name, jint num, jint den)
 {
-    void *o = PTR(void *, obj);
+    void *o = ff_opt_object(env, obj);
     if (!o || !name)
         return AVERROR(EINVAL);
     const char *n = (*env)->GetStringUTFChars(env, name, NULL);
@@ -5740,7 +6271,7 @@ Java_org_ffmpeg_FFMpegNative_optSetQ(JNIEnv *env, jobject thiz, jlong obj, jstri
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_optSetImageSize(JNIEnv *env, jobject thiz, jlong obj, jstring name, jint w, jint h)
 {
-    void *o = PTR(void *, obj);
+    void *o = ff_opt_object(env, obj);
     if (!o || !name)
         return AVERROR(EINVAL);
     const char *n = (*env)->GetStringUTFChars(env, name, NULL);
@@ -5752,7 +6283,7 @@ Java_org_ffmpeg_FFMpegNative_optSetImageSize(JNIEnv *env, jobject thiz, jlong ob
 JNIEXPORT jdouble JNICALL
 Java_org_ffmpeg_FFMpegNative_optGetDouble(JNIEnv *env, jobject thiz, jlong obj, jstring name)
 {
-    void *o = PTR(void *, obj);
+    void *o = ff_opt_object(env, obj);
     if (!o || !name)
         return (jdouble)AVERROR(EINVAL);
     const char *n = (*env)->GetStringUTFChars(env, name, NULL);
@@ -5765,7 +6296,7 @@ Java_org_ffmpeg_FFMpegNative_optGetDouble(JNIEnv *env, jobject thiz, jlong obj, 
 JNIEXPORT jstring JNICALL
 Java_org_ffmpeg_FFMpegNative_optGetString(JNIEnv *env, jobject thiz, jlong obj, jstring name)
 {
-    void *o = PTR(void *, obj);
+    void *o = ff_opt_object(env, obj);
     if (!o || !name)
         return NULL;
     const char *n = (*env)->GetStringUTFChars(env, name, NULL);
@@ -5925,35 +6456,50 @@ Java_org_ffmpeg_FFMpegNative_frameGetPictType(JNIEnv *env, jobject thiz, jlong f
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetParCodecTag(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetParCodecTag");
+
+    (void)c;
     return p ? (jint)p->codec_tag : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetParSampleRate(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetParSampleRate");
+
+    (void)c;
     return p ? (jint)p->sample_rate : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetParChannels(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetParChannels");
+
+    (void)c;
     return p ? (jint)p->ch_layout.nb_channels : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetParProfile(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetParProfile");
+
+    (void)c;
     return p ? (jint)p->profile : (jint)AV_PROFILE_UNKNOWN;
 }
 
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetParChannelLayout(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetParChannelLayout");
+
+    (void)c;
     if (!p)
         return 0;
     /* Only mask-order layouts map onto an Android channel mask; native/custom
@@ -5994,7 +6540,7 @@ Java_org_ffmpeg_FFMpegNative_streamGetAudioFormatInfo(JNIEnv *env, jobject thiz,
                                                       jlongArray outInfo,
                                                       jintArray outIds)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     AVCodecParameters *p;
     int64_t info[FF_JNI_AUDIO_FORMAT_INFO_SLOTS];
     int32_t ids[FF_JNI_AUDIO_FORMAT_MAX_CHANNELS];
@@ -6172,11 +6718,34 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetExtradata(JNIEnv *env, jobject thiz,
                                                jlong ctx, jint index, jbyteArray out, jint off, jint len)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
-    if (!p || !out || !p->extradata || p->extradata_size <= 0)
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p;
+    jsize capacity;
+    jint n;
+
+    if (!c) {
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale", "streamGetExtradata");
         return -1;
-    jint n = (p->extradata_size < len) ? p->extradata_size : len;
+    }
+    if (!out) {
+        ff_jni_throw_badarg(env, "ffmpeg.handle.bad_argument", "streamGetExtradata");
+        return -1;
+    }
+    /* Check the range against the real array length, without forming off + len,
+     * which can overflow for hostile arguments. */
+    capacity = (*env)->GetArrayLength(env, out);
+    if (off < 0 || len < 0 || off > capacity || len > capacity - off) {
+        ff_jni_throw_badarg(env, "ffmpeg.handle.bad_range", "streamGetExtradata");
+        return AVERROR(EINVAL);
+    }
+
+    p = stream_par_locked(&op, index);
+    if (!p || !p->extradata || p->extradata_size <= 0)
+        return -1;                  /* genuinely absent, not a failure */
+    n = (p->extradata_size < len) ? (jint)p->extradata_size : len;
     (*env)->SetByteArrayRegion(env, out, off, n, (const jbyte *)p->extradata);
+    if ((*env)->ExceptionCheck(env))
+        return -1;                  /* the copy failed: do not report a length */
     return n;
 }
 
@@ -6187,14 +6756,17 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetParExtradataSize(JNIEnv *env, jobject thiz,
                                                        jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetParExtradataSize");
+
+    (void)c;
     return (p && p->extradata && p->extradata_size > 0) ? p->extradata_size : 0;
 }
 
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_formatGetStreamDuration(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams)
         return (jlong)AV_NOPTS_VALUE;
     return (jlong)c->streams[index]->duration;
@@ -6203,7 +6775,7 @@ Java_org_ffmpeg_FFMpegNative_formatGetStreamDuration(JNIEnv *env, jobject thiz, 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetDisposition(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams)
         return 0;
     return (jint)c->streams[index]->disposition;
@@ -6212,7 +6784,7 @@ Java_org_ffmpeg_FFMpegNative_streamGetDisposition(JNIEnv *env, jobject thiz, jlo
 JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_streamSetDisposition(JNIEnv *env, jobject thiz, jlong ctx, jint index, jint disposition)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams)
         return;
     c->streams[index]->disposition = disposition;
@@ -6230,7 +6802,7 @@ Java_org_ffmpeg_FFMpegNative_streamSetDisposition(JNIEnv *env, jobject thiz, jlo
 JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_streamDisableParsing(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams)
         return;
     AVStream *st = c->streams[index];
@@ -6249,9 +6821,32 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_codecparSetExtradata(JNIEnv *env, jobject thiz,
                                                   jlong fmtCtx, jint index, jbyteArray in, jint off, jint len)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, fmtCtx), index);
-    if (!p)
+    FF_FORMAT_OP_BEGIN(fmtCtx, op, fc);
+    AVCodecParameters *p;
+    jsize capacity;
+
+    (void)fc;
+    if (!op.handle) {
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale", "codecparSetExtradata");
         return AVERROR(EINVAL);
+    }
+    p = stream_par_locked(&op, index);
+    if (!p) {
+        ff_jni_throw_badarg(env, "ffmpeg.handle.bad_index", "codecparSetExtradata");
+        return AVERROR(EINVAL);
+    }
+
+    if (in) {
+        capacity = (*env)->GetArrayLength(env, in);
+        if (off < 0 || len < 0 || off > capacity || len > capacity - off) {
+            ff_jni_throw_badarg(env, "ffmpeg.handle.bad_range", "codecparSetExtradata");
+            return AVERROR(EINVAL);
+        }
+    } else if (len > 0) {
+        ff_jni_throw_badarg(env, "ffmpeg.handle.bad_argument", "codecparSetExtradata");
+        return AVERROR(EINVAL);
+    }
+
     if (p->extradata)
         av_freep(&p->extradata);
     p->extradata_size = 0;
@@ -6261,6 +6856,13 @@ Java_org_ffmpeg_FFMpegNative_codecparSetExtradata(JNIEnv *env, jobject thiz,
     if (!p->extradata)
         return AVERROR(ENOMEM);
     (*env)->GetByteArrayRegion(env, in, off, len, (jbyte *)p->extradata);
+    if ((*env)->ExceptionCheck(env)) {
+        /* The array read failed: do not leave a half-filled buffer that looks
+         * like valid extradata. */
+        av_freep(&p->extradata);
+        p->extradata_size = 0;
+        return AVERROR(EINVAL);
+    }
     p->extradata_size = len;
     return len;
 }
@@ -6617,14 +7219,14 @@ Java_org_ffmpeg_FFMpegNative_bufferSinkGetHwFramesCtx(JNIEnv *env, jobject thiz,
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_readPause(JNIEnv *env, jobject thiz, jlong ctx)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     return c ? (jint)av_read_pause(c) : AVERROR(EINVAL);
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_readPlay(JNIEnv *env, jobject thiz, jlong ctx)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     return c ? (jint)av_read_play(c) : AVERROR(EINVAL);
 }
 
@@ -6633,25 +7235,27 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_formatFindStreamInfoOpts(JNIEnv *env, jobject thiz,
                                                       jlong ctx, jlong optionsBox)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
-    FFDictBox *holder = NULL;
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    FF_DICT_OP(optionsBox, dop, dholder);
+    int ret;
+
     if (!c)
         return AVERROR(EINVAL);
-    /* NULL box = "default probe options". A non-NULL value must be a live box,
-     * otherwise avformat_find_stream_info would hand it to av_dict_get. */
-    if (optionsBox) {
-        holder = ff_dict_box_from_handle(optionsBox, "formatFindStreamInfoOpts");
-        if (!holder)
-            return AVERROR(EINVAL);
-    }
-    return (jint)avformat_find_stream_info(c, holder ? &holder->dict : NULL);
+    /* A non-zero options token must be a live dictionary: passing a failed
+     * lookup through as NULL would silently probe with default options. */
+    if (optionsBox && !dholder)
+        return AVERROR(EINVAL);
+    ret = (int)avformat_find_stream_info(c, dholder ? &dholder->dict : NULL);
+    if (dholder && ret >= 0)
+        dholder->revision++;    /* probing consumes options in place */
+    return (jint)ret;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_indexSearchTimestamp(JNIEnv *env, jobject thiz,
                                                   jlong ctx, jint streamIndex, jlong timestamp, jint flags)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || streamIndex < 0 || streamIndex >= (jint)c->nb_streams)
         return AVERROR(EINVAL);
     return (jint)av_index_search_timestamp(c->streams[streamIndex],
@@ -6665,7 +7269,7 @@ Java_org_ffmpeg_FFMpegNative_sdpCreate(JNIEnv *env, jobject thiz, jlong ctx,
 {
     if (!ctx || !out)
         return AVERROR(EINVAL);
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     AVFormatContext *ac[1] = { c };
     char *buf = (char *)av_malloc((size_t)len);
     if (!buf)
@@ -7005,7 +7609,7 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_dictSetInt(JNIEnv *env, jobject thiz,
                                         jlong box, jstring key, jlong value, jint flags)
 {
-    FFDictBox *holder = ff_dict_box_from_handle(box, "dictSetInt");
+    FF_DICT_OP(box, op, holder);
     const char *k;
     int ret;
 
@@ -7017,6 +7621,8 @@ Java_org_ffmpeg_FFMpegNative_dictSetInt(JNIEnv *env, jobject thiz,
     ret = av_dict_set_int(&holder->dict, k, (int64_t)value,
                           flags & ~(AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL));
     (*env)->ReleaseStringUTFChars(env, key, k);
+    if (ret >= 0)
+        holder->revision++;
     return ret;
 }
 
@@ -7024,8 +7630,11 @@ Java_org_ffmpeg_FFMpegNative_dictSetInt(JNIEnv *env, jobject thiz,
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_optNext(JNIEnv *env, jobject thiz, jlong obj, jlong prev)
 {
-    void *o = PTR(void *, obj);
+    void *o = ff_opt_object(env, obj);
     const AVOption *p = PTR(const AVOption *, prev);
+
+    if (!o)
+        return 0;
     return (jlong)(intptr_t)av_opt_next(o, p);
 }
 
@@ -7033,7 +7642,7 @@ JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_optFind(JNIEnv *env, jobject thiz, jlong obj,
                                      jstring name, jstring unit, jint optFlags, jint searchFlags)
 {
-    void *o = PTR(void *, obj);
+    void *o = ff_opt_object(env, obj);
     if (!o || !name)
         return 0;
     const char *n = (*env)->GetStringUTFChars(env, name, NULL);
@@ -7076,7 +7685,7 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_optSetBin(JNIEnv *env, jobject thiz, jlong obj,
                                        jstring name, jbyteArray in, jint off, jint len, jint searchFlags)
 {
-    void *o = PTR(void *, obj);
+    void *o = ff_opt_object(env, obj);
     if (!o || !name)
         return AVERROR(EINVAL);
     const char *n = (*env)->GetStringUTFChars(env, name, NULL);
@@ -7102,25 +7711,29 @@ Java_org_ffmpeg_FFMpegNative_optSetBin(JNIEnv *env, jobject thiz, jlong obj,
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_optSetDict(JNIEnv *env, jobject thiz, jlong obj, jlong optionsBox)
 {
-    void *o = PTR(void *, obj);
-    FFDictBox *holder = NULL;
+    void *o = ff_opt_object(env, obj);
+    FF_DICT_OP(optionsBox, dop, dholder);
+    int ret;
+
     if (!o)
         return AVERROR(EINVAL);
-    if (optionsBox) {
-        holder = ff_dict_box_from_handle(optionsBox, "optSetDict");
-        if (!holder)
-            return AVERROR(EINVAL);
-    }
-    /* av_opt_set_dict() empties the dictionary in place; the box stays valid. */
-    return (jint)av_opt_set_dict(o, holder ? &holder->dict : NULL);
+    if (optionsBox && !dholder)
+        return AVERROR(EINVAL);
+    /* av_opt_set_dict() empties the dictionary in place; the handle stays
+     * valid and its revision moves on. */
+    ret = (int)av_opt_set_dict(o, dholder ? &dholder->dict : NULL);
+    if (dholder && ret >= 0)
+        dholder->revision++;
+    return (jint)ret;
 }
 
 /* av_opt_copy: dest must be allocated (e.g. av_mallocz) but uninitialized */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_optCopy(JNIEnv *env, jobject thiz, jlong dst, jlong src)
 {
-    void *d = PTR(void *, dst);
-    void *s = PTR(void *, src);
+    void *d = ff_opt_object(env, dst);
+    void *s = ff_opt_object(env, src);
+
     if (!d || !s)
         return AVERROR(EINVAL);
     return (jint)av_opt_copy(d, s);
@@ -7183,15 +7796,17 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_filterInitDict(JNIEnv *env, jobject thiz, jlong ctx, jlong optionsBox)
 {
     AVFilterContext *c = PTR(AVFilterContext *, ctx);
-    FFDictBox *holder = NULL;
+    FF_DICT_OP(optionsBox, dop, dholder);
+    int ret;
+
     if (!c)
         return AVERROR(EINVAL);
-    if (optionsBox) {
-        holder = ff_dict_box_from_handle(optionsBox, "filterInitDict");
-        if (!holder)
-            return AVERROR(EINVAL);
-    }
-    return (jint)avfilter_init_dict(c, holder ? &holder->dict : NULL);
+    if (optionsBox && !dholder)
+        return AVERROR(EINVAL);
+    ret = (int)avfilter_init_dict(c, dholder ? &dholder->dict : NULL);
+    if (dholder && ret >= 0)
+        dholder->revision++;
+    return (jint)ret;
 }
 
 /* nb_channels of the channel layout negotiated on a link */
@@ -7415,7 +8030,7 @@ JNIEXPORT jstring JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetMetadata(JNIEnv *env, jobject thiz,
                                                jlong ctx, jint index, jstring key)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams || !key)
         return NULL;
     AVDictionary *d = c->streams[index]->metadata;
@@ -7434,7 +8049,7 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamSetMetadata(JNIEnv *env, jobject thiz,
                                                jlong ctx, jint index, jstring key, jstring val)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
     if (!c || index < 0 || index >= (jint)c->nb_streams || !key)
         return AVERROR(EINVAL);
     const char *k = (*env)->GetStringUTFChars(env, key, NULL);
@@ -7461,28 +8076,40 @@ Java_org_ffmpeg_FFMpegNative_streamSetMetadata(JNIEnv *env, jobject thiz,
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetParVideoDelay(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetParVideoDelay");
+
+    (void)c;
     return p ? (jint)p->video_delay : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetParTrailingPadding(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetParTrailingPadding");
+
+    (void)c;
     return p ? (jint)p->trailing_padding : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetParSeekPreroll(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetParSeekPreroll");
+
+    (void)c;
     return p ? (jint)p->seek_preroll : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_streamGetParInitialPadding(JNIEnv *env, jobject thiz, jlong ctx, jint index)
 {
-    AVCodecParameters *p = stream_par(PTR(AVFormatContext *, ctx), index);
+    FF_FORMAT_OP_BEGIN(ctx, op, c);
+    AVCodecParameters *p = stream_par_checked(env, &op, index, "streamGetParInitialPadding");
+
+    (void)c;
     return p ? (jint)p->initial_padding : 0;
 }
 
@@ -7708,23 +8335,39 @@ JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_formatOpenInputFmt(JNIEnv *env, jobject thiz,
                                                 jlong inputFmt, jstring url, jlong optionsBox)
 {
+    const AVInputFormat *ifmt = inputFmt ? PTR(const AVInputFormat *, inputFmt) : NULL;
+    AVFormatContext *ctx = NULL;
+    int64_t token = 0;
+    int ret = AVERROR(EINVAL);
+
     if (!url)
         return 0;
-    const AVInputFormat *ifmt = inputFmt ? PTR(const AVInputFormat *, inputFmt) : NULL;
-    FFDictBox *holder = NULL;
-    if (optionsBox) {
-        holder = ff_dict_box_from_handle(optionsBox, "formatOpenInputFmt");
-        if (!holder)
+
+    {
+        FF_DICT_OP(optionsBox, dop, dholder);
+        AVDictionary **opts;
+        const char *u;
+
+        if (optionsBox && !dholder) {
+            ff_jni_throw_stale(env, "ffmpeg.handle.stale", "formatOpenInputFmt");
             return 0;
+        }
+        opts = dholder ? &dholder->dict : NULL;
+
+        u = (*env)->GetStringUTFChars(env, url, NULL);
+        if (!u)
+            return 0;
+        ret = avformat_open_input(&ctx, u, ifmt, opts);
+        (*env)->ReleaseStringUTFChars(env, url, u);
     }
-    AVDictionary **opts = holder ? &holder->dict : NULL;
-    AVFormatContext *ctx = NULL;
-    const char *u = (*env)->GetStringUTFChars(env, url, NULL);
-    int ret = avformat_open_input(&ctx, u, ifmt, opts);
-    (*env)->ReleaseStringUTFChars(env, url, u);
-    if (ret < 0 || !ctx)
+
+    if (ret < 0 || !ctx) {
+        if (ctx)
+            avformat_close_input(&ctx);
         return 0;
-    return (jlong)(intptr_t)ctx;
+    }
+    token = ff_format_publish(ctx, FF_FORMAT_SOURCE_INPUT, 0, NULL);
+    return (jlong)token;
 }
 
 /* ------------------------------------------------------------------ */
@@ -8839,153 +9482,24 @@ static int ff_output_session_state(FFOutputSession *s)
 }
 
 /* -------------------------------------------------------------- */
-/* Handle registry.                                                */
+/* Window renderer lifetime.                                       */
 /*                                                                */
-/* The opaque long a caller holds used to be the object address,   */
-/* which makes three failures possible: a stale handle can name a  */
-/* recycled allocation, an arbitrary value is dereferenced without */
-/* any check, and Free() has no way to know whether anyone else is */
-/* still inside the object. This registry fixes all three: a token  */
-/* is a slot index plus a generation counter, lookups are atomic    */
-/* against retirement, and every admitted operation holds a         */
-/* reference so the object cannot disappear underneath it.          */
+/* The renderer used to have a private 32-slot registry of its own */
+/* whose token was built with intptr_t arithmetic. Two defects     */
+/* followed from that: on a 32-bit ABI the generation overflowed   */
+/* into the sign bit (so the token went negative and every lookup  */
+/* was refused), and Free() never released the creator reference,  */
+/* so the slot could never be reused and the 33rd create failed.   */
+/*                                                                */
+/* The renderer is now an ordinary managed object:                */
+/*                                                                */
+/*   - the creator reference is released by the first Free();      */
+/*   - every operation takes a reference before it is admitted;    */
+/*   - the finaliser runs from the release that drops the last     */
+/*     reference, so nothing is destroyed while an operation is    */
+/*     still inside;                                              */
+/*   - the slot is reusable once the finaliser has returned.       */
 /* -------------------------------------------------------------- */
-
-typedef struct FFOutputHandle {
-    void *obj;          /* NULL once retired: the slot is reusable */
-    int   refs;         /* creator + every in-flight operation */
-    int   retired;
-} FFOutputHandle;
-
-typedef struct FFOutputRegistry {
-    pthread_mutex_t lock;
-    int             ready;
-    FFOutputHandle  slots[32];
-    int             gens[32];
-} FFOutputRegistry;
-
-static FFOutputRegistry g_output_registry = {
-    PTHREAD_MUTEX_INITIALIZER, 0, { { 0 } }, { 0 }
-};
-
-static void ff_output_registry_init(void)
-{
-    /* PTHREAD_MUTEX_INITIALIZER does the work; this exists so every call
-     * site reads the same, and so a future dynamic setup has one place. */
-    g_output_registry.ready = 1;
-}
-
-/* Allocate a slot and hand back the token. It starts with the creator's
- * reference; the caller passes it to Java and later calls _put() when it
- * retires the handle. */
-static FFOutputHandle *ff_output_handle_new(void)
-{
-    int i;
-
-    pthread_mutex_lock(&g_output_registry.lock);
-    for (i = 0; i < 32; i++) {
-        FFOutputHandle *h = &g_output_registry.slots[i];
-
-        if (!h->retired && h->refs == 0) {
-            g_output_registry.gens[i] = (g_output_registry.gens[i] + 1) & 0x7fffff;
-            if (!g_output_registry.gens[i])
-                g_output_registry.gens[i] = 1;
-            h->obj     = NULL;
-            h->refs    = 1;
-            h->retired = 0;
-            pthread_mutex_unlock(&g_output_registry.lock);
-            return h;
-        }
-    }
-    pthread_mutex_unlock(&g_output_registry.lock);
-    return NULL;
-}
-
-static jlong ff_output_handle_encode(FFOutputHandle *h)
-{
-    intptr_t idx = h - g_output_registry.slots;
-    int      gen = g_output_registry.gens[idx];
-
-    return (jlong)((((intptr_t)gen + 1) << 16) | ((idx + 1) << 3));
-}
-
-/* Look a token up and take a reference on success. Returns the slot or NULL
- * for anything that is not a live token this process issued. */
-static FFOutputHandle *ff_output_handle_acquire(jlong handle, void **obj_out)
-{
-    int idx, gen;
-    FFOutputHandle *h;
-
-    if (obj_out)
-        *obj_out = NULL;
-    if (handle <= 0)
-        return NULL;
-
-    idx = (int)((handle >> 3) & 0x1fff) - 1;
-    gen = (int)((handle >> 16) & 0x7fffff) - 1;
-    if (idx < 0 || idx >= 32)
-        return NULL;
-
-    ff_output_registry_init();
-    pthread_mutex_lock(&g_output_registry.lock);
-    h = &g_output_registry.slots[idx];
-    if (h->retired || h->refs <= 0 || g_output_registry.gens[idx] != gen) {
-        pthread_mutex_unlock(&g_output_registry.lock);
-        return NULL;
-    }
-    h->refs++;
-    if (obj_out)
-        *obj_out = h->obj;
-    pthread_mutex_unlock(&g_output_registry.lock);
-    return h;
-}
-
-/* Drop one reference. The object itself is freed by destroy_fn when the last
- * reference goes, which is what makes "still in flight" safe: Free() cannot
- * take the object away from an admitted operation. */
-static void ff_output_handle_put(FFOutputHandle *h)
-{
-    if (!h)
-        return;
-    pthread_mutex_lock(&g_output_registry.lock);
-    if (h->refs > 0)
-        h->refs--;
-    /* The slot becomes reusable by _new() only after both the retirement and
-     * the last reference, so a token can never name a newer object. Objects
-     * are released by their owner, not here. */
-    pthread_mutex_unlock(&g_output_registry.lock);
-}
-
-/* Retire a token so no new lookup can succeed. Existing references keep
- * working, which is what lets an admitted operation finish safely. */
-static int ff_output_handle_retire(FFOutputHandle *h)
-{
-    if (!h)
-        return AVERROR(EINVAL);
-    pthread_mutex_lock(&g_output_registry.lock);
-    h->retired = 1;
-    pthread_mutex_unlock(&g_output_registry.lock);
-    return 0;
-}
-
-/* Destroy a partially built entry that was never handed to Java. */
-static void ff_output_handle_discard(FFOutputHandle *h, void (*destroy)(void *))
-{
-    if (!h)
-        return;
-    ff_output_handle_retire(h);
-    if (destroy && h->obj)
-        destroy(h->obj);
-    ff_output_handle_put(h);
-}
-
-/* Bind an object to a token before it is published. */
-static void ff_output_handle_bind(FFOutputHandle *h, void *obj)
-{
-    pthread_mutex_lock(&g_output_registry.lock);
-    h->obj = obj;
-    pthread_mutex_unlock(&g_output_registry.lock);
-}
 
 typedef struct FFWindowRenderer {
     ANativeWindow     *win;
@@ -8994,59 +9508,24 @@ typedef struct FFWindowRenderer {
     int dst_w, dst_h;
     /* Admission control for every operation that touches `win`. */
     FFOutputSession    session;
-    /* Freed only when the last reference to the handle is dropped: a Free()
-     * racing an admitted render must not free the scaler or the locks. */
-    int                destroy_pending;
-    int                locked;
 } FFWindowRenderer;
 
-/* One admitted window operation. `r` is owned for the duration by the
- * handle reference taken at admission, so it cannot be freed underneath. */
+/* One admitted window operation. `r` is kept alive by the registry reference
+ * taken at admission, so it cannot be freed underneath the operation. */
 typedef struct FFWindowOp {
     FFWindowRenderer *r;
-    FFOutputHandle   *h;
+    int64_t           token;
 } FFWindowOp;
 
-/* Admission: take a handle reference, then bump the session's in-flight
- * count under the short gate. Either step failing leaves nothing to undo. */
-static int ff_window_op_begin(jlong handle, FFWindowOp *op)
+/* Release every resource of a renderer exactly once.
+ *
+ * Runs as the registry finaliser, therefore only when no operation holds a
+ * reference any more. It is also the backstop for a teardown that was never
+ * proven: the window is released here if Finish() did not already do it. */
+static void ff_window_renderer_finalize(void *p)
 {
-    void *obj = NULL;
-    FFOutputHandle *h = ff_output_handle_acquire(handle, &obj);
+    FFWindowRenderer *r = p;
 
-    op->r = NULL;
-    op->h = NULL;
-    if (!h)
-        return AVERROR(EINVAL);
-    if (!obj) {
-        ff_output_handle_put(h);
-        return AVERROR(EINVAL);
-    }
-    if (ff_output_session_enter(&((FFWindowRenderer *)obj)->session) < 0) {
-        ff_output_handle_put(h);
-        return AVERROR(EPERM);
-    }
-    op->r = obj;
-    op->h = h;
-    return 0;
-}
-
-static void ff_window_op_end(FFWindowOp *op)
-{
-    if (!op->r)
-        return;
-    ff_output_session_exit(&op->r->session);
-    ff_output_handle_put(op->h);
-    op->r = NULL;
-    op->h = NULL;
-}
-
-/* Release every resource of a renderer exactly once. Called only when no
- * operation can still be inside it. */
-static void ff_window_renderer_destroy(FFWindowRenderer *r)
-{
-    if (!r)
-        return;
     if (r->sws) {
         sws_freeContext(r->sws);
         r->sws = NULL;
@@ -9069,12 +9548,37 @@ static void ff_window_renderer_destroy(FFWindowRenderer *r)
     av_free(r);
 }
 
-/* Free a renderer of which no reference is left. The session lock is not
- * taken here: if no operation holds a reference, no thread can be inside an
- * entry point, and the lock may already be gone with the object. */
-static void ff_window_renderer_destroy_void(void *p)
+/* Admission: take a registry reference first, then bump the session's
+ * in-flight count. The reference is what makes the object outlive a
+ * concurrent Free(); the session count is what makes Finish() able to prove
+ * that no operation is inside. Either step failing leaves nothing to undo. */
+static int ff_window_op_begin(jlong handle, FFWindowOp *op)
 {
-    ff_window_renderer_destroy(p);
+    FFWindowRenderer *r;
+
+    op->r = NULL;
+    op->token = (int64_t)handle;
+    if (!handle)
+        return AVERROR(EINVAL);
+
+    r = ff_handle_acquire((int64_t)handle, FF_HANDLE_TYPE_RENDERER, NULL);
+    if (!r)
+        return AVERROR(EINVAL);
+    if (ff_output_session_enter(&r->session) < 0) {
+        ff_handle_release((int64_t)handle, FF_HANDLE_TYPE_RENDERER);
+        return AVERROR(EPERM);
+    }
+    op->r = r;
+    return 0;
+}
+
+static void ff_window_op_end(FFWindowOp *op)
+{
+    if (!op->r)
+        return;
+    ff_output_session_exit(&op->r->session);
+    ff_handle_release(op->token, FF_HANDLE_TYPE_RENDERER);
+    op->r = NULL;
 }
 
 /* Acquire, run, release. The platform work happens under exec_lock so two
@@ -9102,7 +9606,7 @@ Java_org_ffmpeg_FFMpegNative_windowRendererCreate(JNIEnv *env, jobject thiz, job
 {
     ANativeWindow *win;
     FFWindowRenderer *r;
-    FFOutputHandle *h;
+    int64_t token;
 
     if (!surface)
         return 0;
@@ -9111,18 +9615,14 @@ Java_org_ffmpeg_FFMpegNative_windowRendererCreate(JNIEnv *env, jobject thiz, job
     if (!win)
         return 0;
 
-    ff_output_registry_init();
-    h = ff_output_handle_new();
-    r = h ? av_mallocz(sizeof(*r)) : NULL;
+    r = av_mallocz(sizeof(*r));
     if (!r) {
-        ff_output_handle_discard(h, NULL);
         ANativeWindow_release(win);
         return 0;
     }
     if (pthread_mutex_init(&r->session.lock, NULL) != 0) {
         ANativeWindow_release(win);
         av_free(r);
-        ff_output_handle_discard(h, NULL);
         return 0;
     }
     r->session.lock_ready = 1;
@@ -9130,7 +9630,6 @@ Java_org_ffmpeg_FFMpegNative_windowRendererCreate(JNIEnv *env, jobject thiz, job
         ANativeWindow_release(win);
         pthread_mutex_destroy(&r->session.lock);
         av_free(r);
-        ff_output_handle_discard(h, NULL);
         return 0;
     }
     r->session.exec_ready = 1;
@@ -9140,8 +9639,21 @@ Java_org_ffmpeg_FFMpegNative_windowRendererCreate(JNIEnv *env, jobject thiz, job
     r->session.state     = FF_OUTPUT_ACTIVE;
     r->session.in_flight = 0;
 
-    ff_output_handle_bind(h, r);
-    return ff_output_handle_encode(h);
+    /* The returned token owns the creator reference. */
+    token = ff_handle_create(FF_HANDLE_TYPE_RENDERER, r,
+                             ff_window_renderer_finalize);
+    if (!token) {
+        /* No slot: nothing was published, so everything built here is
+         * released here. */
+        r->win = NULL;
+        r->session.win = NULL;
+        ANativeWindow_release(win);
+        pthread_mutex_destroy(&r->session.exec_lock);
+        pthread_mutex_destroy(&r->session.lock);
+        av_free(r);
+        return 0;
+    }
+    return (jlong)token;
 }
 
 /* Every window operation goes through admission. A revoked session admits
@@ -9246,16 +9758,14 @@ Java_org_ffmpeg_FFMpegNative_windowRendererRender(JNIEnv *env, jobject thiz,
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererRevoke(JNIEnv *env, jobject thiz, jlong handle)
 {
-    void *obj = NULL;
-    FFOutputHandle *h = ff_output_handle_acquire(handle, &obj);
+    FFWindowRenderer *r;
     int ret;
 
-    if (!h || !obj) {
-        ff_output_handle_put(h);
+    r = ff_handle_acquire((int64_t)handle, FF_HANDLE_TYPE_RENDERER, NULL);
+    if (!r)
         return AVERROR(EINVAL);
-    }
-    ret = ff_output_session_revoke(&((FFWindowRenderer *)obj)->session);
-    ff_output_handle_put(h);
+    ret = ff_output_session_revoke(&r->session);
+    ff_handle_release((int64_t)handle, FF_HANDLE_TYPE_RENDERER);
     return ret;
 }
 
@@ -9265,88 +9775,82 @@ Java_org_ffmpeg_FFMpegNative_windowRendererRevoke(JNIEnv *env, jobject thiz, jlo
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererFinish(JNIEnv *env, jobject thiz, jlong handle)
 {
-    void *obj = NULL;
-    FFOutputHandle *h = ff_output_handle_acquire(handle, &obj);
+    FFWindowRenderer *r;
     int ret;
 
-    if (!h || !obj) {
-        ff_output_handle_put(h);
+    r = ff_handle_acquire((int64_t)handle, FF_HANDLE_TYPE_RENDERER, NULL);
+    if (!r)
         return FF_OUTPUT_CLOSED;
-    }
-    ret = ff_output_session_try_finish(&((FFWindowRenderer *)obj)->session);
+    ret = ff_output_session_try_finish(&r->session);
     if (ret == FF_OUTPUT_DETACHED) {
-        /* The window handle is gone; clear the renderer's alias so a later
-         * destroy cannot release it a second time. */
-        FFWindowRenderer *r = obj;
-
+        /* The window handle is gone; clear the renderer's alias so the
+         * finaliser cannot release it a second time. */
         pthread_mutex_lock(&r->session.lock);
         r->win = NULL;
         pthread_mutex_unlock(&r->session.lock);
     }
-    ff_output_handle_put(h);
+    ff_handle_release((int64_t)handle, FF_HANDLE_TYPE_RENDERER);
     return ret;
 }
 
-/* Give up on proving teardown. The session is unusable afterwards and must
- * be dropped rather than reused or rebound. Returns the operations that
+/* Give up on proving teardown. The session is unusable afterwards and the
+ * object is retained for good: a slot is never reused for a renderer whose
+ * teardown could not be shown to have finished. Returns the operations that
  * were still admitted, for diagnostics. */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererQuarantine(JNIEnv *env, jobject thiz, jlong handle)
 {
-    void *obj = NULL;
-    FFOutputHandle *h = ff_output_handle_acquire(handle, &obj);
+    FFWindowRenderer *r;
     int ret;
 
-    if (!h || !obj) {
-        ff_output_handle_put(h);
+    r = ff_handle_acquire((int64_t)handle, FF_HANDLE_TYPE_RENDERER, NULL);
+    if (!r)
         return AVERROR(EINVAL);
-    }
-    ret = ff_output_session_quarantine(&((FFWindowRenderer *)obj)->session);
-    ff_output_handle_put(h);
+    ret = ff_output_session_quarantine(&r->session);
+    /* Keep the object and retire the slot permanently. Leaking one renderer
+     * and one slot is the honest outcome here; reusing either would be a
+     * silent claim of safety the bridge cannot back up. */
+    ff_handle_quarantine((int64_t)handle, FF_HANDLE_TYPE_RENDERER);
+    ff_handle_release((int64_t)handle, FF_HANDLE_TYPE_RENDERER);
     return ret;
 }
 
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererGetState(JNIEnv *env, jobject thiz, jlong handle)
 {
-    void *obj = NULL;
-    FFOutputHandle *h = ff_output_handle_acquire(handle, &obj);
+    FFWindowRenderer *r;
     int ret;
 
-    if (!h || !obj) {
-        ff_output_handle_put(h);
+    r = ff_handle_acquire((int64_t)handle, FF_HANDLE_TYPE_RENDERER, NULL);
+    if (!r)
         return FF_OUTPUT_CLOSED;
-    }
-    ret = ff_output_session_state(&((FFWindowRenderer *)obj)->session);
-    ff_output_handle_put(h);
+    ret = ff_output_session_state(&r->session);
+    ff_handle_release((int64_t)handle, FF_HANDLE_TYPE_RENDERER);
     return ret;
 }
 
-/* Free the renderer. Retires the handle first so no new operation can start;
- * then, only if nothing is in flight and the window reference is already
- * released, destroys it. Otherwise the object is retained for the last
- * admitted operation to release, which is what stops Free() from pulling the
- * scaler, the window or the locks out from under a live producer. */
+/* Free the renderer.
+ *
+ * Revoking stops new operations and drops the creator reference. The object is
+ * then destroyed by whichever release drops the last reference: this call when
+ * nothing is in flight, otherwise the last admitted operation. That is what
+ * makes Free() unable to pull the scaler, the window or the locks out from
+ * under a live producer - and why there is no separate "pending" flag any
+ * more, which had no consumer and could only ever be set. */
 JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_windowRendererFree(JNIEnv *env, jobject thiz, jlong handle)
 {
-    void *obj = NULL;
-    FFOutputHandle *h = ff_output_handle_acquire(handle, &obj);
-    FFWindowRenderer *r = obj;
+    FFWindowRenderer *r;
     int rc;
 
-    if (!h) {
-        /* Never issued, or already freed: nothing to do rather than a
-         * dereference of an arbitrary value. */
-        return;
-    }
+    r = ff_handle_acquire((int64_t)handle, FF_HANDLE_TYPE_RENDERER, NULL);
     if (!r) {
-        ff_output_handle_put(h);
+        /* Never issued, already freed, or not a renderer: nothing to do rather
+         * than a dereference of an arbitrary value. */
         return;
     }
 
     /* No new admission from here on, whatever state the session was in. */
-    ff_output_handle_retire(h);
     ff_output_session_revoke(&r->session);
 
     rc = ff_output_session_try_finish(&r->session);
@@ -9354,21 +9858,18 @@ Java_org_ffmpeg_FFMpegNative_windowRendererFree(JNIEnv *env, jobject thiz, jlong
         pthread_mutex_lock(&r->session.lock);
         r->win = NULL;
         pthread_mutex_unlock(&r->session.lock);
-        /* The creator reference is still ours, so this is the last one. */
-        ff_window_renderer_destroy(r);
     } else {
-        /* Retained whole: scaler, window and locks stay until the last
-         * admitted operation drops its reference. Reporting otherwise would
-         * be a claim the bridge cannot back up. */
+        /* Reporting a completed teardown would be a claim the bridge cannot
+         * back up. The finaliser releases whatever is left once the last
+         * admitted operation has left. */
         av_log(NULL, AV_LOG_WARNING,
                "windowRendererFree: teardown not proven (state %d, %d in "
-               "flight); retaining the whole renderer until it drains\n",
+               "flight); the last operation will finish it\n",
                rc, ff_output_session_in_flight(&r->session));
-        pthread_mutex_lock(&r->session.lock);
-        r->destroy_pending = 1;
-        pthread_mutex_unlock(&r->session.lock);
     }
-    ff_output_handle_put(h);
+
+    ff_handle_revoke((int64_t)handle, FF_HANDLE_TYPE_RENDERER);
+    ff_handle_release((int64_t)handle, FF_HANDLE_TYPE_RENDERER);
 }
 
 /* ------------------------------------------------------------------ */
@@ -9407,11 +9908,12 @@ JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_aacAdtsPackerCreate(JNIEnv *env, jobject thiz,
                                                  jlong formatCtx, jint streamIndex)
 {
-    AVFormatContext *s = PTR(AVFormatContext *, formatCtx);
-    if (!s || streamIndex < 0 || streamIndex >= (jint)s->nb_streams)
+    FF_FORMAT_OP_BEGIN(formatCtx, op, s);
+    AVCodecParameters *par = stream_par_locked(&op, streamIndex);
+
+    if (!s || !par)
         return 0;
-    AVCodecParameters *par = s->streams[streamIndex]->codecpar;
-    if (!par || par->codec_id != AV_CODEC_ID_AAC)
+    if (par->codec_id != AV_CODEC_ID_AAC)
         return 0;
     if (par->extradata_size <= 0 || !par->extradata) {
         av_log(NULL, AV_LOG_WARNING, "aac adts: no extradata (AudioSpecificConfig), cannot pack\n");
@@ -9544,18 +10046,19 @@ Java_org_ffmpeg_FFMpegNative_aacAdtsPackerFree(JNIEnv *env, jobject thiz, jlong 
 /* per poll would be both slow and deadlock-prone during teardown.       */
 /* ------------------------------------------------------------------ */
 
-static int ff_jni_interrupt_cb(void *opaque)
-{
-    const FFInterruptFlag *f = (const FFInterruptFlag *)opaque;
-    return f && f->aborted;
-}
-
-/* Allocate a cleared interrupt flag. Free with interruptFlagFree once no
- * AVFormatContext references it any more. @return handle, 0 on OOM. */
+/* Allocate a cleared interrupt flag.
+ *
+ * The flag is a registry object, so it has an identity that can be checked and
+ * a lifetime that a format context can share. Java's handle owns one
+ * (creator) reference; every format context that polls it holds another, and
+ * that is what lets interruptFlagFree() run before the context is closed
+ * without leaving libavformat calling into freed memory.
+ *
+ * @return the token, or 0 on allocation failure. */
 JNIEXPORT jlong JNICALL
 Java_org_ffmpeg_FFMpegNative_interruptFlagCreate(JNIEnv *env, jobject thiz)
 {
-    return (jlong)(intptr_t)av_mallocz(sizeof(FFInterruptFlag));
+    return (jlong)ff_interrupt_create();
 }
 
 /* Install the flag as ctx->interrupt_callback. Must be called before the
@@ -9566,35 +10069,38 @@ JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_formatSetInterruptFlag(JNIEnv *env, jobject thiz,
                                                     jlong ctx, jlong flag)
 {
-    AVFormatContext *c = PTR(AVFormatContext *, ctx);
-    FFInterruptFlag *f = PTR(FFInterruptFlag *, flag);
-    if (!c || !f)
-        return AVERROR(EINVAL);
-    c->interrupt_callback.callback = ff_jni_interrupt_cb;
-    c->interrupt_callback.opaque   = f;
-    return 0;
+    int rc = ff_format_attach_interrupt((int64_t)ctx, (int64_t)flag);
+
+    if (rc == AVERROR(EPERM)) {
+        /* A different flag is already bound. Replacing it would leave
+         * libavformat polling a released flag, possibly already inside a
+         * protocol's callback data, so the request is refused. */
+        ff_jni_throw_stale(env, "ffmpeg.handle.interrupt_bound",
+                           "formatSetInterruptFlag");
+    } else if (rc == AVERROR(EINVAL)) {
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale",
+                           "formatSetInterruptFlag");
+    }
+    return (jint)rc;
 }
 
 /* Raise the flag: in-flight and subsequent blocking I/O on any context
- * holding it fails with AVERROR_EXIT. Safe to call from any thread, and
- * safe to call repeatedly. */
+ * holding it fails with AVERROR_EXIT. Safe to call from any thread, safe to
+ * call repeatedly, and deliberately non-blocking: a close that waited here
+ * would deadlock with the read it is trying to unblock. */
 JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_interruptFlagAbort(JNIEnv *env, jobject thiz, jlong flag)
 {
-    FFInterruptFlag *f = PTR(FFInterruptFlag *, flag);
-    if (f)
-        f->aborted = 1;
+    ff_interrupt_abort((int64_t)flag);
 }
 
-/* Free the flag. The caller must guarantee that no AVFormatContext still
- * points at it (close the contexts first), otherwise their callback would
- * read freed memory. */
+/* Drops Java's reference to the flag. A format context that still polls it
+ * keeps it alive, so this may be called before the context is closed; the
+ * object is freed when the last context releases it. */
 JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_interruptFlagFree(JNIEnv *env, jobject thiz, jlong flag)
 {
-    FFInterruptFlag *f = PTR(FFInterruptFlag *, flag);
-    if (f)
-        av_free(f);
+    ff_interrupt_revoke((int64_t)flag);
 }
 
 /* ------------------------------------------------------------------ */
