@@ -10563,7 +10563,7 @@ Java_org_ffmpeg_FFMpegNative_aacAdtsPackerCreate(JNIEnv *env, jobject thiz,
     int channel_conf      = m4ac.chan_config;
 
     /* Legality checks mirror adts_decode_extradata(); each failure is logged
-     * separately so "设备丝支�? and "砝浝装丝�?ADTS" can be told apart. */
+     * separately so "设备不支持" and "码流装不下 ADTS" can be told apart. */
     if (objecttype > 3) {
         av_log(NULL, AV_LOG_WARNING,
                "aac adts: MPEG-4 AOT %d is not allowed in ADTS\n", objecttype + 1);
