@@ -80,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ccache pkg-config meson ninja-build
+          sudo apt-get install -y ccache pkg-config meson ninja-build gperf
           ccache --version
 
       - name: Cache ccache
@@ -245,7 +245,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.BUILD_DIR }}/deps-install
-          key: deps-${{ matrix.abi }}-fribidi1.0.16-ft2.13.3-hb9.0.0-ass0.17.3-pic-v2
+          key: deps-${{ matrix.abi }}-fribidi1.0.16-ft2.13.3-hb9.0.0-expat2.6.4-fc2.15.0-ass0.17.3-pic-v3
           restore-keys: |
             deps-${{ matrix.abi }}-
 
@@ -254,12 +254,15 @@ jobs:
         run: |
           set -euo pipefail
           NDK_BIN="${{ steps.ndk.outputs.ndk_bin }}"
+          NDK_ROOT="${{ steps.ndk.outputs.ndk_root }}"
           SYSROOT="$(cd "$NDK_BIN/.." && pwd)/sysroot"
           # Plain toolchain clang (not the API wrappers): the target triple,
           # API level and --sysroot go into the meson cross file explicitly,
           # mirroring the layout libass's own Android CI uses.
           CC="$NDK_BIN/clang"
           CXX="$NDK_BIN/clang++"
+          # API-level driver for CMake projects (meson uses --target/--sysroot).
+          CC_API="$NDK_BIN/${{ matrix.clang_triple }}${ANDROID_API}-clang"
           AR="$NDK_BIN/llvm-ar"
           STRIP="$NDK_BIN/llvm-strip"
           DEPS="$PWD/$BUILD_DIR/deps-install"
@@ -318,6 +321,24 @@ jobs:
             echo "::endgroup::"
           }
 
+          build_cmake_one() {
+            # <name> <url> <source subdir> [extra cmake options]. Expat ships
+            # CMake, not meson, build files; use the API-level clang driver so
+            # the sysroot/ABI match the meson cross file below.
+            local name="$1" url="$2" subdir="$3"; shift 3
+            echo "::group::$name"
+            mkdir -p "$BUILD_DIR/$name-src"
+            curl -fsSL "$url" | tar xz -C "$BUILD_DIR/$name-src" --strip-components=1
+            cmake -S "$BUILD_DIR/$name-src/$subdir" -B "$BUILD_DIR/$name-build" \
+              -DCMAKE_C_COMPILER="$CC_API" \
+              -DCMAKE_INSTALL_PREFIX="$DEPS" -DCMAKE_INSTALL_LIBDIR=lib \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              "$@"
+            cmake --build "$BUILD_DIR/$name-build" --parallel "$(nproc)"
+            cmake --install "$BUILD_DIR/$name-build"
+            echo "::endgroup::"
+          }
+
           # Order matters: later packages find the earlier ones' .pc files
           # through PKG_CONFIG_LIBDIR.  Versions here also appear in the cache key.
           build_one fribidi \
@@ -337,15 +358,32 @@ jobs:
             https://github.com/harfbuzz/harfbuzz/archive/refs/tags/9.0.0.tar.gz \
             -Dtests=disabled -Dicu=disabled -Dglib=disabled -Dgobject=disabled \
             -Dcairo=disabled -Dfreetype=disabled -Dintrospection=disabled -Dchafa=disabled
-          # libass without a font provider on Android: MKV embedded fonts go
-          # through ass_add_font() (registered by the JNI ass* entry points)
-          # and fontsdir/fallback cover the rest.  require-system-font-provider
-          # defaults TRUE and aborts 0.17.3 without an explicit false.
-          # libunibreak stays auto-off (nodownload keeps its wrap out of reach;
-          # libass falls back to built-in line-break tables).
+          # expat: fontconfig's XML parser. NDK sysroot has no expat, so build
+          # the static archive and its .pc into the same prefix. XML_STATIC is
+          # required for consumers that link the archive on Windows hosts.
+          build_cmake_one expat \
+            https://github.com/libexpat/libexpat/archive/refs/tags/R_2_6_4.tar.gz \
+            expat \
+            -DEXPAT_BUILD_TOOLS=OFF -DEXPAT_BUILD_EXAMPLES=OFF \
+            -DEXPAT_BUILD_TESTS=OFF -DEXPAT_SHARED_LIBS=OFF \
+            -DEXPAT_BUILD_PKGCONFIG=ON -DCMAKE_C_FLAGS="-fPIC -DXML_STATIC"
+          # fontconfig: use the GitHub mirror of the 2.15.0 release (the
+          # freedesktop GitLab requires a browser challenge). The compiled-in
+          # fallback config must point at Android's font directories; the app
+          # additionally supplies its own fonts.conf through ass_set_fonts().
+          build_one fontconfig \
+            https://github.com/fontconfig/fontconfig/archive/refs/tags/2.15.0.tar.gz \
+            -Dtests=disabled -Dtools=disabled -Ddoc=disabled -Dnls=disabled \
+            -Dcache-build=disabled -Diconv=disabled \
+            -Ddefault-fonts-dirs=/system/fonts -Dadditional-fonts-dirs=no \
+            -Dcache-dir=/data/local/tmp/fc-cache
+          # libass with a real system font provider: this is what makes
+          # get_fallback(codepoint) search the whole font set instead of only
+          # the default family. require-system-font-provider=true turns a
+          # missing fontconfig .pc into a hard configure error.
           build_one libass \
             https://github.com/libass/libass/archive/refs/tags/0.17.3.tar.gz \
-            -Dfontconfig=disabled -Drequire-system-font-provider=false
+            -Dfontconfig=enabled -Drequire-system-font-provider=true
 
           # libass is C++ but meson's pkgconfig generator does not always add
           # the C++ runtime to Libs.private; FFmpeg's configure link test uses
@@ -354,10 +392,27 @@ jobs:
             echo 'Libs.private=' >> "$DEPS/lib/pkgconfig/libass.pc"
           grep -Eq 'stdc\+\+|-lc\+\+' "$DEPS/lib/pkgconfig/libass.pc" || \
             sed -i 's/^Libs\.private=.*/& -lstdc++/' "$DEPS/lib/pkgconfig/libass.pc"
+          # Static fontconfig also needs expat, which is not a public Requires.
+          for pc in libass fontconfig; do
+            grep -q '^Libs\.private=' "$DEPS/lib/pkgconfig/$pc.pc" || \
+              echo 'Libs.private=' >> "$DEPS/lib/pkgconfig/$pc.pc"
+          done
+          if ! grep -q 'expat' "$DEPS/lib/pkgconfig/fontconfig.pc"; then
+            if grep -q '^Requires\.private=' "$DEPS/lib/pkgconfig/fontconfig.pc"; then
+              sed -i 's/^Requires\.private=.*/& expat/' "$DEPS/lib/pkgconfig/fontconfig.pc"
+            else
+              echo 'Requires.private=expat' >> "$DEPS/lib/pkgconfig/fontconfig.pc"
+            fi
+          fi
+          grep -q 'expat' "$DEPS/lib/pkgconfig/fontconfig.pc"
           ls -l "$DEPS/lib" "$DEPS/lib/pkgconfig"
           test -f "$DEPS/lib/libass.a"
           test -f "$DEPS/lib/pkgconfig/libass.pc"
           test -f "$DEPS/include/ass/ass.h"
+          test -f "$DEPS/lib/libfontconfig.a"
+          test -f "$DEPS/lib/libexpat.a"
+          test -f "$DEPS/lib/pkgconfig/fontconfig.pc"
+          test -f "$DEPS/include/fontconfig/fontconfig.h"
 
       - name: Configure FFmpeg
         env:
@@ -398,12 +453,13 @@ jobs:
           # --enable-hwaccel* flags are no longer separate configure options:
           # the mediacodec hwaccel is auto-selected by the decoders above.
           # --enable-libass pulls in the "subtitles"/"ass" filters (see the
-          # libass dependency stack step).  fontconfig is deliberately NOT
-          # enabled: it is only a drawtext/showcqt extra (subtitles_filter_deps
-          # is "avformat avcodec libass"), and there is no usable
-          # system fonts.conf on Android — embedded MKV fonts go through
-          # ass_add_font()/fontsdir instead.  fribidi+harfbuzz are built, so
-          # also enable them for the drawtext font path.
+          # libass dependency stack step).  fontconfig is now built into the
+          # same prefix: libass uses it as its system font provider, so
+          # --enable-libfontconfig records the dependency in config.h and
+          # lets the subtitle filter use the same provider.  The app passes
+          # its own fonts.conf path through assSetFontsWithConfig().
+          # fribidi+harfbuzz are built, so also enable them for the drawtext
+          # font path.
           ./configure \
             --target-os=android --enable-cross-compile \
             --arch=${{ matrix.arch }} \
@@ -415,7 +471,8 @@ jobs:
             --enable-version3 \
             --enable-mbedtls --enable-libcurl --enable-protocol=libcurl \
             --pkg-config-flags="--static" \
-            --enable-libass --enable-libfreetype --enable-libfribidi --enable-libharfbuzz \
+            --enable-libass --enable-libfontconfig --enable-libfreetype \
+            --enable-libfribidi --enable-libharfbuzz \
             --enable-jni --enable-mediacodec \
             --extra-cflags="-fPIC -O2" \
             --extra-ldflags="-lm -lz" \
@@ -430,9 +487,9 @@ jobs:
             ffbuild/config.mak 2>/dev/null || true
           echo "::endgroup::"
           if [ "${CFGRES:-0}" -ne 0 ]; then exit "$CFGRES"; fi
-          for flag in CONFIG_LIBCURL CONFIG_LIBCURL_PROTOCOL CONFIG_MBEDTLS; do
+          for flag in CONFIG_LIBCURL CONFIG_LIBCURL_PROTOCOL CONFIG_MBEDTLS CONFIG_LIBFONTCONFIG; do
             if ! grep -qx "$flag=yes" ffbuild/config.mak; then
-              echo "::error::$flag is not enabled (proxy backend would be unavailable)"
+              echo "::error::$flag is not enabled (proxy/fontconfig backend would be unavailable)"
               exit 1
             fi
           done
@@ -526,6 +583,7 @@ jobs:
           bridge_names = (
               "BRIDGE_API_MAJOR", "BRIDGE_API_MINOR", "CAP_STREAM_SIDE_DATA",
               "CAP_FRAME_SIDE_DATA", "CAP_SIDE_DATA_TYPES", "CAP_VIDEO_METADATA_SNAPSHOT",
+              "CAP_ASS_FONTCONFIG",
               "DOVI_CONFIG_SLOTS", "MASTERING_DISPLAY_SLOTS",
               "CONTENT_LIGHT_SLOTS", "DISPLAY_MATRIX_SLOTS",
           )
@@ -633,7 +691,8 @@ jobs:
                       packetSideDataName frameSideDataName streamGetDoviConfig \
                       streamGetMasteringDisplayMetadata frameGetMasteringDisplayMetadata \
                       streamGetContentLightMetadata frameGetContentLightMetadata \
-                      streamGetDisplayMatrix frameGetDisplayMatrix; do
+                       streamGetDisplayMatrix frameGetDisplayMatrix \
+                       assSetFontsWithConfig assSetFontsDirChecked; do
             grep -qx "Java_org_ffmpeg_FFMpegNative_$sym" /tmp/implemented_jni.txt || {
               echo "::error::bridge contract entry point missing: $sym"
               exit 1
@@ -772,7 +831,7 @@ jobs:
             -lmbedtls -lmbedx509 -lmbedcrypto \
             -Wl,--end-group \
             -Wl,--start-group \
-            -lass -lharfbuzz -lfreetype -lfribidi \
+            -lass -lfontconfig -lexpat -lharfbuzz -lfreetype -lfribidi \
             -Wl,--end-group \
             -static-libstdc++ \
             -lmediandk -landroid -ljnigraphics \
@@ -893,8 +952,10 @@ jobs:
                       Java_org_ffmpeg_FFMpegNative_assTrackGetPlayResY \
                       Java_org_ffmpeg_FFMpegNative_assAddFont \
                       Java_org_ffmpeg_FFMpegNative_assClearFonts \
-                      Java_org_ffmpeg_FFMpegNative_assSetFontsDir \
-                      Java_org_ffmpeg_FFMpegNative_assSetFonts \
+                       Java_org_ffmpeg_FFMpegNative_assSetFontsDir \
+                       Java_org_ffmpeg_FFMpegNative_assSetFontsDirChecked \
+                       Java_org_ffmpeg_FFMpegNative_assSetFonts \
+                       Java_org_ffmpeg_FFMpegNative_assSetFontsWithConfig \
                       Java_org_ffmpeg_FFMpegNative_assSetFrameSize \
                       Java_org_ffmpeg_FFMpegNative_assSetStorageSize \
                       Java_org_ffmpeg_FFMpegNative_assSetMargins \
@@ -970,6 +1031,16 @@ jobs:
             fi
           done
           echo "libass subtitle rendering symbols present"
+          # fontconfig must be part of libass's system font provider, not just
+          # compiled into the build tree: a missing Fc symbol means the .so
+          # would silently fall back to the old default-family behaviour.
+          for sym in FcInitLoadConfigAndFonts FcConfigBuildFonts FcFontSort FcCharSetHasChar; do
+            if ! grep -q " ${sym}$" /tmp/jni_syms.txt; then
+              echo "::error::libffmpeg_jni.so missing ${sym} (fontconfig font provider not linked)"
+              exit 1
+            fi
+          done
+          echo "fontconfig font provider symbols present"
           # Verify at least one MediaCodec hardware decoder is actually linked
           # in. The ff_<name>_mediacodec_decoder FFCodec objects are static
           # globals (in .symtab, not .dynsym), so this must use the --start-group
@@ -1087,7 +1158,7 @@ jobs:
             "${CURL_LIBS[@]}" \
             -lmbedtls -lmbedx509 -lmbedcrypto \
             -Wl,--end-group \
-            -Wl,--start-group -lass -lharfbuzz -lfreetype -lfribidi -Wl,--end-group \
+            -Wl,--start-group -lass -lfontconfig -lexpat -lharfbuzz -lfreetype -lfribidi -Wl,--end-group \
             -static-libstdc++ \
             -lmediandk -landroid -ljnigraphics \
             -llog -ldl -lm -lz \

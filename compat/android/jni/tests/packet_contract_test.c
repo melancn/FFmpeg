@@ -2552,7 +2552,7 @@ static void test_release_capabilities(void)
     CHECK(Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(NULL, NULL) ==
           FF_JNI_BRIDGE_API_VERSION);
     CHECK(FF_JNI_BRIDGE_API_MAJOR == 2);
-    CHECK(FF_JNI_BRIDGE_API_MINOR == 0);
+    CHECK(FF_JNI_BRIDGE_API_MINOR == 1);
 
     /* Promised by this release, each with a test set behind it. */
     CHECK(caps & FF_JNI_CAP_PCM_SESSION_SAFE_V2);
@@ -2595,6 +2595,13 @@ static void test_release_capabilities(void)
 #else
     CHECK((caps & FF_JNI_CAP_LIBASS_FONT_LOG) == 0);
 #endif
+    /* 2.1 fontconfig provider: only a build that links libass + fontconfig
+     * may advertise the new entry points. */
+#if CONFIG_LIBASS && CONFIG_LIBFONTCONFIG
+    CHECK(caps & FF_JNI_CAP_ASS_FONTCONFIG);
+#else
+    CHECK((caps & FF_JNI_CAP_ASS_FONTCONFIG) == 0);
+#endif
 
     /* NOT promised: batch B is deferred. This is the assertion that must
      * fail first if a later change starts advertising scoped accounting
@@ -2632,6 +2639,9 @@ static void test_release_capabilities(void)
 #if CONFIG_LIBASS
         known |= FF_JNI_CAP_LIBASS_FONT_LOG;
 #endif
+#if CONFIG_LIBASS && CONFIG_LIBFONTCONFIG
+        known |= FF_JNI_CAP_ASS_FONTCONFIG;
+#endif
 
         CHECK((caps & ~known) == 0);
     }
@@ -2652,14 +2662,18 @@ static void test_release_capabilities(void)
     CHECK(FF_JNI_CAP_FRAME_SIDE_DATA == (1LL << 16));
     CHECK(FF_JNI_CAP_SIDE_DATA_TYPES == (1LL << 17));
     CHECK(FF_JNI_CAP_VIDEO_METADATA_SNAPSHOT == (1LL << 18));
+    CHECK(FF_JNI_CAP_ASS_FONTCONFIG == (1LL << 24));
 
     /* The whole mask for this release, written out once so an unannounced
      * bit is a test failure rather than a silent contract change. The 1.5
-     * libass bit is present only in a libass build. */
-#if CONFIG_LIBASS
-    CHECK(caps == (jlong)0x7f37f);
+     * libass bit is present only in a libass build; the 2.1 fontconfig bit
+     * additionally requires CONFIG_LIBFONTCONFIG. */
+#if CONFIG_LIBASS && CONFIG_LIBFONTCONFIG
+    CHECK(caps == (jlong)0x1FFF37F);
+#elif CONFIG_LIBASS
+    CHECK(caps == (jlong)0xFFF37F);
 #else
-    CHECK(caps == (jlong)0x7b37f);
+    CHECK(caps == (jlong)0xFFB37F);
 #endif
 }
 

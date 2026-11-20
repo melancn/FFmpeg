@@ -2645,12 +2645,34 @@ public final class FFMpegNative {
     public native void assClearFonts(long lib);
     /** Extra directory scanned by the selected font provider. */
     public native void assSetFontsDir(long lib, String dir);
+
+    /**
+     * 2.1: same as {@link #assSetFontsDir(long, String)} but reports whether
+     * the directory could be handed to libass.
+     * @return 0 on success, negative AVERROR for a bad handle or path
+     */
+    public native int assSetFontsDirChecked(long lib, String dir);
+
     /**
      * Enable font matching after the embedded fonts are registered.
      * @param provider {@code ASS_FONT_SELECT_*}
      * @return 0 on success, negative AVERROR
      */
     public native int assSetFonts(long rend, String defaultFont, String defaultFamily, int provider);
+
+    /**
+     * 2.1: fontconfig-backed variant of {@link #assSetFonts}. {@code configPath}
+     * is an absolute path to a fonts.conf file (assets must be copied to
+     * filesDir first). Passing it makes libass scan the configured font
+     * directories immediately, so missing-glyph fallback can select any
+     * installed face instead of only the default family.
+     *
+     * <p>Gate on {@link org.ffmpeg.consts.BridgeApi#CAP_ASS_FONTCONFIG}.
+     * @return 0 on success, negative AVERROR
+     */
+    public native int assSetFontsWithConfig(long rend, String defaultFont,
+                                             String defaultFamily, int provider,
+                                             String configPath);
 
     /** Set the target frame (view) size in pixels. */
     public native void assSetFrameSize(long rend, int w, int h);

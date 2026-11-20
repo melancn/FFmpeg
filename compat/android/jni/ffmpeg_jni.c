@@ -654,8 +654,14 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  *
  * A 1.x JAR must not be used with a 2.x library: its longs are addresses and
  * will be refused, which is the intended failure. Callers must compare the
- * major version and gate each feature on its capability bit. */
-#define FF_JNI_BRIDGE_API_MINOR 0
+ * major version and gate each feature on its capability bit.
+ *
+ * 2.1 appends the fontconfig-backed font provider: assSetFontsWithConfig()
+ * passes a fonts.conf path and forces an immediate font scan, and
+ * assSetFontsDirChecked() reports directory setup failures that the old void
+ * assSetFontsDir() could not. Both are additive; a 2.0 caller is unaffected.
+ * The bit is only advertised when libass and libfontconfig are compiled in. */
+#define FF_JNI_BRIDGE_API_MINOR 1
 #define FF_JNI_BRIDGE_API_VERSION \
     ((FF_JNI_BRIDGE_API_MAJOR << 16) | FF_JNI_BRIDGE_API_MINOR)
 
@@ -751,6 +757,11 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
 /* 2.0: the window renderer releases its creator reference on Free() and its
  * slot is reusable, with destruction deferred to the last operation. */
 #define FF_JNI_CAP_RENDERER_SLOT_RECYCLE    (1LL << 23)
+/* 2.1: assSetFontsWithConfig() loads a caller-supplied fonts.conf and scans
+ * system fonts immediately; assSetFontsDirChecked() reports the directory
+ * setup result. Only set for builds that link libass with its fontconfig
+ * system font provider. */
+#define FF_JNI_CAP_ASS_FONTCONFIG           (1LL << 24)
 
 /* Bumped whenever the packet budget accounting rules change, so a stored
  * charge value can be attributed to the policy that produced it. */
@@ -911,8 +922,9 @@ Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
      * advertised merely because a constant exists: an older library answers
      * 0, and the caller must gate on the bit.
      *
-     * The 1.5 libass bit is conditional: the entry points live inside
-     * #if CONFIG_LIBASS, so a non-libass build must not claim them. */
+      * The 1.5 libass bit is conditional: the entry points live inside
+      * #if CONFIG_LIBASS, so a non-libass build must not claim them. The 2.1
+      * fontconfig bit needs both libass and CONFIG_LIBFONTCONFIG. */
     jlong caps = (jlong)(FF_JNI_CAP_PACKET_BUDGET_INFO |
                          FF_JNI_CAP_SIDE_DATA_EXACT_COPY |
                          FF_JNI_CAP_BRIDGE_BUILD_INFO |
@@ -935,6 +947,9 @@ Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
                          FF_JNI_CAP_RENDERER_SLOT_RECYCLE);
 #if CONFIG_LIBASS
     caps |= (jlong)FF_JNI_CAP_LIBASS_FONT_LOG;
+#if CONFIG_LIBFONTCONFIG
+    caps |= (jlong)FF_JNI_CAP_ASS_FONTCONFIG;
+#endif
 #endif
     return caps;
 }
@@ -8764,8 +8779,52 @@ Java_org_ffmpeg_FFMpegNative_assSetFontsDir(JNIEnv *env, jobject thiz, jlong lib
     if (!l || !dir)
         return;
     const char *d = (*env)->GetStringUTFChars(env, dir, NULL);
+    if (!d)
+        return;
     ass_set_fonts_dir(l, d);
     (*env)->ReleaseStringUTFChars(env, dir, d);
+}
+
+/* Same operation with a result code. The void form above is retained for JAR
+ * compatibility; callers gating on CAP_ASS_FONTCONFIG can use this one. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assSetFontsDirChecked(JNIEnv *env, jobject thiz,
+                                                   jlong lib, jstring dir)
+{
+    ASS_Library *l = PTR(ASS_Library *, lib);
+    if (!l || !dir)
+        return AVERROR(EINVAL);
+    const char *d = (*env)->GetStringUTFChars(env, dir, NULL);
+    if (!d)
+        return AVERROR(EINVAL);
+    ass_set_fonts_dir(l, d);
+    (*env)->ReleaseStringUTFChars(env, dir, d);
+    return 0;
+}
+
+static jint ass_set_fonts_impl(JNIEnv *env, jlong rend, jstring defaultFont,
+                               jstring defaultFamily, jint provider,
+                               jstring configPath)
+{
+    ASS_Renderer *r = PTR(ASS_Renderer *, rend);
+    if (!r)
+        return AVERROR(EINVAL);
+    const char *df = defaultFont ? (*env)->GetStringUTFChars(env, defaultFont, NULL) : NULL;
+    const char *fam = defaultFamily ? (*env)->GetStringUTFChars(env, defaultFamily, NULL) : NULL;
+    const char *cfg = configPath ? (*env)->GetStringUTFChars(env, configPath, NULL) : NULL;
+    if ((defaultFont && !df) || (defaultFamily && !fam) || (configPath && !cfg)) {
+        if (df) (*env)->ReleaseStringUTFChars(env, defaultFont, df);
+        if (fam) (*env)->ReleaseStringUTFChars(env, defaultFamily, fam);
+        if (cfg) (*env)->ReleaseStringUTFChars(env, configPath, cfg);
+        return AVERROR(EINVAL);
+    }
+    /* A config path must be accompanied by update=1: otherwise fontconfig's
+     * font set stays empty and get_fallback() always returns NULL. */
+    ass_set_fonts(r, df, fam, (int)provider, cfg, cfg ? 1 : 0);
+    if (defaultFont)   (*env)->ReleaseStringUTFChars(env, defaultFont, df);
+    if (defaultFamily) (*env)->ReleaseStringUTFChars(env, defaultFamily, fam);
+    if (configPath)    (*env)->ReleaseStringUTFChars(env, configPath, cfg);
+    return 0;
 }
 
 /* ass_set_fonts passthrough: provider = ASS_FONT_SELECT_* (Java constants:
@@ -8777,17 +8836,22 @@ Java_org_ffmpeg_FFMpegNative_assSetFonts(JNIEnv *env, jobject thiz, jlong rend,
                                          jstring defaultFont, jstring defaultFamily,
                                          jint provider)
 {
-    ASS_Renderer *r = PTR(ASS_Renderer *, rend);
-    if (!r)
-        return AVERROR(EINVAL);
-    const char *df = defaultFont ? (*env)->GetStringUTFChars(env, defaultFont, NULL) : NULL;
-    const char *fam = defaultFamily ? (*env)->GetStringUTFChars(env, defaultFamily, NULL) : NULL;
-    ass_set_fonts(r, df, fam, (int)provider, NULL, 0);
-    if (defaultFont)
-        (*env)->ReleaseStringUTFChars(env, defaultFont, df);
-    if (defaultFamily)
-        (*env)->ReleaseStringUTFChars(env, defaultFamily, fam);
-    return 0;
+    return ass_set_fonts_impl(env, rend, defaultFont, defaultFamily, provider, NULL);
+}
+
+/* 2.1: as above, but configPath is the absolute path of a fonts.conf that the
+ * caller copied out of its assets. libass loads it via FcConfigParseAndLoad
+ * and immediately scans the configured directories. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_assSetFontsWithConfig(JNIEnv *env, jobject thiz,
+                                                   jlong rend,
+                                                   jstring defaultFont,
+                                                   jstring defaultFamily,
+                                                   jint provider,
+                                                   jstring configPath)
+{
+    return ass_set_fonts_impl(env, rend, defaultFont, defaultFamily,
+                              provider, configPath);
 }
 
 /* Renderer geometry / style tweaks. */

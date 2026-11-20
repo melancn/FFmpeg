@@ -22,9 +22,10 @@ public final class BridgeApi {
      * adds {@link #CAP_PCM_SESSION_SAFE_V2} / {@link #CAP_RENDERER_SAFE_CLOSE}.
      * 1.3 appends the audio format snapshot entry points. 1.4 appends the
      * video diagnostics. 1.5 appends the libass message channel. 2.0 makes
-     * five handle kinds opaque tokens and changes the close protocol.
+     * five handle kinds opaque tokens and changes the close protocol. 2.1
+     * appends the fontconfig-backed font setup entry points.
      */
-    public static final int BRIDGE_API_MINOR = 0;
+    public static final int BRIDGE_API_MINOR = 1;
 
     /** {@code major << 16 | minor}; 2.0 is {@code 0x00020000}. */
     public static final int BRIDGE_API_VERSION = (BRIDGE_API_MAJOR << 16) | BRIDGE_API_MINOR;
@@ -96,4 +97,11 @@ public final class BridgeApi {
 
     /** 2.0: the window renderer releases its creator reference and recycles slots. */
     public static final long CAP_RENDERER_SLOT_RECYCLE = 1L << 23;
+
+    /**
+     * 2.1: {@code assSetFontsWithConfig} loads a caller-supplied fonts.conf
+     * and {@code assSetFontsDirChecked} reports directory setup failures.
+     * Only advertised when libass was built with its fontconfig provider.
+     */
+    public static final long CAP_ASS_FONTCONFIG = 1L << 24;
 }
