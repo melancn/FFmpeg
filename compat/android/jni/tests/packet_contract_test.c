@@ -2869,6 +2869,65 @@ static void test_video_diagnostics(void)
         NULL, NULL, (jlong)(intptr_t)mc_cc);
 }
 
+/* The async worker's queue helpers. av_fifo_read()/av_fifo_write() return 0
+ * on success and a negative AVERROR on failure -- never an element count. The
+ * previous worker treated "read result != 1" as an empty queue, so it exited
+ * on the first successful pop and decoded nothing at all. These cases pin the
+ * helper contract that replaced it, and pin that a full bounded queue rejects
+ * the write instead of silently dropping the reference. */
+static void test_async_decoder_queue_helpers(void)
+{
+    FFAsyncDecoder d;
+    AVPacket *p0 = make_payload_packet(8);
+    AVPacket *p1 = make_payload_packet(8);
+    AVPacket *p2 = make_payload_packet(8);
+    AVPacket *p3 = make_payload_packet(8);
+    AVPacket *out = NULL;
+
+    CHECK(p0 && p1 && p2 && p3);
+    if (!p0 || !p1 || !p2 || !p3)
+        return;
+
+    memset(&d, 0, sizeof(d));
+    d.packets = av_fifo_alloc2(2, sizeof(AVPacket *), 0);
+    CHECK(d.packets != NULL);
+    if (!d.packets)
+        return;
+
+    /* Empty queue is EAGAIN, not a fatal error, and leaves out untouched. */
+    CHECK_AVERROR(ff_async_decoder_pop_packet_locked(&d, &out), EAGAIN);
+    CHECK(out == NULL);
+
+    CHECK(av_fifo_write(d.packets, &p0, 1) == 0);
+    CHECK(av_fifo_write(d.packets, &p1, 1) == 0);
+    CHECK(av_fifo_can_read(d.packets) == 2);
+    CHECK(av_fifo_can_write(d.packets) == 0);
+    /* Full queue: the caller must observe the failure and keep its packet. */
+    CHECK(av_fifo_write(d.packets, &p2, 1) < 0);
+    CHECK(av_fifo_can_read(d.packets) == 2);
+
+    /* FIFO order, success reported as 0. */
+    CHECK(ff_async_decoder_pop_packet_locked(&d, &out) == 0);
+    CHECK(out == p0);
+    out = NULL;
+    CHECK(ff_async_decoder_pop_packet_locked(&d, &out) == 0);
+    CHECK(out == p1);
+    out = NULL;
+    CHECK_AVERROR(ff_async_decoder_pop_packet_locked(&d, &out), EAGAIN);
+
+    /* Retirement drops every queued packet, not just the first one. */
+    CHECK(av_fifo_write(d.packets, &p2, 1) == 0);
+    CHECK(av_fifo_write(d.packets, &p3, 1) == 0);
+    ff_async_decoder_drop_packets_locked(&d);
+    CHECK(av_fifo_can_read(d.packets) == 0);
+    CHECK_AVERROR(ff_async_decoder_pop_packet_locked(&d, &out), EAGAIN);
+
+    av_fifo_freep2(&d.packets);
+    av_packet_free(&p0);
+    av_packet_free(&p1);
+    /* p2/p3 were owned by the queue and freed by the drop above. */
+}
+
 /* 2.2 async adapter: a managed token is used for the adapter, so stale and
  * never-issued handles must be refused before any native state is touched.
  * A real decode needs a worker thread and a Java callback, so the positive
@@ -5501,6 +5560,7 @@ int main(void)
     test_pcm_session_rejects_planar_output();
     test_pcm_convert_status_initialised_on_refusal();
     test_video_diagnostics();
+    test_async_decoder_queue_helpers();
     test_async_decoder_adapter_contract();
     test_release_capabilities();
     test_libass_log_level();

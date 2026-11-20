@@ -833,16 +833,38 @@ public final class FFMpegNative {
 
     /**
      * Queue one packet. The packet is copied, so the caller keeps ownership.
-     * Pass {@code pkt==0} for end of stream: frames are drained and
-     * {@link AsyncDecoderCallback#onEof} is delivered. Returns AVERROR(EAGAIN)
-     * when the bounded queue is full.
+     *
+     * <p>Pass {@code pkt==0} for end of stream. The empty packet is not queued
+     * as data: the worker consumes every packet accepted before it, then
+     * reports {@link AsyncDecoderCallback#onEof} only once the decoder itself
+     * returns EOF, i.e. after the trailing frames were delivered.
+     *
+     * <p>Returns AVERROR(EAGAIN) when the bounded queue is full; that packet
+     * was <em>not</em> consumed, so the caller must retry the same packet
+     * rather than drop it. Returns AVERROR(EOF) for a packet offered after end
+     * of stream was already queued, and AVERROR(EINVAL) once the worker has
+     * stopped (including a stop triggered by EOF or a hard decode error).
      */
     public native int asyncDecoderQueuePacket(long adapter, long pkt);
 
-    /** Ask the worker to flush; never blocks on the worker. */
+    /**
+     * Ask the worker to flush; never blocks on the worker.
+     *
+     * <p>Queued packets that were accepted for the retired position are
+     * discarded, pending end-of-stream state is cleared and the codec buffers
+     * are flushed on the worker thread. There is no completion callback, so a
+     * seek must still retire the whole adapter unless the caller can tolerate
+     * in-flight frames of the previous position.
+     */
     public native int asyncDecoderFlush(long adapter);
 
-    /** Stop the worker and join it. Idempotent. */
+    /**
+     * Stop the worker and join it. Idempotent.
+     *
+     * <p>Waits for the worker to leave the decoder, so it must not be called
+     * on the main thread or from a callback (that returns AVERROR(EDEADLK)),
+     * and must not be called while holding a lock the worker needs.
+     */
     public native int asyncDecoderStop(long adapter);
 
     /**

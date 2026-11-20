@@ -65,6 +65,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/samplefmt.h"
+#include "libavutil/time.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/dovi_meta.h"
 #include "libavutil/mastering_display_metadata.h"
@@ -1929,6 +1930,7 @@ typedef struct FFAsyncDecoder {
     int stopping;
     int eof_requested;
     int eof_sent;
+    int eof_delivered;
     int flush_pending;
     int state;
     AVFifo *packets;
@@ -1942,6 +1944,31 @@ typedef struct FFAsyncDecoder {
     uint64_t eofs;
     uint64_t flushes;
 } FFAsyncDecoder;
+
+/* av_fifo_read()/av_fifo_write() return 0 on success and a negative AVERROR
+ * on failure; neither returns an element count. Treating 0 as "nothing read"
+ * desynchronises the worker from the queue, so every FIFO access goes through
+ * these two helpers. Both require d->lock to be held. */
+static int ff_async_decoder_pop_packet_locked(FFAsyncDecoder *d, AVPacket **out)
+{
+    *out = NULL;
+    if (!av_fifo_can_read(d->packets))
+        return AVERROR(EAGAIN);
+
+    if (av_fifo_read(d->packets, out, 1) < 0) {
+        *out = NULL;
+        return AVERROR(EIO);
+    }
+    return 0;
+}
+
+static void ff_async_decoder_drop_packets_locked(FFAsyncDecoder *d)
+{
+    AVPacket *pkt = NULL;
+
+    while (ff_async_decoder_pop_packet_locked(d, &pkt) == 0)
+        av_packet_free(&pkt);
+}
 
 static FFAsyncDecoder *ff_async_decoder_acquire(JNIEnv *env, jlong token)
 {
@@ -2023,10 +2050,14 @@ static void ff_async_decoder_call_eof(JNIEnv *env, FFAsyncDecoder *d)
     }
 }
 
-static void ff_async_decoder_stop_locked(FFAsyncDecoder *d)
+static int ff_async_decoder_stop_locked(FFAsyncDecoder *d)
 {
     if (!d->thread_started)
-        return;
+        return 0;
+    /* A callback runs on this thread; joining it would deadlock. */
+    if (pthread_equal(pthread_self(), d->thread))
+        return AVERROR(EDEADLK);
+
     d->stopping = 1;
     pthread_cond_broadcast(&d->cond);
     pthread_mutex_unlock(&d->lock);
@@ -2034,6 +2065,7 @@ static void ff_async_decoder_stop_locked(FFAsyncDecoder *d)
     pthread_mutex_lock(&d->lock);
     d->thread_started = 0;
     d->state = FF_ASYNC_DECODER_STOPPED;
+    return 0;
 }
 
 static void ff_async_decoder_finalize(void *p)
@@ -2042,13 +2074,15 @@ static void ff_async_decoder_finalize(void *p)
     JNIEnv *env = NULL;
     JNIEnv *probe = NULL;
     int attached_here = 0;
-    AVPacket *pkt;
 
     if (!d)
         return;
 
+    /* The worker must be joined before the mutex, queue and callback ref go
+     * away; stop() is idempotent, so an already-stopped adapter is a no-op. */
     pthread_mutex_lock(&d->lock);
     ff_async_decoder_stop_locked(d);
+    ff_async_decoder_drop_packets_locked(d);
     pthread_mutex_unlock(&d->lock);
 
     if (d->callback && g_vm) {
@@ -2066,12 +2100,53 @@ static void ff_async_decoder_finalize(void *p)
             (*g_vm)->DetachCurrentThread(g_vm);
     }
 
-    while (av_fifo_read(d->packets, &pkt, 1) == 1)
-        av_packet_free(&pkt);
     av_fifo_freep2(&d->packets);
     pthread_cond_destroy(&d->cond);
     pthread_mutex_destroy(&d->lock);
     av_free(d);
+}
+
+static int ff_async_decoder_drain_frames(JNIEnv *env, FFAsyncDecoder *d,
+                                         int have_vm, int *received_frames)
+{
+    for (;;) {
+        AVFrame *frame = av_frame_alloc();
+        int ret;
+
+        if (!frame)
+            return AVERROR(ENOMEM);
+
+        ret = avcodec_receive_frame(d->cc, frame);
+        if (ret == 0) {
+            if (have_vm) {
+                /* Ownership of the handle moves to the callback. */
+                ff_async_decoder_call_frame(env, d, frame);
+                pthread_mutex_lock(&d->lock);
+                d->delivered_frames++;
+                pthread_mutex_unlock(&d->lock);
+            } else {
+                ff_video_stats_note_frame_dropped(frame);
+                av_frame_free(&frame);
+            }
+            (*received_frames)++;
+            continue;
+        }
+
+        av_frame_free(&frame);
+        /* AVERROR(EAGAIN) is the normal "no frame ready" result and must not
+         * be reported as a decoder failure. */
+        return ret;
+    }
+}
+
+static int ff_async_decoder_is_stopping(FFAsyncDecoder *d)
+{
+    int stopping;
+
+    pthread_mutex_lock(&d->lock);
+    stopping = d->stopping;
+    pthread_mutex_unlock(&d->lock);
+    return stopping;
 }
 
 static void *ff_async_decoder_thread(void *arg)
@@ -2082,11 +2157,13 @@ static void *ff_async_decoder_thread(void *arg)
 
     if (g_vm && (*g_vm)->AttachCurrentThread(g_vm, (void **)&env, NULL) == JNI_OK)
         have_vm = 1;
+    else
+        env = NULL;
 
     for (;;) {
         AVPacket *pkt = NULL;
         int do_flush = 0, do_eof = 0, finished = 0;
-        int ret;
+        int ret = 0;
 
         pthread_mutex_lock(&d->lock);
         while (!av_fifo_can_read(d->packets) && !d->flush_pending &&
@@ -2097,14 +2174,26 @@ static void *ff_async_decoder_thread(void *arg)
             break;
         }
         if (d->flush_pending) {
+            /* Flush retires the queued position: packets accepted for the old
+             * position must not be decoded afterwards, and the EOS bookkeeping
+             * of the old position must not leak into the new one. */
             d->flush_pending = 0;
+            ff_async_decoder_drop_packets_locked(d);
+            d->eof_requested = 0;
+            d->eof_sent = 0;
+            d->eof_delivered = 0;
             do_flush = 1;
         } else if (!av_fifo_can_read(d->packets) &&
                    d->eof_requested && !d->eof_sent) {
             d->eof_sent = 1;
             do_eof = 1;
-        } else if (av_fifo_read(d->packets, &pkt, 1) != 1) {
-            finished = 1;
+        } else {
+            ret = ff_async_decoder_pop_packet_locked(d, &pkt);
+            if (ret < 0) {
+                /* The wait above accepted only readable queues, so anything
+                 * except EAGAIN is a real queue failure. */
+                finished = 1;
+            }
         }
         pthread_mutex_unlock(&d->lock);
 
@@ -2112,6 +2201,8 @@ static void *ff_async_decoder_thread(void *arg)
             break;
 
         if (do_flush) {
+            /* No send/receive is in flight here: flush runs on the worker
+             * thread, which is the only consumer of this codec context. */
             avcodec_flush_buffers(d->cc);
             pthread_mutex_lock(&d->lock);
             d->flushes++;
@@ -2119,49 +2210,115 @@ static void *ff_async_decoder_thread(void *arg)
             continue;
         }
 
-        ret = avcodec_send_packet(d->cc, do_eof ? NULL : pkt);
-        av_packet_free(&pkt);
-        if (ret < 0 && ret != AVERROR_EOF && have_vm)
-            ff_async_decoder_call_error(env, d, ret);
-
+        /* A packet rejected with EAGAIN was not consumed. Retrying it is
+         * mandatory: dropping it loses reference frames and, after a flush,
+         * leaves the decoder waiting for input that no longer exists. */
         for (;;) {
-            AVFrame *frame = av_frame_alloc();
+            int received = 0;
+            int drain_ret;
 
-            if (!frame) {
-                if (have_vm)
-                    ff_async_decoder_call_error(env, d, AVERROR(ENOMEM));
-                finished = 1;
+            if (ff_async_decoder_is_stopping(d)) {
+                ret = AVERROR_EXIT;
                 break;
             }
-            ret = avcodec_receive_frame(d->cc, frame);
-            if (ret == 0) {
-                if (have_vm) {
-                    ff_async_decoder_call_frame(env, d, frame);
-                    pthread_mutex_lock(&d->lock);
-                    d->delivered_frames++;
-                    pthread_mutex_unlock(&d->lock);
-                } else {
-                    ff_video_stats_note_frame_dropped(frame);
-                    av_frame_free(&frame);
-                }
-                continue;
-            }
-            av_frame_free(&frame);
-            if (ret == AVERROR(EAGAIN))
+
+            ret = avcodec_send_packet(d->cc, do_eof ? NULL : pkt);
+            if (ret != AVERROR(EAGAIN))
                 break;
-            if (ret == AVERROR_EOF) {
-                if (have_vm)
-                    ff_async_decoder_call_eof(env, d);
-                finished = 1;
+
+            drain_ret = ff_async_decoder_drain_frames(env, d, have_vm,
+                                                      &received);
+            if (drain_ret == AVERROR_EOF) {
+                ret = AVERROR_EOF;
                 break;
             }
+            if (drain_ret != AVERROR(EAGAIN)) {
+                ret = drain_ret;
+                break;
+            }
+            if (!received)
+                av_usleep(2000);
+        }
+        av_packet_free(&pkt);
+
+        if (ret == AVERROR_EXIT)
+            break;
+
+        if (ret < 0 && ret != AVERROR_EOF) {
             if (have_vm)
                 ff_async_decoder_call_error(env, d, ret);
             break;
         }
-        if (finished || do_eof)
+
+        if (do_eof) {
+            /* The empty packet only starts the drain. Trailing frames arrive
+             * through receive(), so EOS is announced when the decoder itself
+             * reports EOF -- never when the empty packet was merely accepted. */
+            int announce = 0;
+
+            for (;;) {
+                int received = 0;
+                int drain_ret;
+
+                if (ff_async_decoder_is_stopping(d))
+                    break;
+
+                drain_ret = ff_async_decoder_drain_frames(env, d, have_vm,
+                                                          &received);
+                if (drain_ret == AVERROR_EOF) {
+                    pthread_mutex_lock(&d->lock);
+                    if (!d->eof_delivered) {
+                        d->eof_delivered = 1;
+                        announce = 1;
+                    }
+                    pthread_mutex_unlock(&d->lock);
+                    break;
+                }
+                if (drain_ret != AVERROR(EAGAIN)) {
+                    if (have_vm)
+                        ff_async_decoder_call_error(env, d, drain_ret);
+                    break;
+                }
+                if (!received)
+                    av_usleep(1000);
+            }
+
+            if (announce && have_vm)
+                ff_async_decoder_call_eof(env, d);
             break;
+        }
+
+        /* Accepted input: drain what is ready, then wait for more. */
+        {
+            int received = 0;
+            int drain_ret = ff_async_decoder_drain_frames(env, d, have_vm,
+                                                          &received);
+
+            if (drain_ret == AVERROR_EOF) {
+                int announce = 0;
+
+                pthread_mutex_lock(&d->lock);
+                if (!d->eof_delivered) {
+                    d->eof_delivered = 1;
+                    announce = 1;
+                }
+                pthread_mutex_unlock(&d->lock);
+
+                if (announce && have_vm)
+                    ff_async_decoder_call_eof(env, d);
+                break;
+            }
+            if (drain_ret != AVERROR(EAGAIN)) {
+                if (have_vm)
+                    ff_async_decoder_call_error(env, d, drain_ret);
+                break;
+            }
+        }
     }
+
+    pthread_mutex_lock(&d->lock);
+    d->state = FF_ASYNC_DECODER_STOPPED;
+    pthread_mutex_unlock(&d->lock);
 
     if (have_vm)
         (*g_vm)->DetachCurrentThread(g_vm);
@@ -2231,7 +2388,7 @@ Java_org_ffmpeg_FFMpegNative_asyncDecoderSetCallback(JNIEnv *env, jobject thiz,
 
     if (!d)
         return AVERROR(EINVAL);
-    if (d->state != FF_ASYNC_DECODER_CREATED || !callback) {
+    if (!callback) {
         ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
         return AVERROR(EINVAL);
     }
@@ -2252,6 +2409,11 @@ Java_org_ffmpeg_FFMpegNative_asyncDecoderSetCallback(JNIEnv *env, jobject thiz,
     }
 
     pthread_mutex_lock(&d->lock);
+    if (d->state != FF_ASYNC_DECODER_CREATED) {
+        pthread_mutex_unlock(&d->lock);
+        (*env)->DeleteGlobalRef(env, global);
+        goto done;
+    }
     if (d->callback)
         (*env)->DeleteGlobalRef(env, d->callback);
     d->callback = global;
@@ -2280,7 +2442,10 @@ Java_org_ffmpeg_FFMpegNative_asyncDecoderStart(JNIEnv *env, jobject thiz,
 
     if (!d)
         return AVERROR(EINVAL);
+
+    pthread_mutex_lock(&d->lock);
     if (d->state != FF_ASYNC_DECODER_CREATED || !d->callback) {
+        pthread_mutex_unlock(&d->lock);
         ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
         return AVERROR(EINVAL);
     }
@@ -2293,14 +2458,18 @@ Java_org_ffmpeg_FFMpegNative_asyncDecoderStart(JNIEnv *env, jobject thiz,
     } else {
         ret = AVERROR(ret);
     }
+    pthread_mutex_unlock(&d->lock);
     ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
     return ret;
 }
 
 /**
  * Queue one packet for the worker. The packet is copied, so the caller keeps
- * ownership. pkt == 0 signals end of stream; frames are then drained and
- * onEof() is delivered. AVERROR(EAGAIN) means the bounded queue is full.
+ * ownership. pkt == 0 signals end of stream; the worker drains every packet
+ * queued before it and reports onEof() only when the decoder itself reaches
+ * EOF. Once end of stream is queued, further packets are refused with
+ * AVERROR_EOF. AVERROR(EAGAIN) means the bounded queue is full and the packet
+ * was not consumed, so the caller must retry the same packet.
  */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_asyncDecoderQueuePacket(JNIEnv *env, jobject thiz,
@@ -2309,14 +2478,11 @@ Java_org_ffmpeg_FFMpegNative_asyncDecoderQueuePacket(JNIEnv *env, jobject thiz,
     FFAsyncDecoder *d = ff_async_decoder_acquire(env, adapter);
     AVPacket *p = pkt ? PTR(AVPacket *, pkt) : NULL;
     AVPacket *copy = NULL;
+    int closed = 0, full = 0, invalid = 0;
     int ret;
 
     if (!d)
         return AVERROR(EINVAL);
-    if (d->state != FF_ASYNC_DECODER_RUNNING) {
-        ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
-        return AVERROR(EINVAL);
-    }
     if (p) {
         copy = av_packet_alloc();
         if (!copy) {
@@ -2332,24 +2498,53 @@ Java_org_ffmpeg_FFMpegNative_asyncDecoderQueuePacket(JNIEnv *env, jobject thiz,
     }
 
     pthread_mutex_lock(&d->lock);
-    if (!av_fifo_can_write(d->packets)) {
+    if (d->state != FF_ASYNC_DECODER_RUNNING)
+        invalid = 1;
+    else if (!p) {
+        /* End of stream needs no queue slot: the worker sends the empty packet
+         * once every ordinary packet accepted before it is consumed. */
+        if (!d->eof_requested) {
+            d->eof_requested = 1;
+            pthread_cond_signal(&d->cond);
+        }
         pthread_mutex_unlock(&d->lock);
-        av_packet_free(&copy);
         ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
-        return AVERROR(EAGAIN);
+        return 0;
+    } else if (d->eof_requested) {
+        closed = 1;
+    } else if (!av_fifo_can_write(d->packets)) {
+        full = 1;
+    } else {
+        ret = av_fifo_write(d->packets, &copy, 1);
+        if (ret < 0) {
+            pthread_mutex_unlock(&d->lock);
+            av_packet_free(&copy);
+            ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+            return ret;
+        }
+        /* Ownership of the copied reference moved into the queue. */
+        d->queued_packets++;
+        pthread_cond_signal(&d->cond);
     }
-    av_fifo_write(d->packets, &copy, 1);
-    if (!p)
-        d->eof_requested = 1;
-    d->queued_packets++;
-    pthread_cond_signal(&d->cond);
     pthread_mutex_unlock(&d->lock);
 
+    if (invalid || closed || full)
+        av_packet_free(&copy);
     ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+    if (invalid)
+        return AVERROR(EINVAL);
+    if (closed)
+        return AVERROR(EOF);
+    if (full)
+        return AVERROR(EAGAIN);
     return 0;
 }
 
-/** Ask the worker to flush the decoder; never blocks on the worker. */
+/**
+ * Ask the worker to flush the decoder; never blocks on the worker. Queued
+ * packets for the retired position are dropped and any pending end-of-stream
+ * state is cleared.
+ */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_asyncDecoderFlush(JNIEnv *env, jobject thiz,
                                                jlong adapter)
@@ -2358,11 +2553,13 @@ Java_org_ffmpeg_FFMpegNative_asyncDecoderFlush(JNIEnv *env, jobject thiz,
 
     if (!d)
         return AVERROR(EINVAL);
+
+    pthread_mutex_lock(&d->lock);
     if (d->state != FF_ASYNC_DECODER_RUNNING) {
+        pthread_mutex_unlock(&d->lock);
         ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
         return AVERROR(EINVAL);
     }
-    pthread_mutex_lock(&d->lock);
     d->flush_pending = 1;
     pthread_cond_signal(&d->cond);
     pthread_mutex_unlock(&d->lock);
@@ -2370,20 +2567,25 @@ Java_org_ffmpeg_FFMpegNative_asyncDecoderFlush(JNIEnv *env, jobject thiz,
     return 0;
 }
 
-/** Stop the worker and join it. Idempotent. */
+/**
+ * Stop the worker and join it. Idempotent. Never call this from a callback,
+ * and never call it while holding a lock the worker needs: it waits for the
+ * worker to leave the decoder.
+ */
 JNIEXPORT jint JNICALL
 Java_org_ffmpeg_FFMpegNative_asyncDecoderStop(JNIEnv *env, jobject thiz,
                                               jlong adapter)
 {
     FFAsyncDecoder *d = ff_async_decoder_acquire(env, adapter);
+    int ret;
 
     if (!d)
         return AVERROR(EINVAL);
     pthread_mutex_lock(&d->lock);
-    ff_async_decoder_stop_locked(d);
+    ret = ff_async_decoder_stop_locked(d);
     pthread_mutex_unlock(&d->lock);
     ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
-    return 0;
+    return ret;
 }
 
 /** Schema v1 state snapshot, written only after every capacity check. */
@@ -2426,12 +2628,20 @@ Java_org_ffmpeg_FFMpegNative_asyncDecoderFree(JNIEnv *env, jobject thiz,
                                               jlong adapter)
 {
     FFAsyncDecoder *d = ff_async_decoder_acquire(env, adapter);
+    int ret;
 
     if (!d)
         return;
     pthread_mutex_lock(&d->lock);
-    ff_async_decoder_stop_locked(d);
+    ret = ff_async_decoder_stop_locked(d);
     pthread_mutex_unlock(&d->lock);
+    if (ret == AVERROR(EDEADLK)) {
+        /* Called from a callback: revoking here would finalise the adapter
+         * while its own worker thread still uses it. Leak the handle instead
+         * and let the caller free it off the callback thread. */
+        ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+        return;
+    }
     ff_handle_revoke((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
     ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
 }
