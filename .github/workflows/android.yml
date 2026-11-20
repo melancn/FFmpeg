@@ -43,10 +43,49 @@ jobs:
       OUT_DIR: android-jni
       CURL_VERSION: 8.22.0
       CURL_SHA256: f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7
+      # Every `run:` step is a fresh shell, so exports made inside one step do
+      # not reach the later JNI/test compiles. Declaring them here keeps the
+      # ccache behaviour identical for the FFmpeg build and for the bridge.
+      # ccache's compiler-check defaults to mtime, which changes between
+      # runner instances (fresh NDK extraction) and forces a full miss on
+      # every run even when ~/.ccache is restored; content hashing makes a
+      # restored cache actually reusable across runs/runners.
+      CCACHE_COMPILERCHECK: content
+      # Keep the cached (-fPIC) command lines stable across workspaces.
+      CCACHE_BASEDIR: ${{ github.workspace }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Fingerprints exactly what the FFmpeg build reads, so the FFmpeg
+      # artifact cache below is keyed on it. compat/android/jni is excluded:
+      # the bridge is compiled into libffmpeg_jni.so by a later step and is
+      # not part of any FFmpeg object, so editing it must not invalidate the
+      # whole FFmpeg build. compat/android/binder.c stays in: --enable-mediacodec
+      # compiles it into libavcodec.
+      #
+      # git ls-files is used rather than hashFiles because the exclusion has to
+      # be exact and the file list has to be the tracked set only: hashing the
+      # working tree would also pull in gitignored generated headers from an
+      # earlier in-tree build.
+      - name: Compute FFmpeg source key
+        id: ffkey
+        run: |
+          set -euo pipefail
+          src_hash=$(git ls-files -z -- \
+                       configure Makefile RELEASE FF_VERSION \
+                       ffbuild libavcodec libavformat libavfilter libavutil \
+                       libswscale libswresample compat \
+                       ':(exclude)compat/android/jni/**' \
+                     | xargs -0 -r sha256sum \
+                     | sha256sum | cut -d' ' -f1)
+          if [ -z "$src_hash" ]; then
+            echo "::error::cannot fingerprint the FFmpeg sources"
+            exit 1
+          fi
+          echo "hash=$src_hash" >> "$GITHUB_OUTPUT"
+          echo "FFmpeg source key: $src_hash"
 
       - name: Test libcurl build guards
         run: |
@@ -91,7 +130,15 @@ jobs:
           # top-level dirs (libavcodec/, libavutil/, ...) and produces a hash
           # independent of their contents, so the key never changed with source.
           # Use recursive '**' patterns so the key actually tracks source edits.
-          key: ccache-android-${{ matrix.abi }}-${{ hashFiles('.github/workflows/android.yml', 'configure', 'Makefile', 'lib*/**', 'ffbuild/**', 'compat/**') }}
+          #
+          # compat/android/jni is excluded on purpose: the bridge does not
+          # contribute an FFmpeg object, so a JNI-only edit would otherwise
+          # store a second multi-gigabyte ccache entry that evicts the mbedTLS,
+          # libcurl and libass caches and turns the next run into a full rebuild.
+          # Excluding it cannot hide a stale object: ccache still validates
+          # every entry against the real compiler input, and the key only
+          # decides which archive is saved.
+          key: ccache-android-${{ matrix.abi }}-${{ hashFiles('.github/workflows/android.yml', 'configure', 'Makefile', 'lib*/**', 'ffbuild/**', 'compat/**', '!compat/android/jni/**') }}
           restore-keys: |
             ccache-android-${{ matrix.abi }}-
 
@@ -414,23 +461,53 @@ jobs:
           test -f "$DEPS/lib/pkgconfig/fontconfig.pc"
           test -f "$DEPS/include/fontconfig/fontconfig.h"
 
+      # The FFmpeg artifacts themselves, not just the ccache that speeds up
+      # rebuilding them. Without this, a JNI-only change still pays a full
+      # configure + `make -j` + install per ABI, which is the dominant cost.
+      #
+      # A tree-wide cache cannot be made incremental by simply restoring the
+      # objects: actions/checkout stamps every source file with the current
+      # time, so `make` sees every .o as older than its .c and rebuilds all of
+      # them. The cache therefore restores a *finished* build and the two steps
+      # below are skipped entirely on a hit.
+      #
+      # The key is exact and there is deliberately no restore-keys: a prefix
+      # hit would mean a different source tree, and skipping `make` against it
+      # would ship a .so that does not match its key. A miss costs one full
+      # build, which is the safe direction.
+      #
+      # The configure switches live in this workflow, so the workflow file is
+      # part of the key; without it, editing --enable-* would silently reuse
+      # the previous configuration.
+      - name: Restore FFmpeg build (static libs + generated config)
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.BUILD_DIR }}/${{ env.INSTALL_DIR }}
+            config.h
+            config_components.h
+            libavutil/avconfig.h
+            libavutil/ffversion.h
+            ffbuild/config.mak
+          key: ffmpeg-${{ matrix.abi }}-api${{ env.ANDROID_API }}-ndk${{ steps.ndk.outputs.ndk_version }}-${{ steps.ffkey.outputs.hash }}-${{ hashFiles('.github/workflows/android.yml') }}
+
+      # Capacity and counters are set on every run, hit or miss: a restored
+      # ~/.ccache may come from a runner with a different limit, and ccache
+      # evicts rather than grows past it.
+      - name: Prepare ccache
+        run: |
+          ccache -M 5G
+          ccache -z
+
       - name: Configure FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         env:
           CC: ${{ steps.toolchain.outputs.cc }}
           AR: ${{ steps.toolchain.outputs.ar }}
           RANLIB: ${{ steps.toolchain.outputs.ranlib }}
           NM: ${{ steps.toolchain.outputs.nm }}
         run: |
-          ccache -M 5G
-          # ccache's compiler-check defaults to mtime, which changes between
-          # runner instances (fresh NDK extraction) and forces a full miss on
-          # every run even when ~/.ccache is restored.  Use content hashing so
-          # a restored cache is actually reused across runs/runners.
-          export CCACHE_COMPILERCHECK=content
-          # Keep the cached compiler (-fPIC) flags stable; ccache only skips
-          # preprocessing-dependent hashes when the input is identical.
-          export CCACHE_BASEDIR="$PWD"
-          ccache -z
           PREFIX="$PWD/$BUILD_DIR/$INSTALL_DIR"
           MBEDTLS_PREFIX="$PWD/$BUILD_DIR/mbedtls-install"
           DEPS_PREFIX="$PWD/$BUILD_DIR/deps-install"
@@ -495,6 +572,7 @@ jobs:
           done
 
       - name: Build & install FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: |
           make -j"$(nproc)"
           make install
@@ -504,6 +582,44 @@ jobs:
           echo "::group::ccache statistics"
           ccache -s
           echo "::endgroup::"
+
+      # A cache hit skips configure, and with it the feature-flag assertions
+      # inside that step. Re-assert the properties the rest of the job relies
+      # on, against the restored config.mak and the restored install tree, so a
+      # wrong cache key fails here instead of producing a .so that silently
+      # lacks the TLS backend or the headers it needs.
+      - name: Verify restored FFmpeg build
+        if: steps.ffmpeg-cache.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          # Only the flags the configure step itself asserts, so this check
+          # cannot fail on a valid cache entry: CONFIG_MEDIACODEC/CONFIG_JNI are
+          # reported by configure but are not guaranteed to appear in
+          # config.mak, and their absence there would be a false alarm.
+          for flag in CONFIG_LIBCURL CONFIG_LIBCURL_PROTOCOL CONFIG_MBEDTLS CONFIG_LIBFONTCONFIG; do
+            if ! grep -qx "$flag=yes" ffbuild/config.mak; then
+              echo "::error::$flag missing from the restored config.mak: the FFmpeg cache key is wrong"
+              exit 1
+            fi
+          done
+          # libass gates the whole subtitle section of the bridge, and the JNI
+          # compile is the first thing that reads this header.
+          if ! grep -qx '#define CONFIG_LIBASS 1' config.h; then
+            echo "::error::restored config.h has CONFIG_LIBASS off: the bridge would lose its libass entry points"
+            exit 1
+          fi
+          # The JNI compile reads config.h from the source root and the bridge
+          # includes FFmpeg headers from the installed prefix; both must have
+          # come back with the cache.
+          for f in config.h libavutil/avconfig.h libavutil/ffversion.h \
+                   "$BUILD_DIR/$INSTALL_DIR/lib/libavcodec.a" \
+                   "$BUILD_DIR/$INSTALL_DIR/include/libavcodec/avcodec.h"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::restored FFmpeg build is missing $f"
+              exit 1
+            fi
+          done
+          echo "Restored FFmpeg build verified"
 
       - name: Generate JNI header (javac -h)
         run: |
