@@ -2552,7 +2552,7 @@ static void test_release_capabilities(void)
     CHECK(Java_org_ffmpeg_FFMpegNative_getBridgeApiVersion(NULL, NULL) ==
           FF_JNI_BRIDGE_API_VERSION);
     CHECK(FF_JNI_BRIDGE_API_MAJOR == 2);
-    CHECK(FF_JNI_BRIDGE_API_MINOR == 1);
+    CHECK(FF_JNI_BRIDGE_API_MINOR == 2);
 
     /* Promised by this release, each with a test set behind it. */
     CHECK(caps & FF_JNI_CAP_PCM_SESSION_SAFE_V2);
@@ -2585,6 +2585,10 @@ static void test_release_capabilities(void)
     CHECK(caps & FF_JNI_CAP_FRAME_SIDE_DATA);
     CHECK(caps & FF_JNI_CAP_SIDE_DATA_TYPES);
     CHECK(caps & FF_JNI_CAP_VIDEO_METADATA_SNAPSHOT);
+
+    /* 2.2: the async adapter is pure bridge code, so it is available for
+     * every decoder and needs no compile-time platform dependency. */
+    CHECK(caps & FF_JNI_CAP_ASYNC_DECODER_ADAPTER);
 
     /* The 1.5 libass channel exists only where the libass section is compiled
      * in. This build enables it (the binary links -lass), so the bit must be
@@ -2863,6 +2867,53 @@ static void test_video_diagnostics(void)
             NULL, NULL, (jlong)(intptr_t)mc2_cc);
     Java_org_ffmpeg_FFMpegNative_codecFreeContext(
         NULL, NULL, (jlong)(intptr_t)mc_cc);
+}
+
+/* 2.2 async adapter: a managed token is used for the adapter, so stale and
+ * never-issued handles must be refused before any native state is touched.
+ * A real decode needs a worker thread and a Java callback, so the positive
+ * path stays a device-gate item; this pins the refusal contract. */
+static void test_async_decoder_adapter_contract(void)
+{
+    JNIEnv env = fftest_jni_env();
+    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+    AVCodecContext *cc = NULL;
+    jlongArray out;
+
+    CHECK(Java_org_ffmpeg_FFMpegNative_asyncDecoderCreate(
+              NULL, NULL, 0, 16) == 0);
+
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_asyncDecoderSetCallback(
+                      &env, NULL, 0, NULL), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_asyncDecoderStart(
+                      &env, NULL, 0), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_asyncDecoderQueuePacket(
+                      &env, NULL, 0, 0), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_asyncDecoderFlush(
+                      &env, NULL, 0), EINVAL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_asyncDecoderStop(
+                      &env, NULL, 0), EINVAL);
+
+    fftest_jni_reset();
+    out = fftest_new_long_array(FF_JNI_ASYNC_DECODER_STATS_SLOTS);
+    CHECK(out != NULL);
+    CHECK_AVERROR(Java_org_ffmpeg_FFMpegNative_asyncDecoderStats(
+                      &env, NULL, 0, out), EINVAL);
+    Java_org_ffmpeg_FFMpegNative_asyncDecoderFree(&env, NULL, 0);
+
+    /* An allocated but unopened codec is not a valid adapter source. */
+    if (codec) {
+        cc = (AVCodecContext *)(intptr_t)
+             Java_org_ffmpeg_FFMpegNative_allocCodecContext(
+                 NULL, NULL, (jlong)(intptr_t)codec);
+        CHECK(cc != NULL);
+        if (cc) {
+            CHECK(Java_org_ffmpeg_FFMpegNative_asyncDecoderCreate(
+                      &env, NULL, (jlong)(intptr_t)cc, 16) == 0);
+            Java_org_ffmpeg_FFMpegNative_codecFreeContext(
+                NULL, NULL, (jlong)(intptr_t)cc);
+        }
+    }
 }
 
 /* BuildInfo must be well-formed JSON with every field present, and any field
@@ -5450,6 +5501,7 @@ int main(void)
     test_pcm_session_rejects_planar_output();
     test_pcm_convert_status_initialised_on_refusal();
     test_video_diagnostics();
+    test_async_decoder_adapter_contract();
     test_release_capabilities();
     test_libass_log_level();
     test_build_info_is_complete();

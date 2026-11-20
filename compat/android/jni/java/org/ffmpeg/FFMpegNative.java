@@ -798,7 +798,61 @@ public final class FFMpegNative {
      *                 {@link org.ffmpeg.consts.VideoDecodeStats#VIDEO_DECODE_STATS_SLOTS}
      * @return 0 on success, or a negative AVERROR as described above
      */
-    public native int videoDecodeStats(long codecCtx, long[] out, int len);
+     public native int videoDecodeStats(long codecCtx, long[] out, int len);
+
+    /**
+     * Create an async decoder adapter around an opened decoder context.
+     *
+     * <p>FFmpeg's {@code *_mediacodec} decoders fetch buffers synchronously
+     * inside libavcodec; that cannot be changed from Java. This adapter moves
+     * the bridge's send/receive loop onto a native worker thread and delivers
+     * each decoded frame through {@link AsyncDecoderCallback}, so Kotlin no
+     * longer has to poll {@link #codecReceiveFrame}. Frame handles delivered
+     * this way are ordinary {@code AVFrame} handles: release them with
+     * {@link #frameFree} and use the usual {@code mediasurface*} protocol for
+     * Surface output.
+     *
+     * <p>The caller keeps ownership of {@code codecCtx} and must not use the
+     * synchronous {@link #codecSendPacket}/{@link #codecReceiveFrame} entry
+     * points on it while the adapter is running. Free the adapter before
+     * {@link #codecFreeContext}.
+     *
+     * <p>Gate on {@link org.ffmpeg.consts.BridgeApi#CAP_ASYNC_DECODER_ADAPTER}.
+     *
+     * @param codecCtx an opened decoder context handle
+     * @param queueCapacity bounded packet queue depth; {@code < 1} uses 16
+     * @return an opaque adapter token, or 0 on failure
+     */
+    public native long asyncDecoderCreate(long codecCtx, int queueCapacity);
+
+    /** Register the callback; only valid before {@link #asyncDecoderStart}. */
+    public native int asyncDecoderSetCallback(long adapter, AsyncDecoderCallback callback);
+
+    /** Start the native worker; a callback must already be registered. */
+    public native int asyncDecoderStart(long adapter);
+
+    /**
+     * Queue one packet. The packet is copied, so the caller keeps ownership.
+     * Pass {@code pkt==0} for end of stream: frames are drained and
+     * {@link AsyncDecoderCallback#onEof} is delivered. Returns AVERROR(EAGAIN)
+     * when the bounded queue is full.
+     */
+    public native int asyncDecoderQueuePacket(long adapter, long pkt);
+
+    /** Ask the worker to flush; never blocks on the worker. */
+    public native int asyncDecoderFlush(long adapter);
+
+    /** Stop the worker and join it. Idempotent. */
+    public native int asyncDecoderStop(long adapter);
+
+    /**
+     * Read the {@link org.ffmpeg.consts.AsyncDecoderStats} schema v1 snapshot.
+     * Nothing is written when the array is too short.
+     */
+    public native int asyncDecoderStats(long adapter, long[] out);
+
+    /** Stop the worker, revoke the token and release native state. */
+    public native void asyncDecoderFree(long adapter);
 
     /**
      * Send a packet to the decoder (drain by passing {@code pkt==0}).

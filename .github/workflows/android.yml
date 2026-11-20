@@ -246,8 +246,8 @@ jobs:
         with:
           path: ${{ env.BUILD_DIR }}/deps-install
           key: deps-${{ matrix.abi }}-fribidi1.0.16-ft2.13.3-hb9.0.0-expat2.6.4-fc2.15.0-ass0.17.3-pic-v3
-          restore-keys: |
-            deps-${{ matrix.abi }}-
+          # No restore prefix: a v2 cache without fontconfig/expat must never be
+          # reused just because the ABI matches.
 
       - name: Build libass dependency stack
         if: steps.deps-cache.outputs.cache-hit != 'true'

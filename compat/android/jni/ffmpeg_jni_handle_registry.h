@@ -51,6 +51,7 @@ typedef enum FFHandleType {
     FF_HANDLE_TYPE_DICT_CURSOR    = 3,
     FF_HANDLE_TYPE_INTERRUPT      = 4,
     FF_HANDLE_TYPE_RENDERER       = 5,
+    FF_HANDLE_TYPE_ASYNC_DECODER  = 6,
     FF_HANDLE_TYPE_MAX
 } FFHandleType;
 

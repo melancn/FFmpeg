@@ -23,9 +23,10 @@ public final class BridgeApi {
      * 1.3 appends the audio format snapshot entry points. 1.4 appends the
      * video diagnostics. 1.5 appends the libass message channel. 2.0 makes
      * five handle kinds opaque tokens and changes the close protocol. 2.1
-     * appends the fontconfig-backed font setup entry points.
+     * appends the fontconfig-backed font setup entry points. 2.2 appends the
+     * async MediaCodec decoder adapter.
      */
-    public static final int BRIDGE_API_MINOR = 1;
+    public static final int BRIDGE_API_MINOR = 2;
 
     /** {@code major << 16 | minor}; 2.0 is {@code 0x00020000}. */
     public static final int BRIDGE_API_VERSION = (BRIDGE_API_MAJOR << 16) | BRIDGE_API_MINOR;
@@ -104,4 +105,10 @@ public final class BridgeApi {
      * Only advertised when libass was built with its fontconfig provider.
      */
     public static final long CAP_ASS_FONTCONFIG = 1L << 24;
+
+    /**
+     * 2.2: the {@code asyncDecoder*} entry points drive the send/receive loop
+     * on a native worker and deliver frames through {@code AsyncDecoderCallback}.
+     */
+    public static final long CAP_ASYNC_DECODER_ADAPTER = 1L << 25;
 }

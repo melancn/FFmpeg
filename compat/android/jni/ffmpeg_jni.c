@@ -51,6 +51,7 @@
 #include <android/native_window_jni.h>
 
 #include "libavutil/avutil.h"
+#include "libavutil/fifo.h"
 #include "libavutil/buffer.h"
 #include "libavutil/audio_fifo.h"
 #include "libavutil/dict.h"
@@ -660,8 +661,16 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  * passes a fonts.conf path and forces an immediate font scan, and
  * assSetFontsDirChecked() reports directory setup failures that the old void
  * assSetFontsDir() could not. Both are additive; a 2.0 caller is unaffected.
- * The bit is only advertised when libass and libfontconfig are compiled in. */
-#define FF_JNI_BRIDGE_API_MINOR 1
+ * The bit is only advertised when libass and libfontconfig are compiled in.
+ *
+ * 2.2 appends the async decoder adapter: asyncDecoderCreate()/Start()/
+ * QueuePacket()/Flush()/Stop()/Stats()/Free() drive a native worker thread
+ * that delivers decoded frames through AsyncDecoderCallback instead of
+ * requiring Kotlin to poll codecReceiveFrame(). It works for every decoder,
+ * including the synchronous *mediacodec decoders, because it changes who
+ * drives the decode loop without changing libavcodec. All entries append; a
+ * 2.1 caller is unaffected. */
+#define FF_JNI_BRIDGE_API_MINOR 2
 #define FF_JNI_BRIDGE_API_VERSION \
     ((FF_JNI_BRIDGE_API_MAJOR << 16) | FF_JNI_BRIDGE_API_MINOR)
 
@@ -762,6 +771,11 @@ Java_org_ffmpeg_FFMpegNative_getSwresampleVersion(JNIEnv *env, jobject thiz)
  * setup result. Only set for builds that link libass with its fontconfig
  * system font provider. */
 #define FF_JNI_CAP_ASS_FONTCONFIG           (1LL << 24)
+
+/* 2.2: the async decoder adapter moves the send/receive loop onto a native
+ * worker and publishes frames through a Java callback. It is bridge code, so
+ * it is available for any decoder this build can open. */
+#define FF_JNI_CAP_ASYNC_DECODER_ADAPTER    (1LL << 25)
 
 /* Bumped whenever the packet budget accounting rules change, so a stored
  * charge value can be attributed to the policy that produced it. */
@@ -943,8 +957,9 @@ Java_org_ffmpeg_FFMpegNative_getBridgeCapabilities(JNIEnv *env, jobject thiz)
                          FF_JNI_CAP_FORMAT_HANDLE_GUARD |
                          FF_JNI_CAP_DICT_HANDLE_GENERATION |
                          FF_JNI_CAP_DICT_ITERATION_CURSOR |
-                         FF_JNI_CAP_INTERRUPT_LIFETIME |
-                         FF_JNI_CAP_RENDERER_SLOT_RECYCLE);
+                          FF_JNI_CAP_INTERRUPT_LIFETIME |
+                          FF_JNI_CAP_RENDERER_SLOT_RECYCLE |
+                          FF_JNI_CAP_ASYNC_DECODER_ADAPTER);
 #if CONFIG_LIBASS
     caps |= (jlong)FF_JNI_CAP_LIBASS_FONT_LOG;
 #if CONFIG_LIBFONTCONFIG
@@ -1869,6 +1884,556 @@ Java_org_ffmpeg_FFMpegNative_videoDecodeStats(JNIEnv *env, jobject thiz,
     if ((*env)->ExceptionCheck(env))
         return AVERROR(ENOMEM);
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Async decoder adapter (JNI boundary)                               */
+/*                                                                     */
+/* FFmpeg's *_mediacodec decoders fetch buffers synchronously inside    */
+/* libavcodec, and that cannot be changed from Java. This adapter       */
+/* moves the *bridge* to a callback-driven API: Kotlin queues packets   */
+/* and receives decoded frames through AsyncDecoderCallback instead of  */
+/* polling codecSendPacket()/codecReceiveFrame() on its own thread.     */
+/* A native worker owns the send/receive loop and publishes each frame  */
+/* as a normal AVFrame handle, so the existing mediasurface* zero-copy  */
+/* buffer protocol keeps working unchanged.                            */
+/* ------------------------------------------------------------------ */
+
+#define FF_JNI_ASYNC_DECODER_STATS_SLOTS        7
+#define FF_JNI_ASYNC_DECODER_SCHEMA_VERSION     1
+#define FF_JNI_ASYNC_DECODER_SLOT_SCHEMA        0
+#define FF_JNI_ASYNC_DECODER_SLOT_STATE         1
+#define FF_JNI_ASYNC_DECODER_SLOT_QUEUED        2
+#define FF_JNI_ASYNC_DECODER_SLOT_FRAMES        3
+#define FF_JNI_ASYNC_DECODER_SLOT_ERRORS        4
+#define FF_JNI_ASYNC_DECODER_SLOT_EOFS          5
+#define FF_JNI_ASYNC_DECODER_SLOT_FLUSHES       6
+
+_Static_assert(FF_JNI_ASYNC_DECODER_SLOT_FLUSHES ==
+               FF_JNI_ASYNC_DECODER_STATS_SLOTS - 1,
+               "AsyncDecoderStats slot layout changed; update "
+               "AsyncDecoderStats and the contract test");
+
+enum FFAsyncDecoderState {
+    FF_ASYNC_DECODER_CREATED = 0,
+    FF_ASYNC_DECODER_RUNNING = 1,
+    FF_ASYNC_DECODER_STOPPED = 2,
+};
+
+typedef struct FFAsyncDecoder {
+    AVCodecContext *cc;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    pthread_t thread;
+    int thread_started;
+    int stopping;
+    int eof_requested;
+    int eof_sent;
+    int flush_pending;
+    int state;
+    AVFifo *packets;
+    jobject callback;
+    jmethodID on_frame;
+    jmethodID on_error;
+    jmethodID on_eof;
+    uint64_t queued_packets;
+    uint64_t delivered_frames;
+    uint64_t errors;
+    uint64_t eofs;
+    uint64_t flushes;
+} FFAsyncDecoder;
+
+static FFAsyncDecoder *ff_async_decoder_acquire(JNIEnv *env, jlong token)
+{
+    FFAsyncDecoder *d = ff_handle_acquire((int64_t)token,
+                                           FF_HANDLE_TYPE_ASYNC_DECODER, NULL);
+    if (!d)
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale", "asyncDecoder*");
+    return d;
+}
+
+static void ff_async_decoder_call_frame(JNIEnv *env, FFAsyncDecoder *d,
+                                        AVFrame *frame)
+{
+    jobject cb;
+    jmethodID m;
+
+    pthread_mutex_lock(&d->lock);
+    cb = d->callback;
+    m  = d->on_frame;
+    pthread_mutex_unlock(&d->lock);
+
+    if (cb && m) {
+        (*env)->CallVoidMethod(env, cb, m, (jlong)(intptr_t)frame);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionDescribe(env);
+            (*env)->ExceptionClear(env);
+        }
+    } else {
+        /* Nobody owns the published frame, so this bridge must reclaim it. */
+        ff_video_stats_note_frame_dropped(frame);
+        av_frame_free(&frame);
+    }
+}
+
+static void ff_async_decoder_call_error(JNIEnv *env, FFAsyncDecoder *d,
+                                        int error)
+{
+    jobject cb;
+    jmethodID m;
+    jstring msg;
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
+
+    pthread_mutex_lock(&d->lock);
+    cb = d->callback;
+    m  = d->on_error;
+    d->errors++;
+    pthread_mutex_unlock(&d->lock);
+
+    if (!cb || !m)
+        return;
+    av_strerror(error, buf, sizeof(buf));
+    msg = (*env)->NewStringUTF(env, buf);
+    (*env)->CallVoidMethod(env, cb, m, (jint)error, msg);
+    if (msg)
+        (*env)->DeleteLocalRef(env, msg);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+    }
+}
+
+static void ff_async_decoder_call_eof(JNIEnv *env, FFAsyncDecoder *d)
+{
+    jobject cb;
+    jmethodID m;
+
+    pthread_mutex_lock(&d->lock);
+    cb = d->callback;
+    m  = d->on_eof;
+    d->eofs++;
+    pthread_mutex_unlock(&d->lock);
+
+    if (!cb || !m)
+        return;
+    (*env)->CallVoidMethod(env, cb, m);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+    }
+}
+
+static void ff_async_decoder_stop_locked(FFAsyncDecoder *d)
+{
+    if (!d->thread_started)
+        return;
+    d->stopping = 1;
+    pthread_cond_broadcast(&d->cond);
+    pthread_mutex_unlock(&d->lock);
+    pthread_join(d->thread, NULL);
+    pthread_mutex_lock(&d->lock);
+    d->thread_started = 0;
+    d->state = FF_ASYNC_DECODER_STOPPED;
+}
+
+static void ff_async_decoder_finalize(void *p)
+{
+    FFAsyncDecoder *d = p;
+    JNIEnv *env = NULL;
+    JNIEnv *probe = NULL;
+    int attached_here = 0;
+    AVPacket *pkt;
+
+    if (!d)
+        return;
+
+    pthread_mutex_lock(&d->lock);
+    ff_async_decoder_stop_locked(d);
+    pthread_mutex_unlock(&d->lock);
+
+    if (d->callback && g_vm) {
+        if ((*g_vm)->GetEnv(g_vm, (void **)&probe, JNI_VERSION_1_6) != JNI_OK) {
+            if ((*g_vm)->AttachCurrentThread(g_vm, (void **)&env, NULL) != JNI_OK)
+                env = NULL;
+            else
+                attached_here = 1;
+        } else {
+            env = probe;
+        }
+        if (env)
+            (*env)->DeleteGlobalRef(env, d->callback);
+        if (attached_here)
+            (*g_vm)->DetachCurrentThread(g_vm);
+    }
+
+    while (av_fifo_read(d->packets, &pkt, 1) == 1)
+        av_packet_free(&pkt);
+    av_fifo_freep2(&d->packets);
+    pthread_cond_destroy(&d->cond);
+    pthread_mutex_destroy(&d->lock);
+    av_free(d);
+}
+
+static void *ff_async_decoder_thread(void *arg)
+{
+    FFAsyncDecoder *d = arg;
+    JNIEnv *env = NULL;
+    int have_vm = 0;
+
+    if (g_vm && (*g_vm)->AttachCurrentThread(g_vm, (void **)&env, NULL) == JNI_OK)
+        have_vm = 1;
+
+    for (;;) {
+        AVPacket *pkt = NULL;
+        int do_flush = 0, do_eof = 0, finished = 0;
+        int ret;
+
+        pthread_mutex_lock(&d->lock);
+        while (!av_fifo_can_read(d->packets) && !d->flush_pending &&
+               !(d->eof_requested && !d->eof_sent) && !d->stopping)
+            pthread_cond_wait(&d->cond, &d->lock);
+        if (d->stopping) {
+            pthread_mutex_unlock(&d->lock);
+            break;
+        }
+        if (d->flush_pending) {
+            d->flush_pending = 0;
+            do_flush = 1;
+        } else if (!av_fifo_can_read(d->packets) &&
+                   d->eof_requested && !d->eof_sent) {
+            d->eof_sent = 1;
+            do_eof = 1;
+        } else if (av_fifo_read(d->packets, &pkt, 1) != 1) {
+            finished = 1;
+        }
+        pthread_mutex_unlock(&d->lock);
+
+        if (finished)
+            break;
+
+        if (do_flush) {
+            avcodec_flush_buffers(d->cc);
+            pthread_mutex_lock(&d->lock);
+            d->flushes++;
+            pthread_mutex_unlock(&d->lock);
+            continue;
+        }
+
+        ret = avcodec_send_packet(d->cc, do_eof ? NULL : pkt);
+        av_packet_free(&pkt);
+        if (ret < 0 && ret != AVERROR_EOF && have_vm)
+            ff_async_decoder_call_error(env, d, ret);
+
+        for (;;) {
+            AVFrame *frame = av_frame_alloc();
+
+            if (!frame) {
+                if (have_vm)
+                    ff_async_decoder_call_error(env, d, AVERROR(ENOMEM));
+                finished = 1;
+                break;
+            }
+            ret = avcodec_receive_frame(d->cc, frame);
+            if (ret == 0) {
+                if (have_vm) {
+                    ff_async_decoder_call_frame(env, d, frame);
+                    pthread_mutex_lock(&d->lock);
+                    d->delivered_frames++;
+                    pthread_mutex_unlock(&d->lock);
+                } else {
+                    ff_video_stats_note_frame_dropped(frame);
+                    av_frame_free(&frame);
+                }
+                continue;
+            }
+            av_frame_free(&frame);
+            if (ret == AVERROR(EAGAIN))
+                break;
+            if (ret == AVERROR_EOF) {
+                if (have_vm)
+                    ff_async_decoder_call_eof(env, d);
+                finished = 1;
+                break;
+            }
+            if (have_vm)
+                ff_async_decoder_call_error(env, d, ret);
+            break;
+        }
+        if (finished || do_eof)
+            break;
+    }
+
+    if (have_vm)
+        (*g_vm)->DetachCurrentThread(g_vm);
+    return NULL;
+}
+
+/**
+ * Create an adapter around an opened decoder context. The caller keeps
+ * ownership of codecCtx and must not use the synchronous send/receive entry
+ * points while the adapter is running.
+ */
+JNIEXPORT jlong JNICALL
+Java_org_ffmpeg_FFMpegNative_asyncDecoderCreate(JNIEnv *env, jobject thiz,
+                                                jlong codecCtx, jint capacity)
+{
+    AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
+    FFAsyncDecoder *d;
+    int64_t token;
+
+    if (!cc || !cc->codec || !avcodec_is_open(cc) ||
+        !av_codec_is_decoder(cc->codec))
+        return 0;
+    if (capacity < 1)
+        capacity = 16;
+
+    d = av_mallocz(sizeof(*d));
+    if (!d)
+        return 0;
+    if (pthread_mutex_init(&d->lock, NULL) != 0) {
+        av_free(d);
+        return 0;
+    }
+    if (pthread_cond_init(&d->cond, NULL) != 0) {
+        pthread_mutex_destroy(&d->lock);
+        av_free(d);
+        return 0;
+    }
+    d->packets = av_fifo_alloc2((size_t)capacity, sizeof(AVPacket *), 0);
+    if (!d->packets) {
+        pthread_cond_destroy(&d->cond);
+        pthread_mutex_destroy(&d->lock);
+        av_free(d);
+        return 0;
+    }
+    d->cc = cc;
+
+    token = ff_handle_create(FF_HANDLE_TYPE_ASYNC_DECODER, d,
+                             ff_async_decoder_finalize);
+    if (!token) {
+        ff_async_decoder_finalize(d);
+        return 0;
+    }
+    return (jlong)token;
+}
+
+/** Register the Java callback. Only valid before start(). */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_asyncDecoderSetCallback(JNIEnv *env, jobject thiz,
+                                                     jlong adapter,
+                                                     jobject callback)
+{
+    FFAsyncDecoder *d = ff_async_decoder_acquire(env, adapter);
+    jclass cls;
+    jmethodID on_frame, on_error, on_eof;
+    jobject global;
+    int ret = AVERROR(EINVAL);
+
+    if (!d)
+        return AVERROR(EINVAL);
+    if (d->state != FF_ASYNC_DECODER_CREATED || !callback) {
+        ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+        return AVERROR(EINVAL);
+    }
+
+    cls = (*env)->GetObjectClass(env, callback);
+    if (!cls)
+        goto done;
+    on_frame = (*env)->GetMethodID(env, cls, "onFrame", "(J)V");
+    on_error = (*env)->GetMethodID(env, cls, "onError", "(ILjava/lang/String;)V");
+    on_eof   = (*env)->GetMethodID(env, cls, "onEof", "()V");
+    if (!on_frame || !on_error || !on_eof)
+        goto done;
+
+    global = (*env)->NewGlobalRef(env, callback);
+    if (!global) {
+        ret = AVERROR(ENOMEM);
+        goto done;
+    }
+
+    pthread_mutex_lock(&d->lock);
+    if (d->callback)
+        (*env)->DeleteGlobalRef(env, d->callback);
+    d->callback = global;
+    d->on_frame = on_frame;
+    d->on_error = on_error;
+    d->on_eof   = on_eof;
+    pthread_mutex_unlock(&d->lock);
+    ret = 0;
+
+done:
+    if ((*env)->ExceptionCheck(env))
+        (*env)->ExceptionClear(env);
+    if (cls)
+        (*env)->DeleteLocalRef(env, cls);
+    ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+    return ret;
+}
+
+/** Start the native worker. A callback must be registered first. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_asyncDecoderStart(JNIEnv *env, jobject thiz,
+                                               jlong adapter)
+{
+    FFAsyncDecoder *d = ff_async_decoder_acquire(env, adapter);
+    int ret;
+
+    if (!d)
+        return AVERROR(EINVAL);
+    if (d->state != FF_ASYNC_DECODER_CREATED || !d->callback) {
+        ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+        return AVERROR(EINVAL);
+    }
+
+    ret = pthread_create(&d->thread, NULL, ff_async_decoder_thread, d);
+    if (ret == 0) {
+        d->thread_started = 1;
+        d->state = FF_ASYNC_DECODER_RUNNING;
+        ret = 0;
+    } else {
+        ret = AVERROR(ret);
+    }
+    ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+    return ret;
+}
+
+/**
+ * Queue one packet for the worker. The packet is copied, so the caller keeps
+ * ownership. pkt == 0 signals end of stream; frames are then drained and
+ * onEof() is delivered. AVERROR(EAGAIN) means the bounded queue is full.
+ */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_asyncDecoderQueuePacket(JNIEnv *env, jobject thiz,
+                                                     jlong adapter, jlong pkt)
+{
+    FFAsyncDecoder *d = ff_async_decoder_acquire(env, adapter);
+    AVPacket *p = pkt ? PTR(AVPacket *, pkt) : NULL;
+    AVPacket *copy = NULL;
+    int ret;
+
+    if (!d)
+        return AVERROR(EINVAL);
+    if (d->state != FF_ASYNC_DECODER_RUNNING) {
+        ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+        return AVERROR(EINVAL);
+    }
+    if (p) {
+        copy = av_packet_alloc();
+        if (!copy) {
+            ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+            return AVERROR(ENOMEM);
+        }
+        ret = av_packet_ref(copy, p);
+        if (ret < 0) {
+            av_packet_free(&copy);
+            ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+            return ret;
+        }
+    }
+
+    pthread_mutex_lock(&d->lock);
+    if (!av_fifo_can_write(d->packets)) {
+        pthread_mutex_unlock(&d->lock);
+        av_packet_free(&copy);
+        ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+        return AVERROR(EAGAIN);
+    }
+    av_fifo_write(d->packets, &copy, 1);
+    if (!p)
+        d->eof_requested = 1;
+    d->queued_packets++;
+    pthread_cond_signal(&d->cond);
+    pthread_mutex_unlock(&d->lock);
+
+    ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+    return 0;
+}
+
+/** Ask the worker to flush the decoder; never blocks on the worker. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_asyncDecoderFlush(JNIEnv *env, jobject thiz,
+                                               jlong adapter)
+{
+    FFAsyncDecoder *d = ff_async_decoder_acquire(env, adapter);
+
+    if (!d)
+        return AVERROR(EINVAL);
+    if (d->state != FF_ASYNC_DECODER_RUNNING) {
+        ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+        return AVERROR(EINVAL);
+    }
+    pthread_mutex_lock(&d->lock);
+    d->flush_pending = 1;
+    pthread_cond_signal(&d->cond);
+    pthread_mutex_unlock(&d->lock);
+    ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+    return 0;
+}
+
+/** Stop the worker and join it. Idempotent. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_asyncDecoderStop(JNIEnv *env, jobject thiz,
+                                              jlong adapter)
+{
+    FFAsyncDecoder *d = ff_async_decoder_acquire(env, adapter);
+
+    if (!d)
+        return AVERROR(EINVAL);
+    pthread_mutex_lock(&d->lock);
+    ff_async_decoder_stop_locked(d);
+    pthread_mutex_unlock(&d->lock);
+    ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+    return 0;
+}
+
+/** Schema v1 state snapshot, written only after every capacity check. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_asyncDecoderStats(JNIEnv *env, jobject thiz,
+                                               jlong adapter, jlongArray out)
+{
+    FFAsyncDecoder *d = ff_async_decoder_acquire(env, adapter);
+    jlong values[FF_JNI_ASYNC_DECODER_STATS_SLOTS];
+
+    if (!d)
+        return AVERROR(EINVAL);
+    if (!out ||
+        (*env)->GetArrayLength(env, out) < FF_JNI_ASYNC_DECODER_STATS_SLOTS) {
+        ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+        return AVERROR(EINVAL);
+    }
+
+    pthread_mutex_lock(&d->lock);
+    values[FF_JNI_ASYNC_DECODER_SLOT_SCHEMA]  = FF_JNI_ASYNC_DECODER_SCHEMA_VERSION;
+    values[FF_JNI_ASYNC_DECODER_SLOT_STATE]   = d->state;
+    values[FF_JNI_ASYNC_DECODER_SLOT_QUEUED]  = (jlong)d->queued_packets;
+    values[FF_JNI_ASYNC_DECODER_SLOT_FRAMES]  = (jlong)d->delivered_frames;
+    values[FF_JNI_ASYNC_DECODER_SLOT_ERRORS]  = (jlong)d->errors;
+    values[FF_JNI_ASYNC_DECODER_SLOT_EOFS]    = (jlong)d->eofs;
+    values[FF_JNI_ASYNC_DECODER_SLOT_FLUSHES] = (jlong)d->flushes;
+    pthread_mutex_unlock(&d->lock);
+
+    ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+    (*env)->SetLongArrayRegion(env, out, 0, FF_JNI_ASYNC_DECODER_STATS_SLOTS,
+                               values);
+    if ((*env)->ExceptionCheck(env))
+        return AVERROR(ENOMEM);
+    return 0;
+}
+
+/** Stop the worker, revoke the token and let the last reference finalise. */
+JNIEXPORT void JNICALL
+Java_org_ffmpeg_FFMpegNative_asyncDecoderFree(JNIEnv *env, jobject thiz,
+                                              jlong adapter)
+{
+    FFAsyncDecoder *d = ff_async_decoder_acquire(env, adapter);
+
+    if (!d)
+        return;
+    pthread_mutex_lock(&d->lock);
+    ff_async_decoder_stop_locked(d);
+    pthread_mutex_unlock(&d->lock);
+    ff_handle_revoke((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
+    ff_handle_release((int64_t)adapter, FF_HANDLE_TYPE_ASYNC_DECODER);
 }
 
 JNIEXPORT jint JNICALL
@@ -9998,7 +10563,7 @@ Java_org_ffmpeg_FFMpegNative_aacAdtsPackerCreate(JNIEnv *env, jobject thiz,
     int channel_conf      = m4ac.chan_config;
 
     /* Legality checks mirror adts_decode_extradata(); each failure is logged
-     * separately so "设备不支持" and "码流装不下 ADTS" can be told apart. */
+     * separately so "设备丝支�? and "砝浝装丝�?ADTS" can be told apart. */
     if (objecttype > 3) {
         av_log(NULL, AV_LOG_WARNING,
                "aac adts: MPEG-4 AOT %d is not allowed in ADTS\n", objecttype + 1);
