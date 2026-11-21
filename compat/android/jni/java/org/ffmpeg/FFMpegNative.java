@@ -708,6 +708,28 @@ public final class FFMpegNative {
      */
     public native int codecOpen2(long codecCtx, long codec);
 
+    /**
+     * Set an integer <b>codec-private</b> option on a codec context.
+     *
+     * <p>{@link #optSetInt} searches only the object itself (no
+     * {@code AV_OPT_SEARCH_CHILDREN}), so codec class options such as
+     * {@code "ndk_codec"} — declared by the {@code *_mediacodec} decoder
+     * classes, not by {@code AVCodecContext} — cannot be set through it.
+     * This helper searches child objects and must be called <b>before</b>
+     * {@link #codecOpen2}: the value is consumed during configure/start.
+     *
+     * <p>Use it for device experiments only. Whether the NDK MediaCodec path
+     * avoids a given vendor stack's stall is an empirical question; it is not
+     * a guaranteed fix.
+     *
+     * @param codecCtx AVCodecContext handle from {@link #allocCodecContext}
+     * @param name     option name (for example {@code "ndk_codec"})
+     * @param value    integer value ({@code 1} = NDK, {@code 0} = JNI shim)
+     * @return 0 on success; negative AVERROR otherwise (EINVAL when the
+     *         context or name is missing, or when the option does not exist)
+     */
+    public native int codecSetOptionInt(long codecCtx, String name, long value);
+
     /** Free the codec context (handle becomes invalid). */
     public native void codecFreeContext(long codecCtx);
 

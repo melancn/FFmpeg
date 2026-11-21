@@ -1610,6 +1610,34 @@ Java_org_ffmpeg_FFMpegNative_codecOpen2(JNIEnv *env, jobject thiz, jlong codecCt
     return (jint)avcodec_open2(cc, c, NULL);
 }
 
+/* Set an integer codec-private option (e.g. mediacodec "ndk_codec").
+ *
+ * The generic optSetInt() helper passes search_flags 0, so it only finds
+ * options declared directly on AVCodecContext. Codec class options such as
+ * "ndk_codec" live on the decoder's AVClass, which av_opt_set_int() only
+ * reaches with AV_OPT_SEARCH_CHILDREN. Must run before codecOpen2(): the
+ * decoder reads the flag while configuring/starting the platform codec. */
+JNIEXPORT jint JNICALL
+Java_org_ffmpeg_FFMpegNative_codecSetOptionInt(JNIEnv *env, jobject thiz,
+                                               jlong codecCtx, jstring name, jlong value)
+{
+    AVCodecContext *cc = PTR(AVCodecContext *, codecCtx);
+    const char *key;
+    int ret;
+
+    if (!cc || !name)
+        return AVERROR(EINVAL);
+
+    key = (*env)->GetStringUTFChars(env, name, NULL);
+    if (!key)
+        return AVERROR(ENOMEM);
+
+    ret = (int)av_opt_set_int(cc, key, (int64_t)value, AV_OPT_SEARCH_CHILDREN);
+
+    (*env)->ReleaseStringUTFChars(env, name, key);
+    return (jint)ret;
+}
+
 JNIEXPORT void JNICALL
 Java_org_ffmpeg_FFMpegNative_codecFreeContext(JNIEnv *env, jobject thiz, jlong codecCtx)
 {
