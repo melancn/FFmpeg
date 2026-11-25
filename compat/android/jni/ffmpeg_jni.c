@@ -39,6 +39,7 @@
 
 #include <jni.h>
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -1434,6 +1435,99 @@ Java_org_ffmpeg_FFMpegNative_getDuration(JNIEnv *env, jobject thiz, jlong ctx)
         return 0;
     }
     return (jlong)c->duration;
+}
+
+/* Snapshot of the container's chapter list.
+ *
+ * Every field is copied into a fresh Java object while the format context is
+ * held by this operation: the AVChapter pointers and the metadata dictionary
+ * entries belong to libavformat and die with the context, so neither is ever
+ * stored on the Java side. The returned array is therefore independent of the
+ * context and remains valid after a seek or a close.
+ *
+ * A container with no chapters returns an empty array, not null: null is
+ * reserved for a failure (a stale handle or a JNI allocation error), which is
+ * reported through an exception.
+ *
+ * The time base is copied per chapter instead of using the format context's
+ * own: AVChapter.start/end are expressed in AVChapter.time_base units, and
+ * formats are free to choose a different one for chapters than for streams. */
+JNIEXPORT jobjectArray JNICALL
+Java_org_ffmpeg_FFMpegNative_formatGetChapters(JNIEnv *env, jobject thiz,
+                                               jlong formatCtx)
+{
+    FF_FORMAT_OP_BEGIN(formatCtx, op, c);
+    jclass cls;
+    jmethodID ctor;
+    jobjectArray out;
+    jsize count;
+    jsize i;
+
+    if (!c) {
+        ff_jni_throw_stale(env, "ffmpeg.handle.stale", "formatGetChapters");
+        return NULL;
+    }
+    if (c->nb_chapters > (unsigned)INT_MAX) {
+        /* The Java array length is a jsize (jint); a list that cannot be
+         * represented is refused rather than truncated. */
+        ff_jni_throw(env, "java/lang/IllegalStateException",
+                     "ffmpeg.format.chapters_too_many", "formatGetChapters");
+        return NULL;
+    }
+
+    cls = (*env)->FindClass(env, "org/ffmpeg/FFMpegNative$NativeChapterInfo");
+    if (!cls)
+        return NULL;
+    ctor = (*env)->GetMethodID(env, cls, "<init>",
+                               "(JIJJJJLjava/lang/String;)V");
+    if (!ctor)
+        return NULL;
+
+    count = (jsize)c->nb_chapters;
+    out = (*env)->NewObjectArray(env, count, cls, NULL);
+    if (!out)
+        return NULL;
+
+    for (i = 0; i < count; i++) {
+        const AVChapter *ch = c->chapters ? c->chapters[i] : NULL;
+        const AVDictionaryEntry *title_entry = NULL;
+        jstring title = NULL;
+        jobject info;
+
+        if (!ch) {
+            /* nb_chapters without its entries is not a snapshot with a gap:
+             * reporting a zero-filled chapter would invent data. */
+            ff_jni_throw(env, "java/lang/IllegalStateException",
+                         "ffmpeg.format.chapter_missing", "formatGetChapters");
+            return NULL;
+        }
+
+        if (ch->metadata)
+            title_entry = av_dict_get(ch->metadata, "title", NULL, 0);
+        if (title_entry && title_entry->value) {
+            title = (*env)->NewStringUTF(env, title_entry->value);
+            if (!title)
+                return NULL;
+        }
+
+        info = (*env)->NewObject(env, cls, ctor,
+                                 (jlong)ch->id, (jint)i,
+                                 (jlong)ch->start, (jlong)ch->end,
+                                 (jlong)ch->time_base.num,
+                                 (jlong)ch->time_base.den,
+                                 title);
+        if (title)
+            (*env)->DeleteLocalRef(env, title);
+        if (!info)
+            return NULL;
+
+        (*env)->SetObjectArrayElement(env, out, i, info);
+        (*env)->DeleteLocalRef(env, info);
+        if ((*env)->ExceptionCheck(env))
+            return NULL;
+    }
+
+    return out;
 }
 
 JNIEXPORT jint JNICALL

@@ -523,6 +523,31 @@ public final class FFMpegNative {
     public native long getDuration(long ctx);
 
     /**
+     * Snapshot the container's chapter list.
+     *
+     * <p>Reads {@code AVFormatContext.nb_chapters}/{@code chapters} and copies
+     * every field, including {@code metadata["title"]}, into Java objects
+     * while the context is locked for this call. No {@code AVChapter} pointer
+     * or metadata entry is retained: the returned array is a data snapshot
+     * that stays valid across seeks, further reads and
+     * {@link #formatCloseInput}.
+     *
+     * <p>Use the chapter list the container has already populated; this
+     * method does not read or probe the file itself. {@code start}/{@code end}
+     * are in the chapter's own {@code timeBaseNum}/{@code timeBaseDen} units,
+     * which can differ from any stream time base. {@code id} is the
+     * container's chapter id, not the array index. {@code title} is
+     * {@code null} when the chapter has no title metadata.
+     *
+     * @param formatCtx format context handle
+     * @return the chapters in container order; an empty array when there are
+     *         none. Never {@code null} on success. A stale or foreign handle
+     *         throws {@link IllegalStateException} with code
+     *         {@code ffmpeg.handle.stale}.
+     */
+    public native NativeChapterInfo[] formatGetChapters(long formatCtx);
+
+    /**
      * Find the best stream of a given type.
      *
      * @param type    {@code AVMEDIA_TYPE_*} (e.g. {@code AVMEDIA_TYPE_VIDEO})
@@ -2949,5 +2974,47 @@ public final class FFMpegNative {
      * {@link #swsFreeContext}. @return SwsContext handle, or 0.
      */
     public native long swsAllocContext();
+
+    /**
+     * Immutable snapshot of one container chapter.
+     *
+     * <p>Returned by {@link #formatGetChapters}. The values are copies of the
+     * {@code AVChapter} fields at the time of the call; the object holds no
+     * native memory and must not be interpreted as a handle.
+     */
+    public static final class NativeChapterInfo {
+        /** Container chapter id ({@code AVChapter.id}); not the array index. */
+        public final long id;
+
+        /** Zero-based position in the container's chapter list. */
+        public final int index;
+
+        /** Chapter start in {@link #timeBaseNum}/{@link #timeBaseDen} units. */
+        public final long start;
+
+        /** Chapter end in {@link #timeBaseNum}/{@link #timeBaseDen} units. */
+        public final long end;
+
+        /** Numerator of the chapter's own time base. */
+        public final long timeBaseNum;
+
+        /** Denominator of the chapter's own time base. */
+        public final long timeBaseDen;
+
+        /** {@code metadata["title"]}, or {@code null} when absent. */
+        public final String title;
+
+        public NativeChapterInfo(long id, int index, long start, long end,
+                                 long timeBaseNum, long timeBaseDen,
+                                 String title) {
+            this.id = id;
+            this.index = index;
+            this.start = start;
+            this.end = end;
+            this.timeBaseNum = timeBaseNum;
+            this.timeBaseDen = timeBaseDen;
+            this.title = title;
+        }
+    }
 
 }
